@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <unistd.h>
 
 #include <vulkan/vulkan_core.h>
 
@@ -42,11 +43,14 @@ namespace {
                 .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
                 .semaphore = handle,
                 .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT,
-                .fd = *importFd // closes the fd
+                .fd = *importFd // closes the fd on success; we close it on failure below
             };
             res = vk.df().ImportSemaphoreFdKHR(vk.dev(), &importInfo);
-            if (res != VK_SUCCESS)
+            if (res != VK_SUCCESS) {
+                if (*importFd >= 0)
+                    close(*importFd); // ownership was not transferred on failure
                 throw ls::vulkan_error(res, "vkImportSemaphoreFdKHR() failed");
+            }
         }
 
         if (exportFd.has_value()) {
