@@ -37,6 +37,8 @@ If you are using performance overlays like Steam's built-in overlay, there is a 
 This is a known limitation of Vulkan layers and without directly working with the overlay developers, there is little that can be done to fix this.
 
 ### Dual-GPU Setups
+A step-by-step setup guide with tested examples lives in the [Dual-GPU Setup Guide](Dual-GPU-Guide.md).
+
 If you configured the `gpu` option to a device other than the one your game renders on, lsfg-vk enters dual-GPU mode: the game keeps rendering and presenting on its own GPU, while the entire frame generation pipeline runs on the selected processing GPU. Frames travel between both GPUs over PCIe, which costs bandwidth and adds latency (see the [Configuration](Configuration.md) documentation for the details).
 
 You can verify which device ended up doing what in the log output:
