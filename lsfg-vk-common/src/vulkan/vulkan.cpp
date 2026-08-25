@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -195,10 +196,20 @@ namespace {
         return func;
     }
 
+    /// query the name of a physical device
+    std::string queryDeviceName(const VulkanInstanceFuncs& fi, VkPhysicalDevice physdev) {
+        VkPhysicalDeviceProperties2 props{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+        };
+        fi.GetPhysicalDeviceProperties2(physdev, &props);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay, modernize-return-braced-init-list)
+        return std::string(props.properties.deviceName);
+    }
 
     /// create a logical device
     ls::owned_ptr<VkDevice> createLogicalDevice(const VulkanInstanceFuncs& fi,
-            VkPhysicalDevice physdev, uint32_t cfi, bool fp16) {
+            VkPhysicalDevice physdev, uint32_t cfi, bool fp16,
+            bool enableDmaBufExtensions) {
         VkDevice handle{};
 
         const float queuePriority{1.0F}; // highest priority
@@ -213,11 +224,34 @@ namespace {
             .queueCount = 1,
             .pQueuePriorities = &queuePriority
         };
-        const std::vector<const char*> requestedExtensions{
+        std::vector<const char*> requestedExtensions{
             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
             VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME
         };
+        if (enableDmaBufExtensions) {
+            // two-stage policy: capability is requested best-effort here
+            // (silent skip keeps same-device users on drivers without these
+            // extensions fully working), while the hard Q4 error fires at
+            // openContext only when cross-device exchange is actually needed
+            // but unavailable. extensions are init-time capability bits with
+            // zero per-frame cost, so over-requesting costs nothing.
+            const bool hasDmaBuf = hasDeviceExtension(fi, physdev,
+                VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+            const bool hasDrmModifier = hasDeviceExtension(fi, physdev,
+                VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+            if (hasDmaBuf && hasDrmModifier) {
+                requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+                requestedExtensions.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+            } else {
+                std::cerr << "lsfg-vk: dma-buf extensions unavailable on '"
+                    << queryDeviceName(fi, physdev) << "', dual-gpu mode disabled\n";
+            }
+        }
+        std::cerr << "lsfg-vk: enabling device extensions:";
+        for (const auto* ext : requestedExtensions)
+            std::cerr << ' ' << ext;
+        std::cerr << '\n';
         const VkDeviceCreateInfo deviceInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .pNext = &requestedFeaturesVulkan12,
@@ -451,7 +485,8 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         PhysicalDeviceSelector selectPhysicalDevice,
         bool isGraphical,
         std::optional<PFN_vkSetDeviceLoaderData> setLoaderData,
-        const std::optional<std::filesystem::path>& cachefile) :
+        const std::optional<std::filesystem::path>& cachefile,
+        bool enableDmaBufExtensions) :
     instance(createInstance(
         appName, appVersion,
         engineName, engineVersion
@@ -467,7 +502,8 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
     device(createLogicalDevice(this->instance_funcs,
         this->phys_dev,
         this->queueFamilyIdx,
-        this->fp16
+        this->fp16,
+        enableDmaBufExtensions
     )),
     setLoaderData(setLoaderData),
     device_funcs(initVulkanDeviceFuncs(

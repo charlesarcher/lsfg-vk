@@ -163,13 +163,19 @@ namespace vk {
         /// @param isGraphical whether the device is graphical (rather than compute)
         /// @param setLoaderData optional function to set loader data
         /// @param cachefile optional path to pipeline cache file
+        /// @param enableDmaBufExtensions whether to additionally enable the
+        ///        dma-buf exchange extensions (VK_EXT_external_memory_dma_buf,
+        ///        VK_EXT_image_drm_format_modifier) when the selected physical
+        ///        device supports them; requesting them on an unsupported device
+        ///        is a hard error. defaults to off (legacy extension set)
         /// @throws ls::vulkan_error on failure
         Vulkan(const std::string& appName, version appVersion,
             const std::string& engineName, version engineVersion,
             PhysicalDeviceSelector selectPhysicalDevice,
             bool isGraphical = false,
             std::optional<PFN_vkSetDeviceLoaderData> setLoaderData = std::nullopt,
-            const std::optional<std::filesystem::path>& cachefile = std::nullopt);
+            const std::optional<std::filesystem::path>& cachefile = std::nullopt,
+            bool enableDmaBufExtensions = false);
 
         /// create based on an existing externally managed vulkan instance.
         /// @param instance vulkan instance handle
