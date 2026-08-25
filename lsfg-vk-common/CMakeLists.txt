@@ -7,6 +7,7 @@ set(COMMON_SOURCES
     "src/vulkan/command_buffer.cpp"
     "src/vulkan/descriptor_pool.cpp"
     "src/vulkan/descriptor_set.cpp"
+    "src/vulkan/exchange.cpp"
     "src/vulkan/fence.cpp"
     "src/vulkan/image.cpp"
     "src/vulkan/sampler.cpp"
