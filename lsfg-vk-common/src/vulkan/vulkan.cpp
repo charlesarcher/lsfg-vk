@@ -2,6 +2,7 @@
 
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 
 #include <array>
@@ -14,6 +15,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <dlfcn.h>
@@ -575,6 +577,32 @@ bool Vulkan::supportsDmaBuf() const {
 bool Vulkan::supportsDrmModifierImages() const {
     return hasDeviceExtension(this->instance_funcs, this->phys_dev,
         VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+}
+
+DeviceExchangeCaps Vulkan::exchangeCaps(VkFormat format) const {
+    VkDrmFormatModifierPropertiesListEXT modList{
+        .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT
+    };
+    VkFormatProperties2 props{
+        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+        .pNext = &modList
+    };
+    this->instance_funcs.GetPhysicalDeviceFormatProperties2(this->phys_dev, format, &props);
+
+    std::vector<VkDrmFormatModifierPropertiesEXT> modifiers(
+        modList.drmFormatModifierCount);
+    modList.pDrmFormatModifierProperties = modifiers.data();
+    this->instance_funcs.GetPhysicalDeviceFormatProperties2(this->phys_dev, format, &props);
+
+    std::vector<ExchangeModifierCaps> caps{};
+    caps.reserve(modifiers.size());
+    for (const auto& mod : modifiers)
+        caps.push_back(ExchangeModifierCaps{
+            .modifier = mod.drmFormatModifier,
+            .requiredUsageBits = mod.drmFormatModifierTilingFeatures
+        });
+
+    return {{format, std::move(caps)}};
 }
 
 bool Vulkan::supportsSyncFdSemaphoreExportImport() const {

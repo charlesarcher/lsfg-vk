@@ -3,6 +3,7 @@
 #pragma once
 
 #include "../helpers/pointers.hpp"
+#include "exchange.hpp"
 
 #include <array>
 #include <bitset>
@@ -241,6 +242,8 @@ namespace vk {
         /// for a single format, filled from VkDrmFormatModifierPropertiesListEXT.
         /// devices without VK_EXT_image_drm_format_modifier yield an empty list
         /// @param format format to query capabilities for
+        /// @return caps keyed under the queried format
+        [[nodiscard]] DeviceExchangeCaps exchangeCaps(VkFormat format) const;
 
         /// check if sync fd semaphores can be exported and imported
         /// @return true if sync fd semaphore export/import is supported
