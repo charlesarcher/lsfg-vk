@@ -19,6 +19,7 @@ namespace lsfgvk::cli::debug {
         int multiplier{2};
         bool performance_mode{true};
         std::optional<std::string> gpu;
+        std::optional<std::string> render_gpu;
 
         std::filesystem::path path;
     };

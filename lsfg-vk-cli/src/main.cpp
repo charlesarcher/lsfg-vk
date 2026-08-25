@@ -50,6 +50,7 @@ SUBCOMMAND OPTIONS:
         -t, --duration <SECONDS>        Benchmark duration in seconds
 
     debug
+        -r, --render-gpu <STRING>       GPU for the frame source/exporter side
         <folder>                        Path to the debug frames)" << '\n';
     }
 
@@ -149,7 +150,7 @@ SUBCOMMAND OPTIONS:
     [[noreturn]] void on_debug(int argc, char** argv) {
         debug::Options opts{};
 
-        const std::array<option, 9> GETOPT {{
+        const std::array<option, 10> GETOPT {{
             { "dll",              required_argument, nullptr, 'd' },
             { "allow-fp16",       no_argument,       nullptr, 'a' },
             { "width",            required_argument, nullptr, 'w' },
@@ -158,11 +159,12 @@ SUBCOMMAND OPTIONS:
             { "multiplier",       required_argument, nullptr, 'm' },
             { "performance-mode",       no_argument, nullptr, 'p' },
             { "gpu",              required_argument, nullptr, 'g' },
+            { "render-gpu",       required_argument, nullptr, 'r' },
             { nullptr,                  no_argument, nullptr,  0  }
         }};
 
         int c{0};
-        while ((c = getopt_long(argc, argv, "d:aw:h:f:m:pg:", GETOPT.data(), nullptr)) != -1) {
+        while ((c = getopt_long(argc, argv, "d:aw:h:f:m:pg:r:", GETOPT.data(), nullptr)) != -1) {
             switch (c) {
                 case 'd':
                     opts.dll.emplace(optarg);
@@ -187,6 +189,9 @@ SUBCOMMAND OPTIONS:
                     break;
                 case 'g':
                     opts.gpu.emplace(optarg);
+                    break;
+                case 'r':
+                    opts.render_gpu.emplace(optarg);
                     break;
                 case '?':
                 default:

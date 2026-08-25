@@ -4,6 +4,7 @@
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/paths.hpp"
+#include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -125,8 +126,25 @@ int benchmark::run(const Options& opts) {
             },
             dll, opts.allow_fp16
         };
+
+        // opaque-fd-equivalent descriptors: modifier sentinel marks legacy
+        // OPAQUE_FD imports, allocationSize/rowPitch are ignored for those;
+        // exporter and processing device coincide here, so this stays same-device
+        const std::array<vk::ExchangeDescriptor, 2> srcDescs{{
+            { srcfds.first, 0, 0, lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
+                VK_FORMAT_R8G8B8A8_UNORM, extent },
+            { srcfds.second, 0, 0, lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
+                VK_FORMAT_R8G8B8A8_UNORM, extent }
+        }};
+        std::vector<vk::ExchangeDescriptor> destDescs{};
+        destDescs.reserve(destfds.size());
+        for (const int fd : destfds)
+            destDescs.push_back({ fd, 0, 0, lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
+                VK_FORMAT_R8G8B8A8_UNORM, extent });
+
         lsfgvk::backend::Context& lsfgvk_ctx = lsfgvk.openContext(
-            srcfds, destfds,
+            srcDescs, destDescs, vk.deviceUUID(),
+            lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
             syncfd, extent.width, extent.height,
             false, 1.0F / opts.flow, opts.performance_mode
         );
