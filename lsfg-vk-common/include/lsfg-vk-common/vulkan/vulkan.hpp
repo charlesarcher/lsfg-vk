@@ -4,6 +4,7 @@
 
 #include "../helpers/pointers.hpp"
 
+#include <array>
 #include <bitset>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +24,10 @@ namespace vk {
         PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
         PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
         PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
+        PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
+        PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
+            GetPhysicalDeviceExternalSemaphoreProperties;
+        PFN_vkGetPhysicalDeviceExternalFenceProperties GetPhysicalDeviceExternalFenceProperties;
         PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties;
         PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
         PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
@@ -213,6 +218,35 @@ namespace vk {
         /// check if fp16 is supported
         /// @return true if fp16 is supported
         [[nodiscard]] bool supportsFP16() const { return this->fp16; }
+
+        /// get the device uuid of the physical device
+        /// @return the 16-byte device uuid
+        [[nodiscard]] std::array<uint8_t, 16> deviceUUID() const;
+
+        /// get the driver uuid of the physical device
+        /// @return the 16-byte driver uuid
+        [[nodiscard]] std::array<uint8_t, 16> driverUUID() const;
+
+        /// check if VK_EXT_external_memory_dma_buf is supported
+        /// @return true if dma buf imports/exports are supported
+        [[nodiscard]] bool supportsDmaBuf() const;
+
+        /// check if VK_EXT_image_drm_format_modifier is supported
+        /// @return true if drm modifier images are supported
+        [[nodiscard]] bool supportsDrmModifierImages() const;
+
+        /// query the drm modifier exchange capabilities of the physical device
+        /// for a single format, filled from VkDrmFormatModifierPropertiesListEXT.
+        /// devices without VK_EXT_image_drm_format_modifier yield an empty list
+        /// @param format format to query capabilities for
+
+        /// check if sync fd semaphores can be exported and imported
+        /// @return true if sync fd semaphore export/import is supported
+        [[nodiscard]] bool supportsSyncFdSemaphoreExportImport() const;
+
+        /// check if sync fd fences can be exported and imported
+        /// @return true if sync fd fence export/import is supported
+        [[nodiscard]] bool supportsSyncFdFenceExportImport() const;
 
         /// get instance-level function pointers
         /// @return the instance function pointers

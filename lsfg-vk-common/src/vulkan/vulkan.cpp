@@ -13,6 +13,7 @@
 #include <ios>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <dlfcn.h>
@@ -149,6 +150,40 @@ namespace {
         return supportedFeaturesVulkan12.shaderFloat16 == VK_TRUE;
     }
 
+    /// query the device and driver uuids of a physical device
+    VkPhysicalDeviceIDProperties queryIDProperties(const VulkanInstanceFuncs& fi,
+            VkPhysicalDevice physdev) {
+        VkPhysicalDeviceIDProperties idProps{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
+        };
+        VkPhysicalDeviceProperties2 props{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &idProps
+        };
+        fi.GetPhysicalDeviceProperties2(physdev, &props);
+        return idProps;
+    }
+
+    /// check if a physical device exposes a given extension
+    bool hasDeviceExtension(const VulkanInstanceFuncs& fi, VkPhysicalDevice physdev,
+            std::string_view name) {
+        uint32_t extCount{};
+        auto res = fi.EnumerateDeviceExtensionProperties(physdev, VK_NULL_HANDLE,
+            &extCount, VK_NULL_HANDLE);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkEnumerateDeviceExtensionProperties() failed");
+
+        std::vector<VkExtensionProperties> extensions(extCount);
+        res = fi.EnumerateDeviceExtensionProperties(physdev, VK_NULL_HANDLE,
+            &extCount, extensions.data());
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkEnumerateDeviceExtensionProperties() failed");
+
+        for (const auto& ext : extensions)
+            if (std::string_view(ext.extensionName) == name) return true;
+        return false;
+    }
+
     template<typename T>
     T dpa(const VulkanInstanceFuncs& funcs, VkDevice device, const char* name) {
         T func = reinterpret_cast<T>(
@@ -157,6 +192,7 @@ namespace {
             throw ls::vulkan_error("failed to get device proc addr for " + std::string(name));
         return func;
     }
+
 
     /// create a logical device
     ls::owned_ptr<VkDevice> createLogicalDevice(const VulkanInstanceFuncs& fi,
@@ -295,6 +331,15 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
             "vkEnumerateDeviceExtensionProperties"),
         .GetPhysicalDeviceProperties2 = ipa<PFN_vkGetPhysicalDeviceProperties2>(mpa, i,
             "vkGetPhysicalDeviceProperties2"),
+        .GetPhysicalDeviceFormatProperties2 =
+            ipa<PFN_vkGetPhysicalDeviceFormatProperties2>(mpa, i,
+                "vkGetPhysicalDeviceFormatProperties2"),
+        .GetPhysicalDeviceExternalSemaphoreProperties =
+            ipa<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(mpa, i,
+                "vkGetPhysicalDeviceExternalSemaphoreProperties"),
+        .GetPhysicalDeviceExternalFenceProperties =
+            ipa<PFN_vkGetPhysicalDeviceExternalFenceProperties>(mpa, i,
+                "vkGetPhysicalDeviceExternalFenceProperties"),
         .GetPhysicalDeviceQueueFamilyProperties =
             ipa<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(mpa, i,
                 "vkGetPhysicalDeviceQueueFamilyProperties"),
@@ -508,4 +553,46 @@ void Vulkan::persistPipelineCache() const noexcept {
         static_cast<std::streamsize>(cacheData.size()));
     if (!file.good())
         return;
+}
+
+std::array<uint8_t, 16> Vulkan::deviceUUID() const {
+    return std::to_array(queryIDProperties(this->instance_funcs, this->phys_dev).deviceUUID);
+}
+
+std::array<uint8_t, 16> Vulkan::driverUUID() const {
+    return std::to_array(queryIDProperties(this->instance_funcs, this->phys_dev).driverUUID);
+}
+
+bool Vulkan::supportsDmaBuf() const {
+    return hasDeviceExtension(this->instance_funcs, this->phys_dev,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+}
+
+bool Vulkan::supportsDrmModifierImages() const {
+    return hasDeviceExtension(this->instance_funcs, this->phys_dev,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+}
+
+bool Vulkan::supportsSyncFdSemaphoreExportImport() const {
+    const VkPhysicalDeviceExternalSemaphoreInfo info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
+    };
+    VkExternalSemaphoreProperties props{};
+    this->instance_funcs.GetPhysicalDeviceExternalSemaphoreProperties(this->phys_dev,
+        &info, &props);
+    return (props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT)
+        && (props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT);
+}
+
+bool Vulkan::supportsSyncFdFenceExportImport() const {
+    const VkPhysicalDeviceExternalFenceInfo info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+        .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
+    };
+    VkExternalFenceProperties props{};
+    this->instance_funcs.GetPhysicalDeviceExternalFenceProperties(this->phys_dev,
+        &info, &props);
+    return (props.externalFenceFeatures & VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT)
+        && (props.externalFenceFeatures & VK_EXTERNAL_FENCE_FEATURE_IMPORTABLE_BIT);
 }
