@@ -13,6 +13,7 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -44,8 +45,10 @@ namespace lsfgvk::layer {
         /// @param backend lsfg-vk backend instance
         /// @param profile active game profile
         /// @param info swapchain info
+        /// @param gameDeviceName device name of this context's game device (mode logging)
         Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
-            ls::GameConf profile, SwapchainInfo info);
+            ls::GameConf profile, SwapchainInfo info,
+            const std::string& gameDeviceName);
 
         /// present a frame
         /// @param vk vulkan instance
@@ -62,6 +65,16 @@ namespace lsfgvk::layer {
         std::vector<vk::Image> sourceImages;
         std::vector<vk::Image> destinationImages;
         ls::lazy<vk::TimelineSemaphore> syncSemaphore;
+
+        bool crossDevice{false}; // sync-fd handshake mode (backend device != game device)
+        // fresh capture semaphore per present: signaled by the capture blit,
+        // exported immediately after enqueue, never waited locally afterwards
+        // (an exported binary semaphore deadlocks RADV on local re-wait), and
+        // never recycled - the retired generation is destroyed behind the next
+        // renderFence gate instead of while its batch may still be pending
+        std::optional<vk::Semaphore> captureSignal;
+        std::optional<vk::Semaphore> retiredCaptureSignal;
+        std::vector<vk::Semaphore> doneWaitSemaphores; // cross-device: per-pass done imports (import-only ring)
 
         ls::lazy<vk::CommandBuffer> renderCommandBuffer;
         ls::lazy<vk::Fence> renderFence;

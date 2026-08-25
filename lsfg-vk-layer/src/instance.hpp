@@ -10,6 +10,7 @@
 #include "swapchain.hpp"
 
 #include <optional>
+#include <shared_mutex>
 #include <unordered_map>
 
 #include <vulkan/vulkan_core.h>
@@ -37,10 +38,12 @@ namespace lsfgvk::layer {
         void modifyInstanceCreateInfo(VkInstanceCreateInfo& createInfo,
             const std::function<void(void)>& finish) const;
         /// modify device create info
+        /// @param funcs instance function pointers of the instance owning physdev
+        /// @param physdev the game physical device the logical device is created from
         /// @param createInfo original create info
         /// @param finish function to call after modification
-        void modifyDeviceCreateInfo(VkDeviceCreateInfo& createInfo,
-            const std::function<void(void)>& finish) const;
+        void modifyDeviceCreateInfo(const vk::VulkanInstanceFuncs& funcs, VkPhysicalDevice physdev,
+            VkDeviceCreateInfo& createInfo, const std::function<void(void)>& finish) const;
 
         /// modify swapchain create info
         /// @param vk vulkan instance
@@ -59,7 +62,12 @@ namespace lsfgvk::layer {
         /// @param swapchain swapchain handle
         /// @return swapchain context
         /// @throws ls::error if not found
+        /// @note thread-safe: takes a shared lock for the lookup; the returned
+        /// reference stays valid because unordered_map nodes are stable and
+        /// apps must not destroy a swapchain while presenting it (Vulkan
+        /// external-synchronization rules)
         [[nodiscard]] Swapchain& getSwapchainContext(VkSwapchainKHR swapchain) {
+            const std::shared_lock lock(this->mutex);
             const auto& it = this->swapchains.find(swapchain);
             if (it == this->swapchains.end())
                 throw ls::error("swapchain context not found");
@@ -74,7 +82,14 @@ namespace lsfgvk::layer {
         std::optional<ls::GameConf> active_profile;
 
         ls::lazy<backend::Instance> backend;
+        std::optional<std::string> backendGpuKey; // gpu key the backend was created with
         std::unordered_map<VkSwapchainKHR, Swapchain> swapchains;
+
+        /// guards backend/swapchains against concurrent present threads.
+        /// writers: lazy backend emplace + context create/remove (cold paths);
+        /// readers: the per-present swapchain lookup (hot path - shared lock
+        /// only, tens of ns uncontended vs ~800us frame budget)
+        mutable std::shared_mutex mutex;
     };
 
 }

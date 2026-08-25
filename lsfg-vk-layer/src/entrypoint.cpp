@@ -163,7 +163,7 @@ namespace {
         // create device
         try {
             VkDeviceCreateInfo newInfo = *info;
-            layer_info->root.modifyDeviceCreateInfo(newInfo,
+            layer_info->root.modifyDeviceCreateInfo(instance_info->funcs, physdev, newInfo,
                 [=, newInfo = &newInfo]() {
                     auto res = instance_info->funcs.CreateDevice(physdev, newInfo, alloc, device);
                     if (res != VK_SUCCESS)
@@ -178,14 +178,25 @@ namespace {
         }
 
         // create layer instance
+        // some applications create auxiliary devices without presentation
+        // support (vkcube does); wrapping those with graphical=true throws
+        // when the swapchain entry points are absent, so match the flag to
+        // what the device actually enables
+        const bool graphical = [&] {
+            for (uint32_t i = 0; i < info->enabledExtensionCount; ++i)
+                if (std::string_view(info->ppEnabledExtensionNames[i])
+                        == VK_KHR_SWAPCHAIN_EXTENSION_NAME)
+                    return true;
+            return false;
+        }();
         try {
             instance_info->devices.emplace(
                 *device,
                 vk::Vulkan(
                     instance_info->handles.front(), *device, physdev,
                     instance_info->funcs, vk::initVulkanDeviceFuncs(instance_info->funcs, *device,
-                        true),
-                    true, setLoaderData
+                        graphical),
+                    graphical, setLoaderData
                 )
             );
         } catch (const std::exception& e) {
