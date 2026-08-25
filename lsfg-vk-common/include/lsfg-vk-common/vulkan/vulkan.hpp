@@ -109,11 +109,13 @@ namespace vk {
         PFN_vkGetPipelineCacheData GetPipelineCacheData;
         PFN_vkCreateComputePipelines CreateComputePipelines;
         PFN_vkDestroyPipeline DestroyPipeline;
+        PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
 
         // extension functions
         PFN_vkSignalSemaphoreKHR SignalSemaphoreKHR;
         PFN_vkWaitSemaphoresKHR WaitSemaphoresKHR;
         PFN_vkGetMemoryFdKHR GetMemoryFdKHR;
+        PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR;
         PFN_vkImportSemaphoreFdKHR ImportSemaphoreFdKHR;
         PFN_vkGetSemaphoreFdKHR GetSemaphoreFdKHR;
         PFN_vkCreateSwapchainKHR CreateSwapchainKHR;

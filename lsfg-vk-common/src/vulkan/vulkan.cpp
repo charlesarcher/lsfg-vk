@@ -420,10 +420,14 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .GetPipelineCacheData = dpa<PFN_vkGetPipelineCacheData>(f, d, "vkGetPipelineCacheData"),
         .CreateComputePipelines = dpa<PFN_vkCreateComputePipelines>(f, d, "vkCreateComputePipelines"),
         .DestroyPipeline = dpa<PFN_vkDestroyPipeline>(f, d, "vkDestroyPipeline"),
+        .GetImageSubresourceLayout = dpa<PFN_vkGetImageSubresourceLayout>(f, d,
+            "vkGetImageSubresourceLayout"),
 
         .SignalSemaphoreKHR = dpa<PFN_vkSignalSemaphoreKHR>(f, d, "vkSignalSemaphoreKHR"),
         .WaitSemaphoresKHR = dpa<PFN_vkWaitSemaphoresKHR>(f, d, "vkWaitSemaphoresKHR"),
         .GetMemoryFdKHR = dpa<PFN_vkGetMemoryFdKHR>(f, d, "vkGetMemoryFdKHR"),
+        .GetMemoryFdPropertiesKHR = dpa<PFN_vkGetMemoryFdPropertiesKHR>(f, d,
+            "vkGetMemoryFdPropertiesKHR"),
         .ImportSemaphoreFdKHR = dpa<PFN_vkImportSemaphoreFdKHR>(f, d, "vkImportSemaphoreFdKHR"),
         .GetSemaphoreFdKHR = dpa<PFN_vkGetSemaphoreFdKHR>(f, d, "vkGetSemaphoreFdKHR"),
 
