@@ -161,6 +161,35 @@ bool Root::update() {
     else
         this->active_profile = std::nullopt;
 
+    // external-mode contexts are NOT rebuilt by the hot-reload loop:
+    // a rebuild would need a full IPC handshake + staging re-export, and a
+    // rebuild under a concurrently blocked present widens the existing UAF
+    // window (escaped reference from getSwapchainContext's short-lived shared
+    // lock) from frame-scale to seconds. log once and suppress the reload
+    // signal when any external context is live so the caller skips the loop.
+    if (this->hasExternalContexts()) {
+        // keep the gpu-change honesty line for the backend case, but also
+        // surface a generic line for any external-mode profile change
+        if (this->backend.has_value() && this->active_profile.has_value()
+                && this->active_profile->gpu != this->backendGpuKey) {
+            std::cerr << "lsfg-vk: gpu change requires restart to take effect\n";
+            this->backendGpuKey = this->active_profile->gpu;
+        } else if (this->active_profile.has_value()
+                && this->active_profile->presentation == ls::Presentation::External) {
+            // any hot-reload while external is active requires restart;
+            // the config watcher already updated active_profile, but callers
+            // must not rebuild the context
+            std::cerr << "lsfg-vk: config change requires restart to take effect\n";
+        }
+        // suppress rebuild: external contexts stay as-is
+        // still return false to the caller so the reload loop is skipped
+        // for external contexts; game contexts would still be rebuilt if mixed,
+        // but the caller handles that per-swapchain below. we return true
+        // only to indicate the config did change; the caller decides per-context.
+        // to keep the contract simple, return true and let the caller filter.
+        return true;
+    }
+
     // hot-reload honesty: the backend persists for the whole process lifetime
     // (vulkan loader bug workaround), so a changed gpu key cannot retarget the
     // processing device mid-run; report it instead of silently ignoring it
@@ -304,6 +333,13 @@ void Root::createSwapchainContext(const vk::Vulkan& vk,
     // log its dual-gpu mode against the real game device
     const auto game = probeDevice(vk.fi(), vk.physdev());
 
+    // external presentation: thin capture path, no backend instance involved
+    if (profile.presentation == ls::Presentation::External) {
+        this->swapchains.emplace(swapchain,
+            CaptureContext(vk, profile, info, game.name));
+        return;
+    }
+
     // any configured gpu requests dma-buf capability on the backend device
     // (best-effort: the extensions are enabled there iff supported). whether a
     // given context actually crosses devices is decided per-context against
@@ -368,4 +404,38 @@ void Root::createSwapchainContext(const vk::Vulkan& vk,
 void Root::removeSwapchainContext(VkSwapchainKHR swapchain) {
     const std::unique_lock lock(this->mutex); // writer: map mutation (cold path)
     this->swapchains.erase(swapchain);
+}
+
+VkResult Root::presentSwapchain(VkSwapchainKHR swapchain,
+        const vk::Vulkan& vk, VkQueue queue,
+        void* next_chain, uint32_t imageIdx,
+        const std::vector<VkSemaphore>& semaphores) {
+    // thread-safe lookup with shared lock then dispatch via variant
+    // the unordered_map node stability guarantees the reference stays valid
+    // per Vulkan external-synchronization rules (no concurrent destroy)
+    ContextVariant* ctx = nullptr;
+    {
+        const std::shared_lock lock(this->mutex);
+        const auto it = this->swapchains.find(swapchain);
+        if (it == this->swapchains.end())
+            throw ls::error("swapchain context not found");
+        ctx = const_cast<ContextVariant*>(&it->second);
+    }
+    return std::visit([&](auto& c) -> VkResult {
+        return c.present(vk, queue, swapchain, next_chain, imageIdx, semaphores);
+    }, *ctx);
+}
+
+bool Root::isExternalContext(VkSwapchainKHR swapchain) const {
+    const std::shared_lock lock(this->mutex);
+    const auto it = this->swapchains.find(swapchain);
+    if (it == this->swapchains.end()) return false;
+    return std::holds_alternative<CaptureContext>(it->second);
+}
+
+bool Root::hasExternalContexts() const {
+    const std::shared_lock lock(this->mutex);
+    for (const auto& [_, ctx] : this->swapchains)
+        if (std::holds_alternative<CaptureContext>(ctx)) return true;
+    return false;
 }

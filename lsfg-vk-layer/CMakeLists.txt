@@ -1,9 +1,13 @@
 set(LAYER_SOURCES
     "src/entrypoint.cpp"
     "src/instance.cpp"
-    "src/swapchain.cpp")
+    "src/swapchain.cpp"
+    "src/capture_context.cpp")
 
 add_library(lsfg-vk-layer SHARED ${LAYER_SOURCES})
+
+target_include_directories(lsfg-vk-layer PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 target_link_libraries(lsfg-vk-layer
     PUBLIC lsfg-vk-common

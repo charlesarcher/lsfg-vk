@@ -8,10 +8,12 @@
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "swapchain.hpp"
+#include "lsfg-vk-layer/capture_context.hpp"
 
 #include <optional>
 #include <shared_mutex>
 #include <unordered_map>
+#include <variant>
 
 #include <vulkan/vulkan_core.h>
 
@@ -66,7 +68,9 @@ namespace lsfgvk::layer {
         /// reference stays valid because unordered_map nodes are stable and
         /// apps must not destroy a swapchain while presenting it (Vulkan
         /// external-synchronization rules)
-        [[nodiscard]] Swapchain& getSwapchainContext(VkSwapchainKHR swapchain) {
+        using ContextVariant = std::variant<Swapchain, CaptureContext>;
+
+        [[nodiscard]] ContextVariant& getSwapchainContext(VkSwapchainKHR swapchain) {
             const std::shared_lock lock(this->mutex);
             const auto& it = this->swapchains.find(swapchain);
             if (it == this->swapchains.end())
@@ -74,6 +78,15 @@ namespace lsfgvk::layer {
 
             return it->second;
         }
+        /// dispatch present to the stored context (external or game)
+        VkResult presentSwapchain(VkSwapchainKHR swapchain,
+            const vk::Vulkan& vk, VkQueue queue,
+            void* next_chain, uint32_t imageIdx,
+            const std::vector<VkSemaphore>& semaphores);
+        /// whether a swapchain is an external capture context
+        [[nodiscard]] bool isExternalContext(VkSwapchainKHR swapchain) const;
+        /// whether any external contexts are currently live
+        [[nodiscard]] bool hasExternalContexts() const;
         /// remove swapchain context
         /// @param swapchain swapchain handle
         void removeSwapchainContext(VkSwapchainKHR swapchain);
@@ -83,7 +96,7 @@ namespace lsfgvk::layer {
 
         ls::lazy<backend::Instance> backend;
         std::optional<std::string> backendGpuKey; // gpu key the backend was created with
-        std::unordered_map<VkSwapchainKHR, Swapchain> swapchains;
+        std::unordered_map<VkSwapchainKHR, ContextVariant> swapchains;
 
         /// guards backend/swapchains against concurrent present threads.
         /// writers: lazy backend emplace + context create/remove (cold paths);

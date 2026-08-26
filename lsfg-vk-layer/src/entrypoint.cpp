@@ -375,6 +375,15 @@ namespace {
         if (reload) {
             try {
                 for (const auto& [swapchain, vk] : instance_info->swapchains) {
+                    // external-mode contexts are NOT rebuilt by hot-reload:
+                    // rebuild would need a full IPC handshake + staging
+                    // re-export, and doing it under a concurrently blocked
+                    // present widens the existing UAF window (escaped
+                    // reference from getSwapchainContext's short-lived shared
+                    // lock) from frame-scale to seconds. skip them.
+                    if (layer_info->root.isExternalContext(swapchain))
+                        continue;
+
                     auto& info = instance_info->swapchainInfos.at(swapchain);
 
                     layer_info->root.removeSwapchainContext(swapchain);
@@ -403,9 +412,8 @@ namespace {
                 for (size_t j = 0; j < info->waitSemaphoreCount; j++)
                     waitSemaphores.push_back(info->pWaitSemaphores[j]);
 
-                auto& context = layer_info->root.getSwapchainContext(swapchain);
-                result = context.present(it->second,
-                    queue, swapchain,
+                result = layer_info->root.presentSwapchain(swapchain,
+                    it->second, queue,
                     const_cast<void*>(info->pNext),
                     info->pImageIndices[i],
                     { waitSemaphores.begin(), waitSemaphores.end() }

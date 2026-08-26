@@ -1,0 +1,71 @@
+=== Test 1: app absent (should fail with socket error) ===
+Selected WSI platform: wayland
+lsfg-vk: using profile with name 'test' (identified via executable)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+Selected GPU 2: Intel(R) Graphics (ARL), type: IntegratedGpu, apiVersion: 4211042 (1.4.354), driverVersion: 109060097 (26.2.1) 
+lsfg-vk: something went wrong during lsfg-vk swapchain creation:
+- lsfg-vk: failed to connect to app socket '/run/user/1000/lsfg-vk/app.sock'
+- connect() to '/run/user/1000/lsfg-vk/app.sock' failed: No such file or directory
+
+=== Test 2: app present (skeleton) ===
+Selected WSI platform: wayland
+lsfg-vk: using profile with name 'test' (identified via executable)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+Selected GPU 2: Intel(R) Graphics (ARL), type: IntegratedGpu, apiVersion: 4211042 (1.4.354), driverVersion: 109060097 (26.2.1) 
+lsfg-vk: external presentation active (game on 'Intel(R) Graphics (ARL)', app on socket)
+lsfg-vk: external presentation active (game on 'Intel(R) Graphics (ARL)', app on socket)
+listen "/run/user/1000/lsfg-vk/app.sock"
+err poll() on ipc socket failed: Connection reset by peer
+err poll() on ipc socket failed: Connection reset by peer
+
+=== FD leak check (500 frames) ===
+4
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+Selected GPU 2: Intel(R) Graphics (ARL), type: IntegratedGpu, apiVersion: 4211042 (1.4.354), driverVersion: 109060097 (26.2.1) 
+lsfg-vk: external presentation active (game on 'Intel(R) Graphics (ARL)', app on socket)
+lsfg-vk: external presentation active (game on 'Intel(R) Graphics (ARL)', app on socket)
+4
+listen "/run/user/1000/lsfg-vk/app.sock"
+err poll() on ipc socket failed: Connection reset by peer
+frames 30 slot 1
+frames 60 slot 1
+frames 90 slot 1
+frames 120 slot 1
+frames 150 slot 1
+frames 180 slot 1
+frames 210 slot 1
+frames 240 slot 1
+frames 270 slot 1
+frames 300 slot 1
+frames 330 slot 1
+frames 360 slot 1
+frames 390 slot 1
+frames 420 slot 1
+frames 450 slot 1
+frames 480 slot 1
+err poll() on ipc socket failed: Connection reset by peer
+
+=== SIGKILL survival ===
+Selected WSI platform: wayland
+lsfg-vk: using profile with name 'test' (identified via executable)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+Selected GPU 2: Intel(R) Graphics (ARL), type: IntegratedGpu, apiVersion: 4211042 (1.4.354), driverVersion: 109060097 (26.2.1) 
+lsfg-vk: external presentation active (game on 'Intel(R) Graphics (ARL)', app on socket)
+lsfg-vk: external presentation active (game on 'Intel(R) Graphics (ARL)', app on socket)
+lsfg-vk: external stream error: ipc connection closed by peer
+lsfg-vk: something went wrong during lsfg-vk swapchain presentation:
+- lsfg-vk: external stream error: ipc connection closed by peer
+- ipc connection closed by peer
+lsfg-vk: external stream error: ipc connection closed by peer
+lsfg-vk: something went wrong during lsfg-vk swapchain presentation:
+- lsfg-vk: external stream error: ipc connection closed by peer
+- ipc connection closed by peer
+killed skeleton
+    PID TTY          TIME CMD
+ 229494 ?        00:00:00 vkcube
+vkcube still alive
+=== Done ===

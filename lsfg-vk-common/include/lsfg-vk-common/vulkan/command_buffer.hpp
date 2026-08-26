@@ -96,6 +96,10 @@ namespace vk {
         /// @param vk the vulkan instance
         /// @throws ls::vulkan_error on failure
         void submit(const vk::Vulkan& vk) const;
+
+        /// get the raw VkCommandBuffer handle
+        /// @return the VkCommandBuffer handle
+        [[nodiscard]] VkCommandBuffer raw() const { return *commandBuffer; }
     private:
         ls::owned_ptr<VkCommandBuffer> commandBuffer;
     };
