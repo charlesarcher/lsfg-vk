@@ -1,0 +1,46 @@
+# t03 — IPC transport module evidence (2026-08-26T08:24:58-05:00)
+branch: feat/dual-gpu-oneway  head: a1445ce
+
+=== 1. module build (zero-warning gate) ===
+$ flock .git/build-lock cmake --build build -j$(nproc) --target lsfg-vk-common
+[100%] Built target lsfg-vk-common
+(rebuild from clean object:)
+no warnings, no errors
+
+=== 2. clang-tidy (repo config lsfg-vk-common/.clang-tidy) ===
+$ clang-tidy -p compile_commands.json --config-file=lsfg-vk-common/.clang-tidy lsfg-vk-common/src/ipc/socket.cpp
+0 warnings (0 = clean; LLVM22 misc-include-cleaner glibc bits/* mapping gap suppressed file-scoped with documented NOLINT block)
+
+=== 3. driver build ===
+$ g++ -std=c++23 -Wall -Wextra -I lsfg-vk-common/include /tmp/opencode/t03/t03-driver.cpp build/lsfg-vk-common/liblsfg-vk-common.a -o /tmp/opencode/t03/t03-driver
+driver built clean (-Wall -Wextra: no diagnostics)
+
+=== 4. driver run: handshake + 1000 FRAME/RELEASE + leak check ===
+envcheck: ok (XDG_RUNTIME_DIR is not set; cannot locate the lsfg-vk app socket (expected ${XDG_RUNTIME_DIR}/lsfg-vk/app.sock))
+misscheck: ok (connect() to '/tmp/opencode/t03/definitely-not-here.sock' failed: No such file or directory)
+deadlinecheck: ok (recvmsg() on ipc socket (deadline expired) failed: Connection timed out)
+server: hello from 'AMD Radeon RX 9060 XT (RADV GFX1200)' 1920x1080 fmt=37
+client: negotiated modifier=0x100000000000002 pitch=7680 size=33423360
+server: staging[0] fd=5 valid
+server: staging[1] fd=6 valid
+client: stream ready
+server: client: 10001000 frame/release cycles done
+ frame/release cycles done
+fdcount: before=3 after=3 delta=0 (tolerance +/-2)
+RUN OK
+run exit=$?
+
+=== 5. strace excerpt: sendmsg/recvmsg with SCM_RIGHTS ===
+$ strace -f -e trace=sendmsg,recvmsg /tmp/opencode/t03/t03-driver run
+[pid 210445] sendmsg(3, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\t\0\0\0GFSL\4", iov_len=9}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[4]}], msg_controllen=24, msg_flags=0}, MSG_NOSIGNAL) = 9
+[pid 210445] sendmsg(3, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\t\0\0\0GFSL\4", iov_len=9}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[4]}], msg_controllen=24, msg_flags=0}, MSG_NOSIGNAL <unfinished ...>
+[pid 210448] <... recvmsg resumed>, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\t\0\0\0GFSL\4", iov_len=9}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[5]}], msg_controllen=24, msg_flags=MSG_CMSG_CLOEXEC}, MSG_NOSIGNAL|MSG_CMSG_CLOEXEC) = 9
+[pid 210448] recvmsg(4, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\t\0\0\0GFSL\4", iov_len=9}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[6]}], msg_controllen=24, msg_flags=MSG_CMSG_CLOEXEC}, MSG_NOSIGNAL|MSG_CMSG_CLOEXEC) = 9
+[pid 210445] sendmsg(3, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\r\0\0\0GFSL\6\0\0\0\0", iov_len=13}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[4]}], msg_controllen=24, msg_flags=0}, MSG_NOSIGNAL) = 13
+[pid 210448] recvmsg(4, {msg_name=NULL, msg_namelen=0, msg_iov=[{iov_base="\r\0\0\0GFSL\6", iov_len=9}], msg_iovlen=1, msg_control=[{cmsg_len=20, cmsg_level=SOL_SOCKET, cmsg_type=SCM_RIGHTS, cmsg_data=[7]}], msg_controllen=24, msg_flags=MSG_CMSG_CLOEXEC}, MSG_NOSIGNAL|MSG_CMSG_CLOEXEC) = 9
+... (one cmsg carrying exactly one fd per STAGING/FRAME message; HELLO/NEGOTIATED/READY/RELEASE frames carry msg_controllen=0)
+
+=== 6. peer-kill mid-stream ===
+killtest: clean named error after peer death: poll() on ipc socket failed: Connection reset by peer
+KILLTEST OK (process alive, no crash)
+kill exit=$?
