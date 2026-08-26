@@ -1,0 +1,25 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+lsfg-vk: processing on 'AMD Radeon RX 9060 XT (RADV GFX1200)' [uuid 00000000870000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk: processing on '00000000870000000000000000000000' (game on 'Intel(R) Graphics (ARL)')
+lsfg-vk-debug: wait ok 1
+lsfg-vk-debug: wait ok 2
+lsfg-vk-debug: wait ok 3
+lsfg-vk-debug: wait ok 4
+=== rerun with explicit -g (CLI ignores LSFGVK_GPU; pinning 9070 XT per plan intent) ===
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk: processing on '00000000040000000000000000000000' (game on 'Intel(R) Graphics (ARL)')
+lsfg-vk-debug: wait ok 1
+lsfg-vk-debug: wait ok 2
+lsfg-vk-debug: wait ok 3
+lsfg-vk-debug: wait ok 4

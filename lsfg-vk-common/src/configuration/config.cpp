@@ -8,6 +8,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <utility>
@@ -106,6 +107,15 @@ namespace {
             return Pacing::None;
         throw ls::error("unknown pacing method: " + str);
     }
+    /// parse a presentation mode from string
+    Presentation presentationFromString(const std::string& str) {
+        if (str == "game")
+            return Presentation::Game;
+        if (str == "external")
+            return Presentation::External;
+        throw ls::error("unknown presentation mode: " + str
+            + " (allowed values: 'game', 'external')");
+    }
     /// parse the global configuration
     GlobalConf parseGlobalConf(const toml::table& tbl) {
         const GlobalConf conf{
@@ -127,13 +137,19 @@ namespace {
             .multiplier = tbl["multiplier"].value_or(2U),
             .flow_scale = tbl["flow_scale"].value_or(1.0F),
             .performance_mode = tbl["performance_mode"].value_or(false),
-            .pacing = parcingFromString(tbl["pacing"].value_or<std::string>("none"))
+            .pacing = parcingFromString(tbl["pacing"].value_or<std::string>("none")),
+            .presentation = presentationFromString(tbl["presentation"].value_or<std::string>("game")),
+            .output = tbl["output"].value<std::string>()
         };
 
         if (conf.multiplier <= 1)
             throw ls::error("multiplier must be greater than 1");
         if (conf.flow_scale < 0.25F || conf.flow_scale > 1.0F)
             throw ls::error("flow_scale must be between 0.25 and 1.0");
+        if (conf.presentation == Presentation::External && !conf.gpu)
+            throw ls::error("external presentation requires 'gpu' to select the processing device");
+        if (conf.output && conf.presentation == Presentation::Game)
+            std::cerr << "lsfg-vk: warning: output is only used by presentation='external'\n";
 
         return conf;
     }
@@ -247,6 +263,10 @@ void ConfigFile::write(const std::filesystem::path& path) const {
                 profile.insert("pacing", "none");
                 break;
         }
+        if (conf.presentation != Presentation::Game)
+            profile.insert("presentation", "external");
+        if (conf.output)
+            profile.insert("output", conf.output.value_or(""));
 
         profiles.push_back(profile);
     }

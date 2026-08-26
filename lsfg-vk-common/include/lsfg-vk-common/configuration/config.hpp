@@ -25,6 +25,14 @@ namespace ls {
         None
     };
 
+    /// presentation mode for a profile
+    enum class Presentation : uint8_t {
+        /// present frames in the game process itself
+        Game,
+        /// present frames in an external companion process
+        External
+    };
+
     /// game profile configuration
     struct GameConf {
         /// name of the profile
@@ -41,6 +49,10 @@ namespace ls {
         bool performance_mode{false};
         /// pacing method
         Pacing pacing{Pacing::None};
+        /// where the frames get presented
+        Presentation presentation{Presentation::Game};
+        /// optional output name for external presentation
+        std::optional<std::string> output;
     };
 
     /// parsed configuration file

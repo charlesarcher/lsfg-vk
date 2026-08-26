@@ -1,0 +1,179 @@
+########## T02 config fixtures transcript (2026-08-26T07:44:01-05:00) ##########
+=== baseline ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "baseline"
+active_in = 'vkcube'
+multiplier = 2
+--- output:
+  baseline: presentation=game, output=-
+Validation success
+exit=0
+
+=== game-explicit ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "explicit game"
+active_in = 'vkcube'
+presentation = "game"
+multiplier = 2
+--- output:
+  explicit game: presentation=game, output=-
+Validation success
+exit=0
+
+=== external-gpu-ok ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "external ok"
+active_in = 'vkcube'
+gpu = 'NVIDIA GeForce RTX 5080'
+presentation = "external"
+output = "DP-1"
+multiplier = 2
+--- output:
+  external ok: presentation=external, output=DP-1
+Validation success
+exit=0
+
+=== external-no-gpu ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "external no gpu"
+active_in = 'vkcube'
+presentation = "external"
+multiplier = 2
+--- output:
+Validation failed: external presentation requires 'gpu' to select the processing device
+exit=1
+
+=== bad-value ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "bad value"
+active_in = 'vkcube'
+presentation = "windowed"
+multiplier = 2
+--- output:
+Validation failed: unknown presentation mode: windowed (allowed values: 'game', 'external')
+exit=1
+
+=== output-with-game ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "output with game"
+active_in = 'vkcube'
+output = "DP-1"
+multiplier = 2
+--- output:
+lsfg-vk: warning: output is only used by presentation='external'
+  output with game: presentation=game, output=DP-1
+Validation success
+exit=0
+
+########## baseline re-check after changes ##########
+  baseline: presentation=game, output=-
+Validation success
+exit=0
+NOTE: diff vs t02-baseline.log = only the added per-profile field line
+("  baseline: presentation=game, output=-") printed by the updated validate CLI.
+Parse behavior is byte-identical: same conf -> exit=0, "Validation success",
+no warnings. Absent-key default path unchanged.
+
+########## re-run against final binary (clang-tidy clean) ##########
+=== baseline ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "baseline"
+active_in = 'vkcube'
+multiplier = 2
+--- output:
+  baseline: presentation=game, output=-
+Validation success
+exit=0
+
+=== game-explicit ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "explicit game"
+active_in = 'vkcube'
+presentation = "game"
+multiplier = 2
+--- output:
+  explicit game: presentation=game, output=-
+Validation success
+exit=0
+
+=== external-gpu-ok ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "external ok"
+active_in = 'vkcube'
+gpu = 'NVIDIA GeForce RTX 5080'
+presentation = "external"
+output = "DP-1"
+multiplier = 2
+--- output:
+  external ok: presentation=external, output=DP-1
+Validation success
+exit=0
+
+=== external-no-gpu ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "external no gpu"
+active_in = 'vkcube'
+presentation = "external"
+multiplier = 2
+--- output:
+Validation failed: external presentation requires 'gpu' to select the processing device
+exit=1
+
+=== bad-value ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "bad value"
+active_in = 'vkcube'
+presentation = "windowed"
+multiplier = 2
+--- output:
+Validation failed: unknown presentation mode: windowed (allowed values: 'game', 'external')
+exit=1
+
+=== output-with-game ===
+--- conf:
+version = 2
+
+[[profile]]
+name = "output with game"
+active_in = 'vkcube'
+output = "DP-1"
+multiplier = 2
+--- output:
+lsfg-vk: warning: output is only used by presentation='external'
+  output with game: presentation=game, output=DP-1
+Validation success
+exit=0
+
