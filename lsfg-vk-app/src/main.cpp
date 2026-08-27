@@ -13,6 +13,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lsfg-vk-app/stream.hpp"
+#include "lsfg-vk-app/wsi/surface_backend.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
@@ -20,6 +21,9 @@
 #include "lsfg-vk-common/helpers/paths.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
+#include "lsfg-vk-common/vulkan/command_buffer.hpp"
+#include "lsfg-vk-common/vulkan/fence.hpp"
+#include "lsfg-vk-common/vulkan/semaphore.hpp"
 
 #include <array>
 #include <cerrno>
@@ -233,10 +237,282 @@ namespace {
 
         return result;
     }
+
+    /// build a single VkImageMemoryBarrier for the pink-clear pass: a one-line
+    /// UNDEFINED<->layout transition on a single-color swapchain image recorded
+    /// on a lone graphics queue family (VK_QUEUE_FAMILY_INVALID, exclusive mode)
+    VkImageMemoryBarrier makeClearBarrier(VkImage image, VkAccessFlags oldAccess,
+            VkImageLayout oldLayout, VkAccessFlags newAccess,
+            VkImageLayout newLayout) {
+        VkImageMemoryBarrier b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        b.srcAccessMask = oldAccess;
+        b.dstAccessMask = newAccess;
+        b.oldLayout = oldLayout;
+        b.newLayout = newLayout;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = image;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.baseMipLevel = 0;
+        b.subresourceRange.levelCount = 1;
+        b.subresourceRange.baseArrayLayer = 0;
+        b.subresourceRange.layerCount = 1;
+        return b;
+    }
+
+    /// --wsi-test: temporary standalone WSI smoke path (task 7 acceptance).
+    /// Opens a borderless window on the display GPU's primary (or named) output,
+    /// builds a real VkSurfaceKHR + FIFO swapchain on the processing wrapper and
+    /// clears frames until closed / SIGINT / ~300 frames. Runs entirely on its
+    /// OWN graphical vk::Vulkan (isGraphical=true) so wsi->df() populates the
+    /// swapchain PFNs. Operates directly on argv: getopt is normal-path only.
+    /// @return EXIT_SUCCESS on a clean run (errors throw ls::error upward)
+    int runWsiTest(int argc, char** argv) {
+        // --output <name> is read straight from argv (the normal path uses
+        // getopt_long; this branch must not touch it).
+        std::optional<std::string> optOutput;
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--output" && i + 1 < argc) {
+                optOutput = argv[i + 1];
+                break;
+            }
+        }
+
+        // --- build a GRAPHICAL vk::Vulkan on the display GPU (RX 9060 XT) ---
+        // the layer is a global ICD-loader layer, so disable it here exactly
+        // like the transport path (setenv before, unsetenv on both paths). the
+        // smoke path builds its own instance (isGraphical=true) so wsi->df()
+        // populates the swapchain PFNs.
+        setenv("DISABLE_LSFGVK", "1", 1);
+        std::optional<vk::Vulkan> wsi;
+        try {
+            wsi.emplace(
+                "lsfg-vk-app", vk::version{2, 0, 0},
+                "lsfg-vk-app-engine", vk::version{2, 0, 0},
+                [](const vk::VulkanInstanceFuncs& fi,
+                   const std::vector<VkPhysicalDevice>& devices) -> VkPhysicalDevice {
+                    // select the display GPU by deviceName; mirror the
+                    // transport path's probeDevice/matchesSelector helpers.
+                    const std::string wanted =
+                        "AMD Radeon RX 9060 XT (RADV GFX1200)";
+                    for (const VkPhysicalDevice& dev : devices) {
+                        const auto id = probeDevice(fi, dev);
+                        if (matchesSelector(id, wanted))
+                            return dev;
+                    }
+                    throw ls::error("failed to find display GPU '" + wanted + "'");
+                },
+                true,          // isGraphical — real swapchain PFNs in wsi->df()
+                std::nullopt,  // setLoaderData
+                std::nullopt,  // cachefile
+                false          // enableDmaBufExtensions — swapchain only, no exchange
+            );
+        } catch (const std::exception& e) {
+            unsetenv("DISABLE_LSFGVK");
+            throw ls::error("--wsi-test: failed to create graphical device", e);
+        }
+        unsetenv("DISABLE_LSFGVK");
+
+        std::cerr << "--wsi-test: display GPU: " << deviceName(*wsi) << "\n";
+
+        // --- connect the X11 surface backend --------------------------------
+        auto backend = ls::wsi::createX11SurfaceBackend();
+        if (!backend->connect("x11"))
+            throw ls::error("--wsi-test: X11 backend could not connect");
+
+        // --- enumerate outputs (greppable, one line each) -------------------
+        const auto outputs = backend->outputs();
+        for (const auto& out : outputs)
+            std::cerr << "--wsi-test: output " << out.name << ' ' << out.width
+                      << "x" << out.height << '@' << out.refresh << "mHz\n";
+
+        // --- resolve the target output --------------------------------------
+        // --output must EXACTLY match an enumerated output; empty/absent =>
+        // primary (pass "" to createWindow).
+        std::string outputName;  // empty => primary/active output
+        if (optOutput.has_value()) {
+            bool found{false};
+            for (const auto& out : outputs)
+                if (out.name == *optOutput) { found = true; break; }
+            if (!found) {
+                std::string avail;
+                for (const auto& out : outputs)
+                    avail += (avail.empty() ? std::string() : ", ") + out.name;
+                throw ls::error("--wsi-test: output '" + *optOutput
+                    + "' not found; available: " + avail);
+            }
+            outputName = *optOutput;
+        }
+
+        // --- create window + surface ----------------------------------------
+        auto handle = backend->createWindow(outputName, VkExtent2D{512, 512}, 0u);
+        VkSurfaceKHR surface = backend->createSurface(*wsi, handle);
+
+        // --- query caps, then pick an extent the surface will accept (> 0x0) ---
+        VkSurfaceCapabilitiesKHR caps{};
+        std::vector<VkColorSpaceKHR> colorspaces;
+        backend->surfaceCaps(surface, caps, colorspaces);
+        (void)colorspaces;  // surfaceCaps fills it; format chosen explicitly below
+        std::cerr << "--wsi-test: caps minImageExtent " << caps.minImageExtent.width
+                  << "x" << caps.minImageExtent.height
+                  << " maxImageExtent " << caps.maxImageExtent.width << "x"
+                  << caps.maxImageExtent.height << "\n";
+        auto clamp32 = [](uint32_t v, uint32_t lo, uint32_t hi) {
+            return v < lo ? lo : (v > hi ? hi : v);
+        };
+        VkExtent2D extent{512, 512};
+        // only clamp to caps when the reported range is sane (min<=max, max>0);
+        // RADV/XCB under XWayland can report a degenerate 0x0 max, so fall back
+        // to the requested extent clamped to a sane [1, 16384] band instead.
+        if (caps.minImageExtent.width <= caps.maxImageExtent.width
+                && caps.maxImageExtent.width > 0 && caps.maxImageExtent.height > 0) {
+            extent.width = clamp32(512, caps.minImageExtent.width, caps.maxImageExtent.width);
+            extent.height = clamp32(512, caps.minImageExtent.height, caps.maxImageExtent.height);
+        } else {
+            extent.width = clamp32(512, 1u, 16384u);
+            extent.height = clamp32(512, 1u, 16384u);
+        }
+        if (extent.width == 0 || extent.height == 0)
+            throw ls::error("--wsi-test: surface supported extent is 0x0");
+
+        // --- create a FIFO color-attachment swapchain -----------------------
+        // explicit RADV/XCB combo: R8G8B8A8_UNORM + SRGB_NONLINEAR. compositing
+        // alpha prefers OPAQUE, then PRE_MULTIPLIED, then POST_MULTIPLIED.
+        VkCompositeAlphaFlagBitsKHR compositingAlpha =
+            VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;  // lowest-priority fallback
+        if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) {
+            if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
+                compositingAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+            else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
+                compositingAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+        }
+
+        VkSwapchainCreateInfoKHR ci{};
+        ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
+        ci.surface = surface;
+        ci.minImageCount = caps.minImageCount < 2 ? 3 : caps.minImageCount;
+        ci.imageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+        ci.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        ci.imageExtent = extent;
+        ci.imageArrayLayers = 1;
+        ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+        ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ci.pQueueFamilyIndices = nullptr;
+        ci.preTransform = caps.currentTransform;
+        ci.compositeAlpha = compositingAlpha;
+        ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        ci.clipped = VK_TRUE;
+        ci.oldSwapchain = VK_NULL_HANDLE;
+
+        VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+        auto createRes = wsi->df().CreateSwapchainKHR(wsi->dev(), &ci, VK_NULL_HANDLE, &swapchain);
+        if (createRes != VK_SUCCESS)
+            throw ls::vulkan_error(createRes, "--wsi-test: CreateSwapchainKHR failed");
+
+        uint32_t imageCount{};
+        if (wsi->df().GetSwapchainImagesKHR(wsi->dev(), swapchain, &imageCount, nullptr) != VK_SUCCESS)
+            throw ls::vulkan_error("failed to enumerate swapchain images");
+        std::vector<VkImage> images(imageCount);
+        if (wsi->df().GetSwapchainImagesKHR(wsi->dev(), swapchain, &imageCount, images.data()) != VK_SUCCESS)
+            throw ls::vulkan_error("failed to enumerate swapchain images");
+
+        // --- per-frame acquire -> clear -> submit -> present ----------------
+        vk::Semaphore acquireSem{*wsi};
+        vk::Semaphore signalSem{*wsi};
+        vk::Fence fence{*wsi};
+        vk::CommandBuffer cmdbuf{*wsi};
+
+        VkClearColorValue pink{};
+        pink.float32[0] = 1.0F; pink.float32[1] = 0.0F;
+        pink.float32[2] = 1.0F; pink.float32[3] = 1.0F;
+        VkImageSubresourceRange colorRange{};
+        colorRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        colorRange.baseMipLevel = 0;
+        colorRange.levelCount = 1;
+        colorRange.baseArrayLayer = 0;
+        colorRange.layerCount = 1;
+
+        constexpr int maxFrames = 300;  // ~cap for automation
+        for (int frame = 0; frame < maxFrames; ++frame) {
+            if (g_stop.load())
+                break;
+
+            // acquire the next swapchain image (waits on the acquire semaphore)
+            uint32_t imageIdx{};
+            auto aqRes = wsi->df().AcquireNextImageKHR(
+                wsi->dev(), swapchain, UINT64_MAX,
+                acquireSem.handle(), VK_NULL_HANDLE, &imageIdx);
+            if (aqRes != VK_SUCCESS && aqRes != VK_SUBOPTIMAL_KHR)
+                throw ls::vulkan_error(aqRes, "--wsi-test: AcquireNextImageKHR failed");
+
+            const VkImage image = images.at(imageIdx);
+
+            // record: UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL, clear pink,
+            //        COLOR_ATTACHMENT_OPTIMAL -> PRESENT_SRC_KHR
+            cmdbuf.begin(*wsi);
+            cmdbuf.insertBarriers(*wsi, { makeClearBarrier(
+                image, VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) });
+            wsi->df().CmdClearColorImage(cmdbuf.raw(), image,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, &pink, 1, &colorRange);
+            cmdbuf.insertBarriers(*wsi, { makeClearBarrier(
+                image, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR) });
+            cmdbuf.end(*wsi);
+
+            // submit (signaling the fence) and block until it completes
+            fence.reset(*wsi);
+            cmdbuf.submit(*wsi,
+                { acquireSem.handle() }, VK_NULL_HANDLE, 0,
+                { signalSem.handle() }, VK_NULL_HANDLE, 0,
+                fence.handle()
+            );
+            if (!fence.wait(*wsi))
+                throw ls::vulkan_error(VK_TIMEOUT, "--wsi-test: fence wait timed out");
+
+            // present (waits on the signal semaphore)
+            VkPresentInfoKHR presentInfo{};
+            presentInfo.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+            presentInfo.waitSemaphoreCount = 1;
+            presentInfo.pWaitSemaphores = &signalSem.handle();
+            presentInfo.swapchainCount = 1;
+            presentInfo.pSwapchains = &swapchain;
+            presentInfo.pImageIndices = &imageIdx;
+            auto pRes = wsi->df().QueuePresentKHR(wsi->queue(), &presentInfo);
+            if (pRes != VK_SUCCESS && pRes != VK_SUBOPTIMAL_KHR)
+                throw ls::vulkan_error(pRes, "--wsi-test: QueuePresentKHR failed");
+
+            // stop if the window resized or closed
+            if (backend->processEvents(16))
+                break;
+        }
+
+        // --- teardown: destroy the swapchain, then the backend (RAII frees wsi)
+        wsi->df().DestroySwapchainKHR(wsi->dev(), swapchain, VK_NULL_HANDLE);
+        backend->destroy();
+
+        std::cerr << "--wsi-test: smoke path completed\n";
+        return EXIT_SUCCESS;
+    }
+
 }
 
 int main(int argc, char** argv) {
     try {
+        // --- --wsi-test: temporary standalone WSI smoke path (task 7) -------
+        // operate directly on argv; getopt is the normal-path only. returns the
+        // smoke result straight from main() so the normal path is never reached
+        // when --wsi-test is passed.
+        bool wsiTest{false};
+        for (int i = 1; i < argc; ++i) {
+            if (std::string(argv[i]) == "--wsi-test") { wsiTest = true; break; }
+        }
+        if (wsiTest)
+            return runWsiTest(argc, argv);
+
         const Options opts = parseArgs(argc, argv);
         g_outputOverride = opts.output;
 

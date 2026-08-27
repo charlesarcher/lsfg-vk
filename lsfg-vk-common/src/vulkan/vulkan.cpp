@@ -64,9 +64,15 @@ namespace {
     }
 
     /// create a vulkan instance
+    /// @param enableSurfaceExtensions when true (graphical instances) the
+    ///        presentation-surface instance extensions are enabled so their
+    ///        creation functions (e.g. vkCreateXcbSurfaceKHR) resolve via
+    ///        vkGetInstanceProcAddr. Availability-filtered: only an extension
+    ///        the loader actually reports is requested.
     ls::owned_ptr<VkInstance> createInstance(
             const std::string& appName, version appVersion,
-            const std::string& engineName, version engineVersion) {
+            const std::string& engineName, version engineVersion,
+            bool enableSurfaceExtensions = false) {
         VkInstance handle{};
 
         auto vkCreateInstance =
@@ -82,9 +88,45 @@ namespace {
             .engineVersion = engineVersion.into(),
             .apiVersion = VK_API_VERSION_1_2 // seems 1.2 is supported on all Vulkan-capable GPUs
         };
+
+        // Presentation-surface instance extensions must be enabled for their
+        // creation functions to be exported by the loader. Only enable an
+        // extension the loader actually reports as available, so we never ask
+        // for an unavailable one and hit VK_ERROR_EXTENSION_NOT_PRESENT.
+        const char* surfaceExtNames[] = { "VK_KHR_xcb_surface" };
+        std::vector<const char*> enabledExtensions;
+        if (enableSurfaceExtensions) {
+            // every vulkan function is pulled from the loader via
+            // vkGetInstanceProcAddr; the library never links libvulkan.
+            auto enumerateExt = ipa<PFN_vkEnumerateInstanceExtensionProperties>(
+                get_mpa(), VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+            if (!enumerateExt)
+                throw ls::vulkan_error(
+                    "failed to get vkEnumerateInstanceExtensionProperties symbol");
+            uint32_t extCount{};
+            if (enumerateExt(VK_NULL_HANDLE, &extCount, nullptr) != VK_SUCCESS)
+                throw ls::vulkan_error("failed to enumerate instance extensions");
+            std::vector<VkExtensionProperties> exts(extCount);
+            if (extCount > 0
+                    && enumerateExt(VK_NULL_HANDLE, &extCount, exts.data()) != VK_SUCCESS)
+                throw ls::vulkan_error("failed to enumerate instance extensions");
+            for (const auto& ext : exts) {
+                const std::string_view name{ext.extensionName};
+                for (const char* want : surfaceExtNames)
+                    if (name == std::string_view(want)) {
+                        enabledExtensions.push_back(want);
+                        break;
+                    }
+            }
+        }
+
         const VkInstanceCreateInfo instanceInfo{
             .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            .pApplicationInfo = &appInfo
+            .pApplicationInfo = &appInfo,
+            .enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size()),
+            .ppEnabledExtensionNames = enabledExtensions.empty()
+                ? nullptr
+                : enabledExtensions.data()
         };
         auto res = vkCreateInstance(&instanceInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
@@ -227,7 +269,8 @@ namespace {
         std::vector<const char*> requestedExtensions{
             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
-            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME
+            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+            VK_KHR_SWAPCHAIN_EXTENSION_NAME
         };
         if (enableDmaBufExtensions) {
             // two-stage policy: capability is requested best-effort here
@@ -263,6 +306,39 @@ namespace {
         auto res = fi.CreateDevice(physdev, &deviceInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkCreateDevice() failed");
+
+        // Attach loader data to the freshly created device. The Vulkan loader
+        // implements device entry points such as vkCreateSwapchainKHR behind the
+        // loader, so they only resolve via vkGetDeviceProcAddr once loader data
+        // is present on the device. The standalone Vulkan ctor resolves its
+        // device-function pointers (including the swapchain PFNs required by a
+        // graphical device) AFTER this function returns, so loader data MUST be
+        // set here for a graphical device to build a real swapchain surface.
+        // This is isolated to the standalone ctor: createLogicalDevice is only
+        // called from there (vulkan.cpp:545), never by the layer's two-way path.
+        // Attach loader data to the freshly created device. The Vulkan loader
+        // implements device entry points such as vkCreateSwapchainKHR behind the
+        // loader, so they only resolve via vkGetDeviceProcAddr once loader data
+        // is present on the device. The standalone Vulkan ctor resolves its
+        // device-function pointers (including the swapchain PFNs required by a
+        // graphical device) AFTER this function returns, so loader data MUST be
+        // set here for a graphical device to build a real swapchain surface.
+        // This is isolated to the standalone ctor: createLogicalDevice is only
+        // called from there (vulkan.cpp:545), never by the layer's two-way path.
+        {
+            auto GetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(
+                fi.GetDeviceProcAddr(handle, "vkGetDeviceQueue"));
+            VkQueue queue{VK_NULL_HANDLE};
+            if (GetDeviceQueue)
+                GetDeviceQueue(handle, cfi, 0, &queue);
+            auto setLoaderDataFn = reinterpret_cast<PFN_vkSetDeviceLoaderData>(
+                fi.GetDeviceProcAddr(handle, "vkSetDeviceLoaderData"));
+            if (setLoaderDataFn) {
+                auto ldr = setLoaderDataFn(handle, queue);
+                if (ldr != VK_SUCCESS)
+                    throw ls::vulkan_error(ldr, "vkSetDeviceLoaderData() failed");
+            }
+        }
 
         auto defunc =
             dpa<PFN_vkDestroyDevice>(fi, handle, "vkDestroyDevice");
@@ -489,7 +565,8 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         bool enableDmaBufExtensions) :
     instance(createInstance(
         appName, appVersion,
-        engineName, engineVersion
+        engineName, engineVersion,
+        isGraphical
     )),
     instance_funcs(initVulkanInstanceFuncs(*this->instance, get_mpa(), false)),
     phys_dev(findPhysicalDevice(this->instance_funcs,
@@ -508,7 +585,7 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
     setLoaderData(setLoaderData),
     device_funcs(initVulkanDeviceFuncs(
         this->instance_funcs,
-        *this->device, false
+        *this->device, isGraphical
     )),
     computeQueue(getQueue(this->device_funcs, *this->device,
         this->setLoaderData,
