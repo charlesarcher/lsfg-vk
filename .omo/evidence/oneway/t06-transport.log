@@ -1,0 +1,82 @@
+================================================================================
+Task 6 QA: lsfg-vk-app - negotiate exchange layout from true caps + wire backend
+contexts (real cross-device transport)
+Plan: .omo/plans/oneway-dualgpu.md  |  task 6
+================================================================================
+
+## Build
+    cmake --build build --target lsfg-vk-app
+    -> [100%] Built target lsfg-vk-app  (exit 0, no warnings)
+
+App source (task 6 scope):
+    lsfg-vk-app/CMakeLists.txt          (add lsfg-vk-backend link)
+    lsfg-vk-app/src/main.cpp            (backend Instance, DISABLE_LSFGVK, accept loop)
+    lsfg-vk-app/src/stream.cpp          (true-caps negotiation + 2xSTAGING +
+                                           2xDEST + backend.openContext + isCrossDevice)
+    lsfg-vk-app/include/lsfg-vk-app/stream.hpp (StreamState grew to 2 source +
+                                           2 dest images + owned context)
+
+## QA setup
+    XDG_RUNTIME_DIR=/run/user/1000
+    XDG_CONFIG_HOME=/tmp/lsfgq          -> conf.toml with profiles:
+        vkcube-game : active_in=vkcube, gpu="Intel(R) Graphics (ARL)", presentation=external
+        vkcube-app  : gpu="AMD Radeon RX 9060 XT (RADV GFX1200)"
+    Layer rig: cd /tmp/opencode/layer-test
+               VK_LAYER_PATH=/tmp/opencode/layer-test
+               VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation
+    Socket:    /run/user/1000/lsfg-vk/app.sock
+
+## Negotiated modifier
+    App negotiates R8G8B8A8_UNORM from the APP (RADV) device TRUE caps. The layer
+    validates the negotiated modifier on the GAME device (ANV). A RADV-only proper
+    DRM modifier is not advertised by ANV, so negotiation MUST return the LINEAR
+    fallback (modifier == EXCHANGE_MODIFIER_LINEAR), mirroring the layer's proven
+    swapchain.cpp cross-device path (gameCaps vs a LINEAR-only proxy).
+
+## 10 rapid vkcube restart cycles (timeout 6s each, layer-driven external presentation)
+run 1  ext=2  using profile with name 'vkcube-game'
+run 2  ext=2  using profile with name 'vkcube-game'
+run 3  ext=2  using profile with name 'vkcube-game'
+run 4  ext=2  using profile with name 'vkcube-game'
+run 5  ext=2  using profile with name 'vkcube-game'
+run 6  ext=2  using profile with name 'vkcube-game'
+run 7  ext=2  using profile with name 'vkcube-game'
+run 8  ext=2  using profile with name 'vkcube-game'
+run 9  ext=2  using profile with name 'vkcube-game'
+run 10 ext=2  using profile with name 'vkcube-game'
+-> 10/10 cycles: layer connected and established external presentation on 'Intel(R) Graphics (ARL)'
+
+## Per-stream handshake (app side logs) -- cross-device context opened + logged
+    lsfg-vk-app: stream from 'Intel(R) Graphics (ARL)' 500x500 VkFormat(58)
+    lsfg-vk-app: context created on 'dma-buf' cross-device=1
+-> 20 total streams across 10 cycles (2 per cycle); every stream logged
+   "context created on 'dma-buf' cross-device=1" (backend context opened AND the
+   isCrossDevice() guard verified true for each).
+
+## Listener / fd stability
+    ss -lxp  ->  1 listener: /run/user/1000/lsfg-vk/app.sock users:(("lsfg-vk-app",pid=...,fd=8))
+    app fd count before cycles : 9
+    app fd count after  cycles : 9   (no fd leak over 20 streams)
+    single listener confirmed live before and after a vkcube cycle.
+
+## VUID scan
+    grep -c VUID app.log  ->  0   (zero Vulkan validation errors)
+
+## RESULT: PASS
+App negotiates the exchange layout from the app device's TRUE caps (LINEAR fallback,
+accepted by the game device), imports 2 staging images, creates 2 self-exporting dest
+images, opens a backend cross-device context, verifies isCrossDevice()==true, and logs
+"context created ... cross-device=1" on all 20 streams. Full handshake completes across
+10 rapid churns with a single listener, fd stable (9->9), and ZERO VUID.
+
+## Fix log (deviation from the mechanical spec)
+1. negotiateExchangeLayout app-vs-app (RADV vs RADV) returned a RADV-only proper DRM
+   modifier (0x144115188076389125) that the ANV game device rejected ("negotiated
+   modifier ... not advertised by game device"), breaking the stream before READY.
+   Fixed: negotiate against a LINEAR-only caps proxy (mirror layer swapchain.cpp),
+   forcing modifier == EXCHANGE_MODIFIER_LINEAR so the game device accepts it.
+2. The original (pre-fix) path only closed the exportDmaBuf handle on the dup-failure
+   branch; the success path leaked one unowned fd per dest image (2/stream). Confirmed
+   leak 9->49 over 20 streams. Fixed: close exp.fd after the dup is handed to the
+   backend (backend only consumes the dup), restoring fd stability 9->9.
+================================================================================

@@ -2,10 +2,11 @@
 
 // lsfg-vk-app: the receiving side of one-way (external) dual-GPU frame
 // generation. It binds the IPC listener, completes the handshake with the
-// task-4 layer, and holds per-stream state. WSI/presentation (creating the
-// output swapchain on the processing GPU) is a later task; this skeleton only
-// needs a real vk::Vulkan on the processing device so it can be addressed and
-// logged, and so the exchange extension set is enabled on that device.
+// task-4 layer, holds per-stream state, and opens real cross-device
+// frame-generation contexts via the lsfg-vk backend. WSI/presentation
+// (creating the output swapchain on the processing GPU) is a later task;
+// this only needs a real vk::Vulkan on the processing device plus a backend
+// Instance so it can negotiate, import staging, and open a context.
 
 // glibc keeps struct sigaction / sigemptyset behind __USE_POSIX, which is only
 // enabled when a POSIX feature-test macro is defined before any include.
@@ -13,8 +14,10 @@
 
 #include "lsfg-vk-app/stream.hpp"
 
+#include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/helpers/paths.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
@@ -49,6 +52,12 @@ namespace {
     std::atomic<bool> g_stop{false};
     /// write end of the SIGINT self-pipe; the handler signals via it
     int g_selfPipeWrite{-1};
+
+    /// process-level frame-gen backend instance (never freed: makeLeaking).
+    /// created once before the accept loop, alive for the whole run. its
+    /// selection predicate mirrors the vk::Vulkan PhysicalDeviceSelector: the
+    /// profile 'gpu' key (deviceName | ids | pci).
+    static lsfgvk::backend::Instance* g_backend{nullptr};
 
     /// SIGINT handler: write a byte to the self-pipe so the blocking accept()
     /// poll() returns (SIGPIPE is ignored so a peer's death does not kill us).
@@ -142,9 +151,9 @@ namespace {
             std::string("lsfg-vk-app - receiving side of one-way external dual-GPU frame generation.\n\n")
             + "USAGE:\n    " + prog + " [OPTIONS]\n\n"
             + "OPTIONS:\n"
-            + "    -p, --profile <name>    REQUIRED: profile selecting the processing GPU\n"
-            + "    -o, --output <name>     OPTIONAL: output name for later presentation tasks\n"
-            + "    -v, --verbose           Verbose per-frame logging\n"
+            + "    -p, --profile <name>    REQUIRED: profile selecting the processing GPU"
+            + "    -o, --output <name>     OPTIONAL: output name for later presentation tasks"
+            + "    -v, --verbose           Verbose per-frame logging"
             + "    -h, --help              Show this help\n";
         std::cerr << text;
     }
@@ -162,8 +171,8 @@ namespace {
         const std::array<option, 4> GETOPT {{
             { "profile",   required_argument, nullptr, 'p' },
             { "output",    required_argument, nullptr, 'o' },
-            { "verbose",   no_argument,       nullptr, 'v' },
-            { "help",      no_argument,       nullptr, 'h' }
+            { "verbose",     no_argument,       nullptr, 'v' },
+            { "help",        no_argument,       nullptr, 'h' }
         }};
 
         int c{};
@@ -274,6 +283,48 @@ int main(int argc, char** argv) {
 
         const std::string devName = deviceName(*vk);
 
+        // --- create the process-level frame-gen backend instance -----------
+        // The backend dlopens the shader DLL and must select the SAME processing
+        // GPU the vk::Vulkan above targets (match profile.gpu via
+        // deviceName | ids | pci, mirroring the selector lambda above). mirror
+        // the vk::Vulkan disable dance: setenv before the ctor, unsetenv on
+        // BOTH the success and the failure paths. makeLeaking() is the loader
+        // workaround that prevents the Vulkan loader from trying to destroy the
+        // instance/device (a known loader bug) - do it once, right after the
+        // backend is constructed.
+        ls::ConfigFile cfg{ls::findConfigurationFile()};
+        const auto& g = cfg.global();
+        const std::filesystem::path shaderDll =
+            g.dll.has_value() ? std::filesystem::path(*g.dll) : ls::findShaderDll();
+        {
+            const char* kDisable = "DISABLE_LSFGVK";
+            setenv(kDisable, "1", 1);
+            bool backendOk{false};
+            try {
+                g_backend = new lsfgvk::backend::Instance{
+                    [conf = conf](const std::string& name,
+                                  std::pair<const std::string&, const std::string&> ids,
+                                  const std::optional<std::string>& pci) {
+                        const std::string& wanted = *conf.gpu;
+                        return (name == wanted)
+                            || (ids.first + ":" + ids.second) == wanted
+                            || (pci.has_value() && *pci == wanted);
+                    },
+                    shaderDll,
+                    g.allow_fp16,
+                    true  // enableDmaBufExtensions=true (cross-device path)
+                };
+                lsfgvk::backend::makeLeaking();
+                backendOk = true;
+            } catch (const std::exception& e) {
+                unsetenv(kDisable);
+                throw ls::error("failed to create frame-gen backend for profile '"
+                    + conf.name + "'", e);
+            }
+            unsetenv(kDisable);
+            (void)backendOk;
+        }
+
         // --- bind the listener + SIGINT self-pipe --------------------------
         struct sigaction sa{};
         sa.sa_handler = onSigInt;
@@ -349,7 +400,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 try {
-                    ls::ipc::runStream(conn, it.first->second, g_stop);
+                    ls::ipc::runStream(conn, it.first->second, g_stop, *vk, *g_backend, conf);
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk-app: stream ended: " << e.what() << "\n";
                 }
