@@ -1,6 +1,7 @@
 set(APP_SOURCES
     "src/main.cpp"
     "src/stream.cpp"
+    "src/presentation.cpp"
     "src/wsi/backend_x11.cpp")
 
 add_executable(lsfg-vk-app ${APP_SOURCES})

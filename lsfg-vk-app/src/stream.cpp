@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lsfg-vk-app/stream.hpp"
+#include "lsfg-vk-app/presentation.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
@@ -260,21 +261,11 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     // 6. READY: stream is live.
     conn.send(ls::ipc::Ready{});
 
-    // 7. steady state: per FRAME consume the sync fd and release the slot.
-    //    KEEP the existing FRAME loop unchanged - do NOT call scheduleFrames
-    //    (that is task 8).
-    while (!stop.load(std::memory_order_relaxed)) {
-        auto frameMsg = recvStop(conn, stop);
-        if (!frameMsg)
-            break;
-        const auto* frame = std::get_if<Frame>(&*frameMsg);
-        if (!frame)
-            throw ls::error(std::string("expected FRAME, got ")
-                + nameOf(typeOf(*frameMsg)));
-        const int syncFd = conn.takeReceivedFd();
-        if (syncFd >= 0)
-            ::close(syncFd);
-        conn.send(ls::ipc::Release{ frame->stagingIdx });
-    }
+    // 7. steady state: present the backend-generated + real captured frames on
+    //    the output swapchain (task 8). Hand off to runPresent, which owns the
+    //    window, surface and swapchain for this stream and tears them all down
+    //    on every return path. The handshake above already opened the backend
+    //    context that runPresent drives via backend.scheduleFrames.
+    ls::presentation::runPresent(conn, state, vk, backend, conf, stop);
 }
 }  // namespace ls::ipc
