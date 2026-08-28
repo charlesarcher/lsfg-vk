@@ -29,6 +29,7 @@
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -94,13 +95,23 @@ namespace {
 
 void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const vk::Vulkan& vk, lsfgvk::backend::Instance& backend,
-        const ls::GameConf& conf, const std::atomic<bool>& stop) {
+        const ls::GameConf& conf, std::string_view session,
+        const std::atomic<bool>& stop) {
     const uint32_t w = state.width, h = state.height;
 
     // --- surface backend + window/surface on the transport vk ----------------
-    auto wsi = ls::wsi::createX11SurfaceBackend();
-    if (!wsi->connect("x11"))
-        throw ls::error("could not connect the X11 surface backend");
+    std::unique_ptr<ls::wsi::SurfaceBackend> wsi;
+    if (session == "wayland") {
+        wsi = ls::wsi::createWaylandSurfaceBackend();
+    } else {
+        // default to X11 for "x11" or "auto" (XWayland)
+        wsi = ls::wsi::createX11SurfaceBackend();
+    }
+    if (!wsi->connect(session))
+        throw ls::error("could not connect the surface backend for session: " + std::string(session));
+
+    if (verboseEnabled())
+        std::cerr << "lsfg-vk-app: using " << (session == "wayland" ? "Wayland" : "X11") << " surface backend\n";
 
     // --- resolve the target output: an explicit output must match a connector
     //     exactly; absent/empty selects the primary/active output.
@@ -230,6 +241,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     };
     SwapchainGuard guard{ &vk, swapchain, wsi.get() };
 
+    // --- pacing / backpressure / stall policy state ---------------------------
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point lastFrameTime = Clock::now();
+    Clock::time_point statsLastTime = Clock::now();
+    uint64_t frameCount = 0;
+    bool idleLogged = false;
+    uint32_t lastFrameStagingIdx = 0;
+    const auto idleThreshold = std::chrono::seconds(5);
+    const auto statsInterval = std::chrono::seconds(1);
+
     // --- the present loop ----------------------------------------------------
     size_t fidx{ 0 };
     while (!stop.load(std::memory_order_relaxed)) {
@@ -244,8 +265,68 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             if (errno == EINTR) continue;
             throw ls::ipc::socket_error("poll() on present loop", errno);
         }
-        if (pr == 0 || !(pfd.revents & POLLIN))
+
+        const auto now = Clock::now();
+
+        // idle detection: if no FRAME for >5 s, present the last real frame once
+        // and log a single notification. the window stays alive.
+        if (pr == 0 || !(pfd.revents & POLLIN)) {
+            if (!idleLogged && now - lastFrameTime >= idleThreshold) {
+                // present the last captured game frame to keep the window alive
+                uint32_t idx{};
+                const auto aq = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
+                    UINT64_MAX, acquireSem.handle(), VK_NULL_HANDLE, &idx);
+                if (aq == VK_SUCCESS || aq == VK_SUBOPTIMAL_KHR) {
+                    const VkImage dstImage = swapImages.at(idx);
+                    auto& srcImage = state.sourceImages.at(lastFrameStagingIdx);
+                    cmdbuf.begin(vk);
+                    cmdbuf.blitImage(vk,
+                        {
+                            makeBlitBarrier(srcImage.mut().handle(),
+                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                            makeBlitBarrier(dstImage,
+                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                        },
+                        { srcImage.mut().handle(), dstImage },
+                        VkExtent2D{ w, h },
+                        {
+                            makeBlitBarrier(dstImage,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                        }
+                    );
+                    cmdbuf.end(vk);
+                    cmdbuf.submit(vk,
+                        { acquireSem.handle() }, VK_NULL_HANDLE, 0,
+                        { signalSem.at(destCount).handle() }, VK_NULL_HANDLE, 0,
+                        VK_NULL_HANDLE
+                    );
+                    const VkPresentInfoKHR presentInfo{
+                        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                        .waitSemaphoreCount = 1,
+                        .pWaitSemaphores = &signalSem.at(destCount).handle(),
+                        .swapchainCount = 1,
+                        .pSwapchains = &swapchain,
+                        .pImageIndices = &idx,
+                    };
+                    (void)vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+                }
+                std::cerr << "lsfg-vk-app: idle >5 s, presenting last frame (slot " << lastFrameStagingIdx << ")\n";
+                idleLogged = true;
+            }
+            // per-second stats when verbose
+            if (verboseEnabled() && now - statsLastTime >= statsInterval) {
+                const double fps = static_cast<double>(frameCount) /
+                    std::chrono::duration<double>(now - statsLastTime).count();
+                std::cerr << "lsfg-vk-app: " << static_cast<uint32_t>(fps) << " fps, slots "
+                          << "2/2, queued 0\n";
+                frameCount = 0;
+                statsLastTime = now;
+            }
             continue;
+        }
 
         // receive is bounded by SO_RCVTIMEO (set on the socket by runStream).
         auto msg = conn.receive(std::nullopt);
@@ -254,6 +335,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             // steady state is one FRAME per staging slot per generation cycle;
             // anything else (a stray message) is silently drained.
             continue;
+
+        // reset idle state on new frame
+        idleLogged = false;
+        lastFrameTime = now;
+        lastFrameStagingIdx = frame->stagingIdx;
+        ++frameCount;
 
         // the FRAME carries the capture sync fd; scheduleFrames consumes it.
         const int captureFd = conn.takeReceivedFd();
@@ -311,13 +398,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
                 }
             );
+            cmdbuf.end(vk);
             cmdbuf.submit(vk,
                 { acquireSem.handle(), doneWaitSem.at(i).handle() },
                 VK_NULL_HANDLE, 0,
                 { signalSem.at(i).handle() }, VK_NULL_HANDLE, 0,
                 VK_NULL_HANDLE
             );
-            cmdbuf.end(vk);
 
             const VkPresentInfoKHR presentInfo{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
@@ -360,6 +447,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
                 }
             );
+            cmdbuf.end(vk);
             // the real present is the last submit of the frame: signal the fence
             // so the next frame's gate waits for all of this frame's work.
             cmdbuf.submit(vk,
@@ -367,7 +455,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 { signalSem.at(destCount).handle() }, VK_NULL_HANDLE, 0,
                 fence.handle()
             );
-            cmdbuf.end(vk);
 
             const VkPresentInfoKHR presentInfo{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,

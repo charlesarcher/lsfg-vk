@@ -74,19 +74,21 @@ namespace ls::ipc {
         StreamState& operator=(StreamState&&) = default;
     };
 
-    /// run one accepted connection to completion: HELLO -> NEGOTIATED -> two
-    /// STAGING -> READY -> per-frame FRAME/RELEASE until the peer closes or an
-    /// error (or a shutdown flag) ends the stream. the caller removes the
-    /// stream from its registry once this returns.
-    ///
-    /// @param conn the accepted connection (its fd is the stream key)
-    /// @param state mutable registry entry the handshake fills (its staging
-    ///     fds); the caller erases it on return so the destructor closes those
-    ///     fds
-    /// @param stop shared shutdown flag; set by the SIGINT handler when true
-    ///     the stream handler returns immediately instead of blocking
-    /// @throws ls::error / ls::ipc::socket_error on protocol or socket failure
+/// run one accepted connection to completion: HELLO -> NEGOTIATED -> two
+///     STAGING -> READY -> per-frame FRAME/RELEASE until the peer closes or an
+///     error (or a shutdown flag) ends the stream. the caller removes the
+///     stream from its registry once this returns.
+///
+/// @param conn the accepted connection (its fd is the stream key)
+/// @param state mutable registry entry the handshake fills (its staging
+///     fds); the caller erases it on return so the destructor closes those
+///     fds
+/// @param stop shared shutdown flag; set by the SIGINT handler when true
+///     the stream handler returns immediately instead of blocking
+/// @param session WSI backend: "x11" | "wayland" | "auto"
+/// @throws ls::error / ls::ipc::socket_error on protocol or socket failure
     void runStream(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const std::atomic<bool>& stop, const vk::Vulkan& vk,
-        lsfgvk::backend::Instance& backend, const ls::GameConf& conf);
+        lsfgvk::backend::Instance& backend, const ls::GameConf& conf,
+        std::string_view session);
 }

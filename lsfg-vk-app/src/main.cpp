@@ -157,6 +157,7 @@ namespace {
             + "OPTIONS:\n"
             + "    -p, --profile <name>    REQUIRED: profile selecting the processing GPU"
             + "    -o, --output <name>     OPTIONAL: output name for later presentation tasks"
+            + "    -s, --session <type>    OPTIONAL: WSI backend: x11, wayland, auto (default: auto)"
             + "    -v, --verbose           Verbose per-frame logging"
             + "    -h, --help              Show this help\n";
         std::cerr << text;
@@ -165,6 +166,7 @@ namespace {
     struct Options {
         std::optional<std::string> profile;
         std::optional<std::string> output;
+        std::optional<std::string> session;
         bool verbose{false};
     };
 
@@ -172,18 +174,20 @@ namespace {
     Options parseArgs(int argc, char** argv) {
         Options opts{};
 
-        const std::array<option, 4> GETOPT {{
+        const std::array<option, 5> GETOPT {{
             { "profile",   required_argument, nullptr, 'p' },
             { "output",    required_argument, nullptr, 'o' },
+            { "session",   required_argument, nullptr, 's' },
             { "verbose",     no_argument,       nullptr, 'v' },
             { "help",        no_argument,       nullptr, 'h' }
         }};
 
         int c{};
-        while ((c = getopt_long(argc, argv, "vo:h", GETOPT.data(), nullptr)) != -1) {
+        while ((c = getopt_long(argc, argv, "vpo:s:h", GETOPT.data(), nullptr)) != -1) {
             switch (c) {
                 case 'p': opts.profile.emplace(optarg); break;
                 case 'o': opts.output.emplace(optarg); break;
+                case 's': opts.session.emplace(optarg); break;
                 case 'v': opts.verbose = true; break;
                 case 'h': usage(*argv); std::exit(EXIT_SUCCESS);
                 case '?':
@@ -197,6 +201,16 @@ namespace {
             std::cerr << "lsfg-vk-app: --profile <name> is required\n\n";
             usage(*argv);
             std::exit(EXIT_FAILURE);
+        }
+
+        // Validate session value if provided
+        if (opts.session.has_value()) {
+            const auto& s = *opts.session;
+            if (s != "x11" && s != "wayland" && s != "auto") {
+                std::cerr << "lsfg-vk-app: --session must be 'x11', 'wayland', or 'auto'\n\n";
+                usage(*argv);
+                std::exit(EXIT_FAILURE);
+            }
         }
 
         return opts;
@@ -248,6 +262,21 @@ int main(int argc, char** argv) {
             // task 8: -v surfaces the per-cycle [gen gen real] ordering log,
             // threaded to runPresent via an env var since the signature has none.
             setenv("LSFGVK_APP_VERBOSE", "1", 1);
+
+        // --- session auto-detection (task 10) --------------------------------
+        // --session auto (default): prefer Wayland if WAYLAND_DISPLAY is set,
+        // otherwise fall back to X11 (XWayland). Explicit --session x11/wayland
+        // overrides the auto-detection.
+        std::string session = "auto";
+        if (opts.session.has_value()) {
+            session = *opts.session;
+        } else {
+            const char* wlDisplay = std::getenv("WAYLAND_DISPLAY");
+            if (wlDisplay && *wlDisplay != '\0')
+                session = "wayland";
+            else
+                session = "x11";
+        }
 
         const ls::GameConf conf = selectProfile(*opts.profile);
         if (!conf.gpu.has_value())
@@ -409,7 +438,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 try {
-                    ls::ipc::runStream(conn, it.first->second, g_stop, *vk, *g_backend, conf);
+                    ls::ipc::runStream(conn, it.first->second, g_stop, *vk, *g_backend, conf, session);
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk-app: stream ended: " << e.what() << "\n";
                 }

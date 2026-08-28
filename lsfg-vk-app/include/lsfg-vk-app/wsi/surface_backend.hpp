@@ -52,4 +52,7 @@ namespace ls::wsi {
 
     /// factory: build the best-available backend (X11/xcb is the only implementation today)
     std::unique_ptr<SurfaceBackend> createX11SurfaceBackend();
+
+    /// factory: build the Wayland backend (xdg-shell + xdg-output)
+    std::unique_ptr<SurfaceBackend> createWaylandSurfaceBackend();
 }

@@ -36,9 +36,11 @@ namespace ls::presentation {
     /// @param backend the process-level frame-gen instance
     /// @param conf the selected profile (its optional output selects the display
     ///     connector to present on)
+    /// @param session "x11" | "wayland" | "auto" - selects the WSI backend
     /// @param stop shared shutdown flag; when true the loop stops and tears down
     /// @throws ls::error / ls::vulkan_error on surface/swapchain/present failure
     void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const vk::Vulkan& vk, lsfgvk::backend::Instance& backend,
-        const ls::GameConf& conf, const std::atomic<bool>& stop);
+        const ls::GameConf& conf, std::string_view session,
+        const std::atomic<bool>& stop);
 }

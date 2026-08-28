@@ -106,7 +106,8 @@ StreamState::~StreamState() {
 
 namespace ls::ipc {
 void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& stop,
-    const vk::Vulkan& vk, lsfgvk::backend::Instance& backend, const ls::GameConf& conf) {
+    const vk::Vulkan& vk, lsfgvk::backend::Instance& backend, const ls::GameConf& conf,
+    std::string_view session) {
     // own the backend for this stream's lifetime (used by the context janitor
     // below on erase); points to the process-level instance in main.cpp, so it
     // outlives this stream.
@@ -266,6 +267,6 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     //    window, surface and swapchain for this stream and tears them all down
     //    on every return path. The handshake above already opened the backend
     //    context that runPresent drives via backend.scheduleFrames.
-    ls::presentation::runPresent(conn, state, vk, backend, conf, stop);
+    ls::presentation::runPresent(conn, state, vk, backend, conf, session, stop);
 }
 }  // namespace ls::ipc
