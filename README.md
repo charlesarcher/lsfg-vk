@@ -6,6 +6,15 @@
 >[!CAUTION]
 > You are reading the README for the upcoming version 2.0 of lsfg-vk. For the stable version 1.x, [please read here](https://github.com/PancakeTAS/lsfg-vk/tree/ff1a0f72a7d6d08b84d58b7b4dc5f05c9f904f98)
 
+## Features
+
+- **Frame generation** for Vulkan applications using Lossless Scaling's algorithm
+- **Dual-GPU support**: run the game on one GPU, generate frames on another
+- **One-way external presentation**: present generated frames on the processing GPU via a separate app, eliminating return traffic to the game GPU
+- **Configurable** via GUI (`lsfg-vk-ui`) or TOML config file
+- **Benchmarking** mode to measure frame generation performance
+- **Flatpak support** for sandboxed applications
+
 ## Installation
 >[!TIP]
 > If you are on a Steam Deck or similar handheld, consider using the [Decky plugin for lsfg-vk](https://github.com/xXJSONDeruloXx/decky-lsfg-vk). This is an easy way to install and configure lsfg-vk on the Steam Deck.

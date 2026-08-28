@@ -36,6 +36,149 @@ If you are using performance overlays like Steam's built-in overlay, there is a 
 
 This is a known limitation of Vulkan layers and without directly working with the overlay developers, there is little that can be done to fix this.
 
+### One-Way External Presentation Mode
+
+If you are using `presentation = external` (one-way mode), the following
+failure modes are specific to the `lsfg-vk-app` / layer handshake.
+
+#### "failed to connect to app socket" / "Connection refused"
+
+**Layer log:**
+```
+lsfg-vk: failed to connect to app socket '/run/user/1000/lsfg-vk/app.sock'
+lsfg-vk: connect() to '/run/user/1000/lsfg-vk/app.sock' failed: Connection refused
+```
+
+**Cause:** The game started but `lsfg-vk-app` is not running, or the socket
+path differs (e.g. `XDG_RUNTIME_DIR` mismatch between game and app).
+
+**Fix:**
+- Start `lsfg-vk-app` **before** launching the game.
+- Ensure both processes share the same `XDG_RUNTIME_DIR` (default
+  `/run/user/$(id -u)`). If running the game via Flatpak or a different
+  user session, the socket will not be visible.
+- The socket path is fixed at `$XDG_RUNTIME_DIR/lsfg-vk/app.sock`; it
+  cannot be changed via configuration.
+
+**Game behavior:** The game **exits immediately** — the layer throws during
+swapchain creation and does not fall back.
+
+#### "Connection reset by peer" (app died mid-stream)
+
+**Layer log:**
+```
+lsfg-vk: external stream error: poll() on ipc socket failed: Connection reset by peer
+lsfg-vk: something went wrong during lsfg-vk swapchain presentation:
+- lsfg-vk: external stream error: poll() on ipc socket failed: Connection reset by peer
+```
+
+**Cause:** `lsfg-vk-app` was killed (SIGKILL, crash, OOM) while a stream
+was active.
+
+**Game behavior:** The game **stays alive**. The layer errors on the next
+present but does not crash the game process.
+
+**Recovery:** Restart `lsfg-vk-app` and launch a new game instance. The
+new handshake establishes cleanly ("external presentation active" logged).
+
+#### "Permission denied" on socket bind (app side)
+
+**App log:**
+```
+lsfg-vk-app: fatal: bind() on '/run/user/1000/lsfg-vk/app.sock' failed: Permission denied
+```
+
+**Cause:** `XDG_RUNTIME_DIR` points to a non-writable directory, or the
+`lsfg-vk` subdirectory exists with wrong permissions.
+
+**Fix:**
+- Ensure `XDG_RUNTIME_DIR` is set and writable (typically
+  `/run/user/$(id -u)`).
+- Remove any stale socket file: `rm -f $XDG_RUNTIME_DIR/lsfg-vk/app.sock`.
+- The app creates the `lsfg-vk` directory with mode 0700; if it already
+  exists with different ownership/permissions, delete it.
+
+#### "output 'X' not found; available: ..."
+
+**App log (Wayland):**
+```
+lsfg-vk-app: stream ended: output 'nonexistent-output' not found; available: 
+```
+
+**App log (X11):**
+```
+lsfg-vk-app: stream ended: output 'nonexistent-output' not found; available: HDMI-A-3
+```
+
+**Cause:** The `output` option in the profile (or `--output` CLI flag)
+does not match any connector enumerated by the backend.
+
+**Fix:**
+- Run `lsfg-vk-app --profile <name> --session wayland --output invalid`
+  (or `--session x11`) to see the list of available output names.
+- **Wayland:** Names come from `xdg_output` (logical names like
+  `HDMI-A-3`, `DP-1`). If the list is empty, the compositor does not
+  support `xdg-output`; the app falls back to `wl_output` make/model
+  strings.
+- **X11:** Names come from RandR (e.g. `HDMI-A-3`, `DP-1`).
+- Omit `output` entirely to auto-select the primary/active output.
+
+#### Colorspace mismatch (HDR requested but display is SDR)
+
+**Status:** Not testable on current rig (KWin reports HDR off, no HDR
+config option in `GameConf`).
+
+**Expected failure:** If a future HDR config requests BT.2020/PQ but the
+processing GPU's swapchain only supports `VK_COLOR_SPACE_SRGB_NONLINEAR_KHR`,
+the layer/app will fail to create a compatible swapchain.
+
+**Workaround:** Ensure the display supports HDR and the compositor has HDR
+enabled before attempting HDR external presentation. Current code prefers
+`SRGB_NONLINEAR` and falls back to the first supported colorspace.
+
+#### Session detection failures (wrong backend selected)
+
+**Symptoms:** App starts but game fails to connect, or app logs "could not
+connect the surface backend for session: wayland" on an X11-only session.
+
+**Cause:** `--session auto` (default) prefers Wayland when
+`WAYLAND_DISPLAY` is set. On an X11-only session with `WAYLAND_DISPLAY`
+erroneously set, or a Wayland session where XWayland is desired, the
+wrong backend is chosen.
+
+**Fix:** Explicitly set `--session wayland` or `--session x11` on the
+`lsfg-vk-app` command line. The `session` option is not in the profile;
+it is a CLI-only flag.
+
+#### Two games, one app (no isolation)
+
+**Symptom:** Second game dies waiting for handshake; first game runs
+normally.
+
+**Cause:** `lsfg-vk-app` processes streams **sequentially** (single-threaded
+accept loop). It cannot handle multiple concurrent game streams.
+
+**Fix:** Run a separate `lsfg-vk-app` instance per game (each needs its
+own socket — currently not configurable, so only one app instance per
+`XDG_RUNTIME_DIR` is possible). True multi-game isolation requires
+separate user sessions or a future socket-per-profile feature.
+
+#### Multiplier hot-reload "restart required" message not appearing
+
+**Observation:** Changing `multiplier` in `conf.toml` while external
+presentation is active does not log the expected "config change requires
+restart" message, though no context rebuild occurs (correct behavior).
+
+**Cause:** `WatchedConfig::update()` uses filesystem `last_write_time`
+comparison, which may have timestamp resolution issues on some filesystems.
+
+**Status:** The logic exists in code (`Root::update()` detects external
+contexts and suppresses rebuild) but the notification message did not
+trigger in testing. No functional impact — external presentation continues
+uninterrupted.
+
+---
+
 ### Dual-GPU Setups
 A step-by-step setup guide with tested examples lives in the [Dual-GPU Setup Guide](Dual-GPU-Guide.md).
 

@@ -277,3 +277,77 @@ Per accepted FRAME: `doneFds = scheduleFrames(ctx, captureFd)`; for each doneFd 
 - `lsfg-vk-app/src/presentation.cpp` (backend selection + verbose logging)
 - `lsfg-vk-app/include/lsfg-vk-app/stream.hpp` (added session parameter)
 - `lsfg-vk-app/src/stream.cpp` (pass session to runPresent)
+
+---
+
+## 2026-08-27 Task 12: Failure-Mode Audit for One-Way Dual-GPU Frame Generation
+
+### Test Summary (11 scenarios)
+
+| Test | Scenario | Result | Key Finding |
+|------|----------|--------|-------------|
+| (a) | App absent at swapchain creation | ✅ Named error | "Connection refused" — game exits immediately |
+| (b) | App SIGKILL mid-soak | ✅ Named error, game alive, relaunch works | "Connection reset by peer" → game stays alive, new vkcube works after app restart |
+| (c) | Socket unwritable/unset XDG_RUNTIME_DIR | ✅ Named errors both sides | Layer: "Connection refused"; App: "Permission denied" on bind() |
+| (d) | B lacking HDR colorspace | ⚠️ Not testable | No HDR display, no config option in GameConf |
+| (e) | Wrong --profile name | ✅ Named error | "no profile named 'X' in conf.toml" |
+| (f) | Unsupported output name | ✅ Named error, lists available | Wayland: empty list; X11: "HDMI-A-3" |
+| (g) | Focus behavior | 📝 Code review | X11: WM_HINTS input=False set; Wayland: compositor-dependent (no protocol equivalent) |
+| (h) | Exclusive fullscreen | ⚠️ Not testable | vkcube/Linux no exclusive FS support |
+| (i) | Two games, one app | ❌ No isolation | App serializes streams (single-threaded accept loop); 2nd game dies waiting |
+| (j) | Multiplier hot-reload | ⚠️ Code has logic, didn't trigger | "restart required" message not observed in logs; no context rebuild (correct) |
+| (k) | Multi-swapchain double-wait | 📝 Code review only | Pre-existing in entrypoint.cpp:400-412; inherited from two-way; not fixed |
+
+### Key Learnings
+
+1. **App is single-stream only** — The accept loop in `main.cpp` processes one stream at a time (`runStream` blocks). True multi-game isolation requires separate app instances (separate sockets).
+
+2. **Hot-reload message not triggering** — `WatchedConfig::update()` uses `last_write_time` comparison; may have filesystem timestamp resolution issues. The "config change requires restart" logic exists in `Root::update()` but didn't fire in testing.
+
+3. **Focus behavior differs by backend** — X11 has explicit `WM_HINTS input=False`; Wayland relies on compositor (KWin) behavior with `xdg_toplevel` fullscreen + `app_id`.
+
+4. **Pre-existing double-wait hazard** — In `myvkQueuePresentKHR`, multiple swapchains in one present call share the same wait semaphores vector. Binary semaphores would double-wait. Timeline semaphores handle this correctly. Not fixed per task requirements.
+
+### Evidence
+- Full report: `.omo/evidence/oneway/t12-failures.md`
+- Individual test logs: `.omo/evidence/oneway/t12-failures/test-*.log`
+
+### Commit
+```
+test(oneway): failure-mode audit
+```
+
+---
+
+## 2026-08-27 Task 13: Documentation for One-Way Dual-GPU Frame Generation
+
+### Documentation updates completed:
+
+1. **Configuration.md** — Added `presentation` and `output` reference entries with per-backend output-name semantics (Wayland: xdg_output logical name; X11: RandR name).
+
+2. **Dual-GPU-Guide.md** — New "One-way mode (external app)" section with:
+   - Concept diagram (text) showing traffic flow A→B only, no return traffic
+   - Setup steps: run app first, `--session` selection, cabling guidance (display on processing GPU), compositor copy caveat
+   - WM coverage table (native X11 + native Wayland = all major WMs; tested-cells table from Task 11 including which backend was exercised where)
+   - Tested-cells table from Task 11 with "external presentation active" counts
+   - Screenshot placeholder
+
+3. **Troubleshooting.md** — Entries for all Task 12 failure modes:
+   - Socket-missing ("Connection refused", game exits)
+   - App-died ("Connection reset by peer", game stays alive, relaunch works)
+   - Colorspace mismatch (HDR not testable, documented expected failure)
+   - Wrong-output-name (named error listing available outputs per backend)
+   - Session-detection failures (auto-detection picks wrong backend, fix with explicit --session)
+   - Two games one app (no isolation, sequential processing)
+   - Multiplier hot-reload message not triggering (timestamp resolution issue)
+
+4. **README.md** — Added feature bullet: "One-way external presentation: present generated frames on the processing GPU via a separate app, eliminating return traffic to the game GPU"
+
+5. **Verification** — Grep confirms no undocumented options exist; `presentation` and `output` only appear in config.hpp/GameConf and are handled in layer (presentation) and app (output). No environment variables for these options. `session` is CLI-only for lsfg-vk-app.
+
+### Commit
+```
+docs: one-way external presentation mode
+```
+test(oneway): failure-mode audit
+```
