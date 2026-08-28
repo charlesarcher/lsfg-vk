@@ -1,0 +1,18 @@
+version = 2
+
+[global]
+dll = "/mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll"
+allow_fp16 = true
+
+[[profile]]
+name = "vkcube-external"
+active_in = "vkcube"
+gpu = "Intel(R) Graphics (ARL)"
+presentation = "external"
+multiplier = 2
+
+[[profile]]
+name = "test-app"
+gpu = "AMD Radeon RX 9070 XT (RADV GFX1201)"
+presentation = "external"
+multiplier = 2

@@ -1,0 +1,8 @@
+lsfg-vk: using profile with name 'vkcube-external' (identified via executable)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+Selected GPU 0: AMD Radeon RX 9070 XT (RADV GFX1201), type: DiscreteGpu, apiVersion: 4211042 (1.4.354), driverVersion: 109060097 (26.2.1) 
+lsfg-vk: external stream error: ipc connection closed by peer
+lsfg-vk: something went wrong during lsfg-vk swapchain creation:
+- lsfg-vk: external stream error: ipc connection closed by peer
+- ipc connection closed by peer

@@ -1,0 +1,12 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_KHR_swapchain VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_KHR_swapchain VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk-app: listening on /run/user/1000/lsfg-vk/app.sock (processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)')
+lsfg-vk-app: stream from 'AMD Radeon RX 9070 XT (RADV GFX1201)' 500x500 VkFormat(58)
+lsfg-vk-app: stream ended: failed to open backend context
+- Unable to import timeline semaphore
+- vkImportSemaphoreFdKHR() failed (error -13)
