@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <unistd.h>
@@ -287,15 +288,35 @@ void CaptureContext::drainReleases() {
 }
 
 size_t CaptureContext::selectFreeSlot() {
-    // round-robin over free slots
-    for (size_t tries = 0; tries < this->slotFree.size(); ++tries) {
-        const size_t idx = (this->nextSlot + tries) % this->slotFree.size();
-        if (this->slotFree.at(idx)) {
-            this->nextSlot = (idx + 1) % this->slotFree.size();
-            return idx;
+    // round-robin over free slots with 500 ms deadline polling
+    constexpr auto deadline = std::chrono::milliseconds(500);
+    const auto start = std::chrono::steady_clock::now();
+
+    while (true) {
+        for (size_t tries = 0; tries < this->slotFree.size(); ++tries) {
+            const size_t idx = (this->nextSlot + tries) % this->slotFree.size();
+            if (this->slotFree.at(idx)) {
+                this->nextSlot = (idx + 1) % this->slotFree.size();
+                return idx;
+            }
         }
+
+        // no free slot yet; check deadline
+        if (std::chrono::steady_clock::now() - start >= deadline) {
+            throw ls::error("lsfg-vk: external stream error: no free staging slots within 500 ms (app stalled)");
+        }
+
+        // drain any pending RELEASE messages before retrying
+        try {
+            this->drainReleases();
+        } catch (const ls::error& e) {
+            // already logged inside drainReleases; surface as stream error
+            throw;
+        }
+
+        // brief sleep to avoid busy-waiting
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    throw ls::error("lsfg-vk: external stream error: no free staging slots (app stalled)");
 }
 
 VkResult CaptureContext::present(const vk::Vulkan& vk,
