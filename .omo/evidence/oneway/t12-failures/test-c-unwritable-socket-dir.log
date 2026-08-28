@@ -1,0 +1,7 @@
+Authorization required, but no authorization protocol specified
+
+Selected WSI platform: xlib
+lsfg-vk: using profile with name 'vkcube-external' (identified via executable)
+Authorization required, but no authorization protocol specified
+
+bash: line 12: 488914 Segmentation fault         (core dumped) VK_LAYER_PATH=/tmp/opencode/layer-test VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation LSFGVK_DLL_PATH="/mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll" LSFGVK_CONFIG=/home/archerc/.config/lsfg-vk/conf.toml vkcube --gpu_number 2 --present_mode fifo 2>&1

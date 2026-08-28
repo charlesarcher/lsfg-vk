@@ -1,0 +1,5 @@
+error: XDG_RUNTIME_DIR is invalid or not set in the environment.
+Selected WSI platform: xlib
+lsfg-vk: using profile with name 'vkcube-external' (identified via executable)
+Environment variable DISPLAY requires a valid value.
+Exiting ...
