@@ -511,19 +511,31 @@ public:
             }
         }
 
-        // Dispatch pending events
+        // Dispatch everything already buffered (non-blocking).
         int ret = wl_display_dispatch_pending(mDisplay);
         if (ret < 0)
             return false;
 
-        // If no pending events, block with timeout
+        // Nothing buffered: wait for data up to timeout, then drain. The
+        // drain must stay NON-blocking: the blocking wl_display_dispatch
+        // (default queue) deadlocks when the bytes poll signalled carry only
+        // events for another queue - RADV owns the wl_buffer release
+        // listeners on its own queue. It consumes those bytes, dispatches
+        // nothing on the default queue, and then waits forever on the
+        // already-empty socket (observed: main thread stuck in
+        // wl_display_dispatch -> ppoll(NULL) with Recv-Q 0).
+        // dispatch_pending routes every read byte to its own queue and
+        // returns without blocking.
         if (ret == 0) {
             struct pollfd pfd{};
             pfd.fd = wl_display_get_fd(mDisplay);
             pfd.events = POLLIN;
             int pollRet = poll(&pfd, 1, timeout_ms);
             if (pollRet > 0 && (pfd.revents & POLLIN)) {
-                wl_display_dispatch(mDisplay);
+                int r;
+                do {
+                    r = wl_display_dispatch_pending(mDisplay);
+                } while (r > 0);
             }
         }
 

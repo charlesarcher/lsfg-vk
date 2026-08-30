@@ -311,6 +311,29 @@ if (dbgEnabled())
         wsi->processEvents(timeout_ms);
     };
 
+    // Acquire a swapchain image, pumping WSI events while waiting. the
+    // timeout must stay finite on Wayland: the compositor frees an image via
+    // a wl_buffer release event that only reaches RADV through a display
+    // dispatch, so an infinite block (UINT64_MAX) with no pump deadlocks the
+    // stream - and the stop flag (SIGINT) - until the process is killed.
+    // on timeout: pump events (which may deliver the release), re-check stop,
+    // retry. throws on hard errors; returns false if stop was requested.
+    constexpr uint64_t acquireTimeoutNs = 200ULL * 1000 * 1000; // 200 ms
+    auto acquireImage = [&](uint32_t& outIdx) -> bool {
+        for (;;) {
+            const auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
+                acquireTimeoutNs, acquireSem.handle(), VK_NULL_HANDLE, &outIdx);
+            if (res != VK_TIMEOUT) {
+                if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+                    throw ls::vulkan_error(res, "AcquireNextImageKHR failed");
+                return true;
+            }
+            processWsiEvents(0);
+            if (stop.load(std::memory_order_relaxed))
+                return false;
+        }
+    };
+
     // --- the present loop ----------------------------------------------------
     size_t fidx{ 0 };
     while (!stop.load(std::memory_order_relaxed)) {
@@ -337,10 +360,7 @@ if (dbgEnabled())
             if (!idleLogged && now - lastFrameTime >= idleThreshold) {
                 // present the last captured game frame to keep the window alive
                 uint32_t idx{};
-                processWsiEvents(0); // process events before acquire
-                const auto aq = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
-                    UINT64_MAX, acquireSem.handle(), VK_NULL_HANDLE, &idx);
-                if (aq == VK_SUCCESS || aq == VK_SUBOPTIMAL_KHR) {
+                if (acquireImage(idx)) {
                     const VkImage dstImage = swapImages.at(idx);
                     auto& srcImage = state.sourceImages.at(lastFrameStagingIdx);
                     cmdbuf.begin(vk);
@@ -453,11 +473,8 @@ if (dbgEnabled())
             // acquire a swapchain image (wait: acquireSem is always unsignaled).
             dbg("present: acquire gen %zu/%zu (fidx %zu)", i, destCount, fidx);
             uint32_t idx{};
-            processWsiEvents(0); // process events before acquire
-            const auto aq = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
-                UINT64_MAX, acquireSem.handle(), VK_NULL_HANDLE, &idx);
-            if (aq != VK_SUCCESS && aq != VK_SUBOPTIMAL_KHR)
-                throw ls::vulkan_error(aq, "AcquireNextImageKHR failed");
+            if (!acquireImage(idx))
+                break;
             const VkImage dstImage = swapImages.at(idx);
 
             // wait for this generated frame via its sync fd.
@@ -507,16 +524,17 @@ if (dbgEnabled())
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
         }
+        // a stop mid-generation loop must exit the present loop, not just the
+        // per-destination for loop above.
+        if (stop.load(std::memory_order_relaxed))
+            break;
 
         // --- ONE real frame: blit the latest captured game frame -----------
         {
             dbg("present: acquire real (fidx %zu)", fidx);
             uint32_t idx{};
-            processWsiEvents(0); // process events before acquire
-            const auto aq = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
-                UINT64_MAX, acquireSem.handle(), VK_NULL_HANDLE, &idx);
-            if (aq != VK_SUCCESS && aq != VK_SUBOPTIMAL_KHR)
-                throw ls::vulkan_error(aq, "AcquireNextImageKHR failed (real)");
+            if (!acquireImage(idx))
+                break;
             const VkImage dstImage = swapImages.at(idx);
 
             auto& srcImage = state.sourceImages.at(frame->stagingIdx);
