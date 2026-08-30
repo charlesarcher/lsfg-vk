@@ -112,17 +112,24 @@ card that does the presenting. (If the monitor were on the game card, the
 compositor would silently copy the app's window to the other card — it
 works, but you pay that copy every frame.)
 
-### What happens if the app stalls or dies
+### Guarantees
 
-- **Stall** (app SIGSTOPped or otherwise wedged): the game keeps rendering
-  and presenting its own window; the capture fills both slots, then the
-  layer's 500 ms slot deadline fails the present with the named error above.
-  The game process never crashes.
-- **Death** (app SIGKILLed): the next present sees a broken socket; the
-  layer logs a named `Connection reset by peer` stream error. Start a fresh
-  app and game.
-- **Idle** (no game frames for >5 s): the app keeps its window alive,
-  presents the last real frame, and logs once (media-player semantics).
+Whatever happens to the doubler process, the game is never harmed and
+nothing fails silently:
+
+- **The game never crashes or hangs.** At most 2 frames are in flight, so
+  a wedged doubler can back up the game's capture by at most 2 frames; the
+  layer then waits 500 ms for a free slot and reports
+  `no free staging slots within 500 ms (app stalled)` — a named error, and
+  the game keeps rendering and presenting its own window.
+- **Every error is named.** Each condition the processes can hit logs the
+  exact error text (see Troubleshooting). There is no silent path: if
+  anything is wrong, both processes say what happened and why.
+- **A restart restores the stream.** If the app exits (SIGINT, crash,
+  kill), the game logs a named `Connection reset by peer` on its next
+  present — and starting the app and game again brings the stream back.
+- **Idle is media-player semantics.** No game frames for >5 s: the app
+  keeps its window alive, presents the last real frame, and logs once.
 
 Consequences:
 
