@@ -15,7 +15,7 @@ Card names used throughout:
 | "9700XT" | `AMD Radeon RX 9070 XT (RADV GFX1201)` | `1002:7550` | **Render** (game GPU, headless) |
 | "9600XT" | `AMD Radeon RX 9060 XT (RADV GFX1200)` | `1002:7590` | **Frame doubler + display** |
 
-## How it works
+## How this works
 
 ```
 Game (9070 XT, unchanged swapchain)
@@ -30,7 +30,99 @@ lsfg-vk-app (own process, 9060 XT):
     → present ALL output frames from the 9060 XT's real swapchain:
          (multiplier-1) generated + 1 real   e.g. [generated, real] at multiplier 2
     → ack the staging slot back to the layer (backpressure)
- ```
+```
+
+### The four parts
+
+- **The Vulkan layer** (`liblsfg-vk-layer.so`, layer
+  `VK_LAYER_LSFGVK_frame_generation`) runs *inside the game process*. It hooks
+  only `vkCreateSwapchainKHR` / `vkQueuePresentKHR` /
+  `vkDestroySwapchainKHR`. In one-way mode the present hook becomes
+  *capture + forward*: it copies the frame just presented into a staging image
+  and then forwards the game's own present down the chain **unchanged**. The
+  game's swapchain is never replaced and no acquire/get-images calls are ever
+  hooked — zero WSI emulation.
+- **The app** (`lsfg-vk-app`) is a separate process you start before the
+  game. It owns an ordinary swapchain on the doubler card (9060 XT) and
+  presents everything the display sees.
+- **The backend** (`lsfg-vk-backend`, linked into the app) is the
+  frame-generation engine: it dlopens `Lossless.dll` and runs LSSC's shader
+  chain (mipmaps → alpha → beta → gamma → delta → generate passes) on the
+  doubler card.
+- **The socket** (`$XDG_RUNTIME_DIR/lsfg-vk/app.sock`, AF_UNIX) carries
+  length-prefixed messages plus GPU sync file descriptors (SCM_RIGHTS). It is
+  the only path between the two processes.
+
+### Setup (once, at swapchain creation)
+
+1. The game creates its swapchain; the layer sees `presentation = "external"`
+   and connects to the app's socket (absent app → loud, named error — see
+   Troubleshooting).
+2. The layer announces its game device, format, and extent (HELLO); the app
+   negotiates the dma-buf layout (modifier, pitch) against the doubler card's
+   *true* caps (NEGOTIATED).
+3. The layer creates **two** exportable staging images on the 9070 XT and
+   hands the app both of their fds (STAGING ×2); the app imports them as
+   images the doubler card can read directly.
+4. READY — the stream is live.
+
+### Per-frame timeline (what happens for every game frame)
+
+| # | Where | What happens |
+|---|-------|--------------|
+| 1 | game (9070 XT) | renders a frame into its own swapchain and calls `vkQueuePresentKHR`. |
+| 2 | layer (in the game process) | records a blit: presented image → staging slot (slots alternate 0/1), waiting on the game's own present semaphores. |
+| 3 | layer | exports a sync-fd that signals "capture done" and sends `FRAME {slot, fd}` to the app. |
+| 4 | layer | forwards the game's original present unchanged — the game's window keeps presenting underneath the app's fullscreen window. |
+| 5 | app (9060 XT) | waits on the sync-fd (no CPU copy — the pixels are a dma-buf image shared between the GPUs; the doubler card reads them straight from the 9070 XT's memory) and runs LSSC frame generation: **`multiplier − 1` intermediate frames** synthesized between this real frame and the previous real frame. |
+| 6 | app | presents from its own swapchain: the `multiplier − 1` generated frames, then the real frame (per-cycle order `[gen × (m−1), real]` — the `[gen x 1 + real]` lines in `-v`). |
+| 7 | app | sends `RELEASE {slot}` — the layer may now overwrite that slot. |
+| 8 | display | scans out the presented frames at up to its refresh rate. |
+
+### Why the staging ring is exactly 2 slots
+
+The LSSC backend's contract is **exactly 2 source images, alternated
+between** — so the capture ring is exactly 2 slots deep, 1:1 with the
+backend's current/next alternation. Side benefit: at most 2 frames are ever
+in flight, which is the backpressure bound — if the app stalls, the game's
+capture fills both slots, then the layer waits 500 ms for a free slot and
+fails the present with a named error (`no free staging slots within 500 ms
+(app stalled)`), never hanging.
+
+### What the LSSC algorithm does
+
+Frame generation is temporal interpolation. For each new real frame the
+shader chain (extracted from `Lossless.dll`) estimates motion from the
+current frame and the previous real frame (kept as temporal history; the
+first frame after start-up uses a black prior) and synthesizes intermediate
+frame(s) *between* the two. With `multiplier = 2`, one intermediate per real
+frame → the display is presented at 2× the game's cadence. `flow_scale` and
+`performance_mode` tune the quality/performance trade-off of that
+interpolation (see [Configuration](Configuration.md)).
+
+### Why "one-way"
+
+The only cross-GPU traffic is the capture: one frame per cycle, game →
+doubler, one direction. The generated frames are *made on* the doubler card
+and *presented from* the doubler card — nothing ever travels back over
+PCIe. (Two-way mode instead blits the generated frames back into the
+game's swapchain: one PCIe round trip per frame.) That is also why the
+display cable goes into the doubler card: the monitor scans out of the
+card that does the presenting. (If the monitor were on the game card, the
+compositor would silently copy the app's window to the other card — it
+works, but you pay that copy every frame.)
+
+### What happens if the app stalls or dies
+
+- **Stall** (app SIGSTOPped or otherwise wedged): the game keeps rendering
+  and presenting its own window; the capture fills both slots, then the
+  layer's 500 ms slot deadline fails the present with the named error above.
+  The game process never crashes.
+- **Death** (app SIGKILLed): the next present sees a broken socket; the
+  layer logs a named `Connection reset by peer` stream error. Start a fresh
+  app and game.
+- **Idle** (no game frames for >5 s): the app keeps its window alive,
+  presents the last real frame, and logs once (media-player semantics).
 
 Consequences:
 
