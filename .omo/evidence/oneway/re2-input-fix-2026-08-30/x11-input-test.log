@@ -1,0 +1,22 @@
+==========================================================
+ X11 input pass-through test — 2026-08-30T18:28:53Z
+ display: :0 (Xwayland, KWin), 2560x1440
+ tool:    xptr.c (pointer-only XTest probe, no keypress)
+==========================================================
+
+### BASELINE (control: game window only, no overlay)
+$ DISPLAY=:0 ./xptr baseline
+geom: game at root (640,359) size 1280x720 -> target (1280,719)
+mode=baseline  GAME received: button=1 motion=0 | OVERLAY received: button=0
+baseline exit=0
+
+### OVERLAY (fullscreen input=False window on top, mirroring backend_x11.cpp)
+$ DISPLAY=:0 ./xptr overlay
+geom: game at root (640,359) size 1280x720 -> target (1280,719)
+mode=overlay  GAME received: button=0 motion=0 | OVERLAY received: button=1
+overlay exit=1
+
+### NOTE: Xvfb :99 (isolated) is INVALID for this test — the baseline
+### control returns 0 events there (XTest requests accepted, rets=1,
+### pointer warps correctly, but no events are delivered to any client
+### window). See README.md for the source-level analysis.
