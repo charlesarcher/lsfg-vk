@@ -230,7 +230,11 @@ public:
         // the window after seeing the map, and EWMH mandates a post-map
         // ClientMessage. a pre-map property set is ignored by KWin, which
         // then placed the window at (0,28) 2560x1382 instead of (0,0) 2560x1440.
-        requestFullscreenState(mWindow);
+        // TEMP DEBUG: LSFGVK_APP_NO_FS=1 skips the fullscreen request (plain
+        // window) to isolate WM fullscreen handling from the X round-trip
+        // (parity with the wayland backend's knob of the same name).
+        if (std::getenv("LSFGVK_APP_NO_FS") == nullptr)
+            requestFullscreenState(mWindow);
         xcb_flush(mConn);
 
         if (xcb_connection_has_error(mConn) != 0)
