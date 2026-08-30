@@ -21,6 +21,7 @@
 // but harmless. We only need poll/errno/close/getenv which are exposed.
 #include "lsfg-vk-app/presentation.hpp"
 
+#include "lsfg-vk-app/hud.hpp"
 #include "lsfg-vk-app/wsi/surface_backend.hpp"
 
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -256,6 +257,12 @@ if (dbgEnabled())
     for (size_t i = 0; i < presentCount; ++i)
         signalSem.emplace_back(vk);
 
+    // --- FPS HUD: the "<game>/<presented>" box in the top-left window corner.
+    //     created after the swapchain so its format and scale match the
+    //     display; torn down with the loop's other locals on return.
+    ls::hud::Hud hud{ vk, extent.height, ci.imageFormat };
+    hud.update("0/0");
+
     // RAII guard: tear down swapchain + surface + connection on EVERY exit path
     // (normal return, stop, or throw) so no WSI handle leaks. Declared last so
     // it is destroyed first, before the vk:: objects below.
@@ -286,17 +293,20 @@ if (dbgEnabled())
     const auto idleThreshold = std::chrono::seconds(5);
     const auto statsInterval = std::chrono::seconds(1);
 
-    // per-second stats when verbose: `frameCount` counts received game
-    // frames (one per generation cycle); `presentedFrames` counts swapchain
-    // presents ((destCount + 1) per cycle), so the presented/game ratio is
-    // the observable multiplier. must run from both loop branches.
+    // per-second stats: the presented/game ratio is the observable multiplier
+    // (logged when verbose) and feeds the top-left HUD (always). frameCount
+    // counts received game frames; presentedFrames counts swapchain presents
+    // ((destCount + 1) per cycle). must run from both loop branches.
     auto maybeStats = [&](Clock::time_point now) {
-        if (!verboseEnabled() || now - statsLastTime < statsInterval)
+        if (now - statsLastTime < statsInterval)
             return;
         const double dt = std::chrono::duration<double>(now - statsLastTime).count();
-        std::cerr << "lsfg-vk-app: " << static_cast<uint32_t>(frameCount / dt)
-                  << " fps game, " << static_cast<uint32_t>(presentedFrames / dt)
-                  << " fps presented\n";
+        const uint32_t gameFps = static_cast<uint32_t>(frameCount / dt);
+        const uint32_t presentedFps = static_cast<uint32_t>(presentedFrames / dt);
+        if (verboseEnabled())
+            std::cerr << "lsfg-vk-app: " << gameFps << " fps game, "
+                      << presentedFps << " fps presented\n";
+        hud.update(std::to_string(gameFps) + "/" + std::to_string(presentedFps));
         frameCount = 0;
         presentedFrames = 0;
         statsLastTime = now;
@@ -332,6 +342,48 @@ if (dbgEnabled())
             if (stop.load(std::memory_order_relaxed))
                 return false;
         }
+    };
+
+    // blit the HUD box into the top-left of a just-filled swapchain image.
+    // call right after the content blit (dstImage in TRANSFER_DST_OPTIMAL,
+    // write access in flight); it leaves dstImage in the same layout so the
+    // existing post barrier still transitions it to PRESENT_SRC.
+    auto drawHud = [&](VkImage dstImage) {
+        const VkImage hudImage = hud.image().handle();
+        const VkImageMemoryBarrier hudBarrier = makeBlitBarrier(hudImage,
+            hud.lastAccess(), VK_IMAGE_LAYOUT_GENERAL,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        const VkImageMemoryBarrier dstBarrier = makeBlitBarrier(dstImage,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        const VkImageMemoryBarrier barriers[2] = { hudBarrier, dstBarrier };
+        vk.df().CmdPipelineBarrier(cmdbuf.raw(),
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+            0, nullptr, 0, nullptr, 2, barriers);
+        const VkOffset2D o = ls::hud::Hud::ORIGIN;
+        const VkExtent2D b = hud.box();
+        const VkImageBlit blit{
+            .srcSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1
+            },
+            .srcOffsets = {
+                { 0, 0, 0 },
+                { static_cast<int32_t>(b.width), static_cast<int32_t>(b.height), 1 }
+            },
+            .dstSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1
+            },
+            .dstOffsets = {
+                { static_cast<int32_t>(o.x), static_cast<int32_t>(o.y), 0 },
+                { static_cast<int32_t>(o.x + b.width), static_cast<int32_t>(o.y + b.height), 1 }
+            }
+        };
+        vk.df().CmdBlitImage(cmdbuf.raw(), hudImage, VK_IMAGE_LAYOUT_GENERAL,
+            dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+            VK_FILTER_NEAREST);
+        hud.markRead();
     };
 
     // --- the present loop ----------------------------------------------------
@@ -383,6 +435,7 @@ if (dbgEnabled())
                         VkExtent2D{ w, h },
                         VK_FILTER_LINEAR
                     );
+                    drawHud(dstImage);
                     cmdbuf.end(vk);
                     cmdbuf.submit(vk,
                         { acquireSem.handle() }, VK_NULL_HANDLE, 0,
@@ -503,6 +556,7 @@ if (dbgEnabled())
                 imgExtent,
                 VK_FILTER_LINEAR
             );
+            drawHud(dstImage);
             cmdbuf.end(vk);
             cmdbuf.submit(vk,
                 { acquireSem.handle(), doneWaitSem.at(i).handle() },
@@ -558,6 +612,7 @@ if (dbgEnabled())
                 imgExtent,
                 VK_FILTER_LINEAR
             );
+            drawHud(dstImage);
             cmdbuf.end(vk);
             // the real present is the last submit of the frame: signal the fence
             // so the next frame's gate waits for all of this frame's work.

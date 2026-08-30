@@ -2,6 +2,7 @@ set(APP_SOURCES
     "src/main.cpp"
     "src/stream.cpp"
     "src/presentation.cpp"
+    "src/hud.cpp"
     "src/wsi/backend_x11.cpp"
     "src/wsi/backend_wayland.cpp")
 
