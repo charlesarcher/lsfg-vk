@@ -280,10 +280,27 @@ if (dbgEnabled())
     Clock::time_point lastFrameTime = Clock::now();
     Clock::time_point statsLastTime = Clock::now();
     uint64_t frameCount = 0;
+    uint64_t presentedFrames = 0;
     bool idleLogged = false;
     uint32_t lastFrameStagingIdx = 0;
     const auto idleThreshold = std::chrono::seconds(5);
     const auto statsInterval = std::chrono::seconds(1);
+
+    // per-second stats when verbose: `frameCount` counts received game
+    // frames (one per generation cycle); `presentedFrames` counts swapchain
+    // presents ((destCount + 1) per cycle), so the presented/game ratio is
+    // the observable multiplier. must run from both loop branches.
+    auto maybeStats = [&](Clock::time_point now) {
+        if (!verboseEnabled() || now - statsLastTime < statsInterval)
+            return;
+        const double dt = std::chrono::duration<double>(now - statsLastTime).count();
+        std::cerr << "lsfg-vk-app: " << static_cast<uint32_t>(frameCount / dt)
+                  << " fps game, " << static_cast<uint32_t>(presentedFrames / dt)
+                  << " fps presented\n";
+        frameCount = 0;
+        presentedFrames = 0;
+        statsLastTime = now;
+    };
 
     // Helper to process Wayland events before blocking Vulkan calls.
     // On Wayland, the compositor requires the client to process events
@@ -362,19 +379,12 @@ if (dbgEnabled())
                         .pImageIndices = &idx,
                     };
                     (void)vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+                    presentedFrames += 1;
                 }
                 std::cerr << "lsfg-vk-app: idle >5 s, presenting last frame (slot " << lastFrameStagingIdx << ")\n";
                 idleLogged = true;
             }
-            // per-second stats when verbose
-            if (verboseEnabled() && now - statsLastTime >= statsInterval) {
-                const double fps = static_cast<double>(frameCount) /
-                    std::chrono::duration<double>(now - statsLastTime).count();
-                std::cerr << "lsfg-vk-app: " << static_cast<uint32_t>(fps) << " fps, slots "
-                          << "2/2, queued 0\n";
-                frameCount = 0;
-                statsLastTime = now;
-            }
+            maybeStats(now);
             // Process WSI events even during idle to keep Wayland connection alive
             processWsiEvents(0);
             continue;
@@ -555,6 +565,7 @@ if (dbgEnabled())
 
         if (verboseEnabled())
             std::cerr << "[gen x " << destCount << " + real]\n";
+        presentedFrames += presentCount;
 
         // backpressure: tell the layer this slot is free so it can recapture
         // into it (the ring is 2 deep, so the layer will not reuse it until a
@@ -562,6 +573,7 @@ if (dbgEnabled())
         conn.send(ls::ipc::Release{ frame->stagingIdx });
 
         ++fidx;
+        maybeStats(Clock::now());
 
         // stop on a window resize/close (processEvents returns true for both);
         // teardown happens via the guard on return.

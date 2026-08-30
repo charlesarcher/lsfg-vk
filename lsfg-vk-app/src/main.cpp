@@ -76,9 +76,12 @@ namespace {
     /// profile 'gpu' key (deviceName | ids | pci).
     static lsfgvk::backend::Instance* g_backend{nullptr};
 
-    /// SIGINT handler: write a byte to the self-pipe so the blocking accept()
-    /// poll() returns (SIGPIPE is ignored so a peer's death does not kill us).
+    /// SIGINT handler: set the shutdown flag (the present loop and the
+    /// accept loop both poll it) and write a byte to the self-pipe so a
+    /// blocking accept() poll() returns (SIGPIPE is ignored so a peer's
+    /// death does not kill us).
     void onSigInt(int /*sig*/) noexcept {
+        g_stop.store(true, std::memory_order_relaxed);
         char b{'S'};
         ssize_t n{};
         do {
