@@ -177,6 +177,34 @@ contexts and suppresses rebuild) but the notification message did not
 trigger in testing. No functional impact — external presentation continues
 uninterrupted.
 
+#### Input (mouse/keyboard) not reaching the game
+
+**Symptom:** The frame-doubled game displays correctly, but mouse and/or
+keyboard input does not affect the game (e.g. RE2's menu or gameplay is
+unresponsive).
+
+**Cause:** The `lsfg-vk-app` presentation window covers the game and must not
+capture input. The two backends handle this differently:
+
+- **Wayland (`--session wayland`):** The app window is a layer-shell **overlay**
+  surface with an **empty input region**. The compositor's pointer hit-test
+  skips the app surface (pointer reaches the game) and the overlay never takes
+  keyboard focus (`keyboard_interactivity = NONE`). Both mouse and keyboard
+  reach the game. If input does not reach the game on Wayland, you are running
+  a pre-fix binary — rebuild and relaunch `lsfg-vk-app`.
+- **X11 (`--session x11`):** The app window uses `WM_HINTS input=False`, which
+  only stops it from taking **keyboard** focus. It is still a normal `InputOutput`
+  window stacked `ABOVE`, so it **captures the pointer** and the game does not
+  receive mouse events. Keyboard works; mouse does not. This is a known X11
+  limitation (a drawing window on X11 has no clean built-in pointer
+  click-through). Use `--session wayland` for full input pass-through.
+
+**Fix / workaround:**
+- Use `--session wayland` with the fixed `lsfg-vk-app` build for both mouse and
+  keyboard to reach the game.
+- On `--session x11`, expect keyboard to work but mouse to be captured by the
+  app window.
+
 ---
 
 ### Dual-GPU Setups

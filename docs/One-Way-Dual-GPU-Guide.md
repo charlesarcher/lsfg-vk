@@ -644,12 +644,26 @@ Under **X11** the state is *requested* with a post-map EWMH ClientMessage
 ignored by KWin and leaves the window under the top panel ((0,28) 2560×1382
 instead of (0,0) 2560×1440; fixed 2026-08-30, verified placed at (0,0)
 2560×1440 with FULLSCREEN | ABOVE). Under **Wayland** the window is a
-fullscreen toplevel on the requested output; KWin/Plasma *may* keep its panels
-drawn above the toplevel, which can occlude the top-left corner (the fps HUD)
-by a few pixels — set the panel to auto-hide if that bothers you (in the
-2026-08-30 verified runs the HUD was fully visible at (8,8) on both backends).
+layer-shell **overlay** surface (stacks above toplevels, never takes focus;
+falls back to a fullscreen toplevel on compositors without `zwlr_layer_shell_v1`);
+KWin/Plasma *may* keep its panels drawn above the overlay, which can occlude
+the top-left corner (the fps HUD) by a few pixels — set the panel to auto-hide
+if that bothers you (in the 2026-08-30 verified runs the HUD was fully visible
+at (8,8) on both backends).
 Disable compositor effects for the app window if you see smearing (KWin:
 Window Rules → "No compositing" for the app).
+
+**Input (mouse/keyboard) not reaching the game**:
+- **Wayland** (`--session wayland`): the fixed app window is a layer-shell
+  overlay with an empty input region, so both pointer and keyboard pass to the
+  game (see "Fixed: Wayland input + focus" below). If input still does not
+  reach the game you are running a pre-fix binary — rebuild and relaunch the
+  app.
+- **X11** (`--session x11`): keyboard passes (the app window never takes focus
+  via `WM_HINTS input=False`) but **mouse does not** — the app window is a
+  normal `InputOutput` window stacked above and it captures the pointer. This
+  is a known X11 limitation (Known issues #5); use `--session wayland` for
+  full input pass-through.
 
 **Flatpak**: both GPUs' `/dev/dri/renderD*` nodes must be granted to the
 sandbox (`--device=/dev/dri` plus the specific nodes; see the Flatpak Guide).
@@ -669,6 +683,16 @@ sandbox (`--device=/dev/dri` plus the specific nodes; see the Flatpak Guide).
    swapchain. The layer-side recipe (Steam launch options) is in
    "Frame-doubling a real game (Steam)" below; the vkcube E2E on both
    backends is the verified proof of the mechanism.
+5. **X11 backend: mouse input is not passed through** (validated 2026-08-30):
+   `WM_HINTS input=False` only stops the app window from taking *keyboard*
+   focus; it does not make the window pointer-transparent. The app window is a
+   normal `InputOutput` window stacked `ABOVE`, so it still captures the
+   pointer and the game below does not receive mouse events. Keyboard works
+   (the app never takes focus); mouse does not. The Wayland backend fixes both
+   (empty input region for the pointer, layer-shell for the keyboard/focus).
+   A drawing window on X11 has no clean built-in pointer click-through (an
+   `InputOnly` window would be transparent but could not present frames). Use
+   `--session wayland` for full input pass-through.
 
 ### Fixed: Wayland backend stall (2026-08-29)
 
@@ -684,6 +708,45 @@ unreachable as well. Fixed with a non-blocking bounded dispatch in
 events and re-checks the stop flag on each retry. Verified: 60 s Wayland soak
 (9,088 cycles, ratio 2.005, 0 errors, clean SIGINT in 56 ms) and an X11
 regression run (no change: 1,744 cycles / 30 s, ratio 2.010).
+
+### Fixed: Wayland input + focus (2026-08-30)
+
+Two input bugs while running a real game (RE2, `--session wayland`): (1) mouse
+and keyboard not reaching the game, and (2) the app window and the game window
+"fighting" — a flashy/glitchy stacking/focus ping-pong that only a click used
+to pin. The app window is the one that covers the game and presents the doubled
+frames, so it must not eat input. Two independent mechanisms fix them:
+
+- **Pointer → empty input region.** `wl_surface_set_input_region` with an
+  *empty* region (no `add_box`). The compositor's pointer hit-test then skips
+  the app surface and delivers the pointer to the window beneath (the game).
+  Wayland has no `WM_HINTS input=False`; the empty region is the protocol's
+  click-through mechanism (the pattern GTK uses for non-interactive surfaces).
+- **Keyboard/focus + stacking → layer-shell overlay.** The app window is now a
+  `zwlr_layer_shell_v1` **overlay** surface (`keyboard_interactivity = NONE`,
+  anchored to all four edges, exclusive zone `-1`), with `xdg_toplevel` kept as
+  the fallback for compositors without layer-shell. The overlay layer always
+  stacks above toplevels and is never a focus candidate, which removes the app
+  window from the compositor's toplevel focus/stacking cycle. That cycle is
+  exactly what caused the flicker: as a toplevel, KWin re-activated and
+  re-stacked the two fullscreen windows at ~20 Hz (toplevel configure states
+  cycling at the compositor's refresh rate), re-focusing the app on every pass.
+
+Verified (`WAYLAND_DEBUG` evidence + input probe, under
+`.omo/evidence/oneway/re2-input-fix-2026-08-30/`): the empty `set_input_region`
+is committed to the app surface, **0** pointer/keyboard events reach the app,
+**0** toplevel configures fire (was ~1,166/20 s pre-fix — the ping-pong is
+gone), and the present loop is intact (2,993 cycles @ ~149/300 fps, 0 VUIDs,
+clean teardown).
+
+> **Note on the X11 path:** `WM_HINTS input=False` (the X11 backend's input
+> mechanism) is a **keyboard-focus hint only** — it keeps the app from taking
+> keyboard focus, but it does *not* make the window pointer-transparent. A
+> pointer-only XTest probe confirms it: with the fullscreen `input=False`
+> overlay on top, the overlay captures the pointer (button=1) and the game
+> receives nothing (button=0); without the overlay the game gets the button.
+> So the X11 one-way path gives keyboard pass-through but not mouse
+> pass-through. See `.omo/evidence/oneway/re2-input-fix-2026-08-30/README.md`.
 
 ## Related docs
 
