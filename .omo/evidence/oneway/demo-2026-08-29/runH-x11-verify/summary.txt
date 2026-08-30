@@ -1,0 +1,17 @@
+runH: fresh X11-backend verification, 2026-08-29 23:00-23:06 CDT, HEAD 6114b27
+app: lsfg-vk-app --profile app-oneway --session x11 -v (XAUTHORITY xauth_OKuvCG)
+game: vkcube --present_mode fifo --wsi xcb, MESA_VK_DEVICE_SELECT=1002:7550 (9070 XT)
+
+run 1 (app.log, game.log, shot-t8/23/38/53.png, engine-doubler-*.txt / engine-game-*.txt):
+  84 per-second stats samples: 57.25 fps game / 114.99 fps presented -> ratio 2.0085
+  4,917 [gen x 1 + real] cycles
+  stills: single fullscreen animating image (motion bbox 61% x 65% up to 100% x 100%);
+  colors (58,77,80)/(55,74,76)/(61,77,80) vs ground truth (60,77,79); blue-dominant, R-B -19..-22
+  engine: doubler card3 busy 6% (samples) vs idle 4%; game card2 14%
+run 2 (app2.log, game2.log): timed SIGINT
+  17 samples: 56.94 / 114.53 -> ratio 2.0114; 1,036 cycles
+  SIGINT -> exit 24 ms, "lsfg-vk-app: shutting down" banner (shutdown-ms.txt)
+  game side: documented "Connection reset by peer" burst only
+
+Conclusion: X11 backend works end-to-end; cadence ratio ~2.01, one fullscreen image
+(no ghosting), color matches ground truth (no artifacting), clean SIGINT.

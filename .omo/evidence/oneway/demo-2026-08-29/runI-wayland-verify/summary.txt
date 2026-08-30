@@ -1,0 +1,15 @@
+runI: fresh Wayland-backend verification, 2026-08-29 23:08-23:10 CDT, HEAD 6114b27
+app: lsfg-vk-app --profile app-oneway --session wayland -v
+game: vkcube --present_mode fifo --wsi xcb, MESA_VK_DEVICE_SELECT=1002:7550 (9070 XT)
+
+app.log, game.log, shot-t10/25/40.png, engine-doubler-*.txt / engine-game-*.txt:
+  51 per-second stats samples: 149.94 fps game / 300.71 fps presented -> ratio 2.0055
+  7,774 [gen x 1 + real] cycles
+  stills: single fullscreen animating image (motion bbox 65% x 66%);
+  colors (64,77,79)/(61,77,80) vs ground truth (60,77,79); blue-dominant, R-B -15.7/-19.2
+  engine: doubler card3 busy during run; game card2 14%
+SIGINT -> exit 12 ms, "lsfg-vk-app: shutting down" banner (shutdown-ms.txt)
+game side: documented "Connection reset by peer" burst only
+
+Conclusion: Wayland backend works end-to-end (post 2026-08-29 stall fix);
+cadence ratio ~2.01, one fullscreen image, color matches ground truth, clean SIGINT.
