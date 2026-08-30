@@ -14,8 +14,10 @@
 #include <vulkan/vulkan_core.h>
 
 #include <chrono>
+#include <cstdarg>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -31,6 +33,25 @@
 using namespace ls::ipc;
 
 namespace {
+    /// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
+    /// on LSFGVK_APP_DBG so the default stream stays clean.
+    const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
+    bool dbgEnabled() {
+        return std::getenv("LSFGVK_APP_DBG") != nullptr;
+    }
+    void dbg(const char* fmt, ...) {
+        if (!dbgEnabled())
+            return;
+        char buf[256];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_dbgT0).count();
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] %s (t+%lld ms)\n", buf, ms);
+    }
+
     /// bound the blocking recv() so a SIGINT (EINTR) or a silent peer can never
     /// hang the accept loop: SO_RCVTIMEO makes recvmsg return within this span
     /// when no data is ready.
@@ -102,6 +123,10 @@ StreamState::~StreamState() {
             ::close(fd);
             fd = -1;
         }
+    if (dbgEnabled())
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] dtor: staging fds closed, member destructors next (context/images) (t+%lld ms)\n",
+        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_dbgT0).count());
 }
 
 namespace ls::ipc {
@@ -116,7 +141,9 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     setRecvTimeout(conn.fd(), RECV_TIMEOUT);
 
     // 1. HELLO: game identity + swapchain size/format --------------------
+    dbg("runStream: waiting for HELLO");
     auto helloMsg = recvStop(conn, stop);
+    dbg("runStream: HELLO received");
     if (!helloMsg)
         return;
     const auto* hello = std::get_if<Hello>(&*helloMsg);
@@ -202,11 +229,17 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     }
     state.stagingCount = 2;
 
-    // 4. create two B-local destination images natively, self-export each, and
-    //    hand the backend a dup of the export fd as the destination descriptor.
+    // 4. create (multiplier-1) B-local destination images natively, self-export
+    //    each, and hand the backend a dup of the export fd as the destination
+    //    descriptor. the backend generates one frame per destination image per
+    //    cycle (multiplier = dests + 1), so the display cadence is
+    //    multiplier x the game's (config parser already enforces multiplier > 1).
+    const size_t destCount = conf.multiplier - 1;
     std::vector<vk::ExchangeDescriptor> destDescs;
     std::vector<int> handedDestFds;
-    for (size_t i = 0; i < 2; ++i) {
+    state.destinationImages.reserve(destCount);
+    for (size_t i = 0; i < destCount; ++i) {
+        state.destinationImages.emplace_back();
         state.destinationImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt, imgUsage,
             std::nullopt /*importFd*/, std::nullopt /*exportFd*/, layout);
         auto exp = state.destinationImages.at(i).mut().exportDmaBuf(vk);
@@ -229,20 +262,22 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         });
     }
 
-    // 5. open the cross-device frame-gen context with EXACTLY 2 source + 2
-    //    descriptors. hdr=false because the exchange images are R8G8B8A8_UNORM
+    // 5. open the cross-device frame-gen context with EXACTLY 2 source +
+    //    (multiplier-1) destination descriptors. hdr=false because the exchange
     //    (lsfgvk.hpp:103-105: false => R8G8B8A8_UNORM, true => RGBA16F). the
     //    backend infers the format from hdr, so a wrong hdr would reject the
     //    source descriptors' format. syncFd is ignored on the cross-device path.
     //    on any throw before a successful import, close the handed dups (the
     //    backend has consumed none yet).
     try {
+        dbg("runStream: openContext start");
         auto& ctx = backend.openContext(
             std::span<const vk::ExchangeDescriptor>(sourceDescs),
             std::span<const vk::ExchangeDescriptor>(destDescs),
             state.gameUuid, neg.modifier, -1 /*syncFd ignored cross-device*/,
             w, h, false /*hdr: R8G8B8A8 staging, never format>57*/,
             1.0F / conf.flow_scale, conf.performance_mode);
+        dbg("runStream: openContext done");
         if (!backend.isCrossDevice(ctx))
             throw ls::error("backend context is not cross-device");
         state.context = ls::owned_ptr<ls::R<lsfgvk::backend::Context>>(

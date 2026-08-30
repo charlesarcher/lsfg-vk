@@ -105,7 +105,11 @@ void CommandBuffer::dispatch(const vk::Vulkan& vk,
 void CommandBuffer::blitImage(const vk::Vulkan& vk,
         const std::vector<vk::Barrier>& preBarriers,
         std::pair<VkImage, VkImage> images, VkExtent2D extent,
-        const std::vector<vk::Barrier>& postBarriers) const {
+        const std::vector<vk::Barrier>& postBarriers,
+        VkExtent2D srcExtent, VkFilter filter) const {
+    if (srcExtent.width == 0 || srcExtent.height == 0)
+        srcExtent = extent; // 1:1 blit
+
     vk.df().CmdPipelineBarrier(*this->commandBuffer,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
         0,
@@ -121,8 +125,8 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
         },
         .srcOffsets = {
             { 0, 0, 0 },
-            { static_cast<int32_t>(extent.width),
-              static_cast<int32_t>(extent.height), 1 }
+            { static_cast<int32_t>(srcExtent.width),
+              static_cast<int32_t>(srcExtent.height), 1 }
         },
         .dstSubresource = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -138,7 +142,7 @@ void CommandBuffer::blitImage(const vk::Vulkan& vk,
         images.first, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         images.second, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         1, &region,
-        VK_FILTER_NEAREST
+        filter
     );
 
     vk.df().CmdPipelineBarrier(*this->commandBuffer,

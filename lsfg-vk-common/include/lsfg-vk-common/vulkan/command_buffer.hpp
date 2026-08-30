@@ -36,13 +36,18 @@ namespace vk {
         /// @param vk the vulkan instance
         /// @param preBarriers image memory barriers to apply before blit
         /// @param images source and destination images
-        /// @param extent the extent of the blit
+        /// @param extent the extent of the blit (destination rect, anchored at 0,0)
         /// @param postBarriers image memory barriers to apply after blit
+        /// @param srcExtent the source rect (anchored at 0,0); 0x0 = same as @p extent
+        ///        (a 1:1 blit). a nonzero src scales the source onto the dest extent
+        /// @param filter the sampler filter for the scaling (no effect on 1:1 blits)
         /// throws ls::vulkan_error on failure
         void blitImage(const vk::Vulkan& vk,
             const std::vector<vk::Barrier>& preBarriers,
             std::pair<VkImage, VkImage> images, VkExtent2D extent,
-            const std::vector<vk::Barrier>& postBarriers) const;
+            const std::vector<vk::Barrier>& postBarriers,
+            VkExtent2D srcExtent = VkExtent2D{ 0, 0 },
+            VkFilter filter = VK_FILTER_NEAREST) const;
 
         /// insert a bunch of barriers
         /// @param vk the vulkan instance

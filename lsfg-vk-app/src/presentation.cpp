@@ -29,8 +29,10 @@
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 
 #include <cerrno>
+#include <cstdarg>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -42,6 +44,24 @@
 
 namespace ls::presentation {
 namespace {
+    /// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
+/// on LSFGVK_APP_DBG so the default stream stays clean.
+const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
+bool dbgEnabled() {
+    return std::getenv("LSFGVK_APP_DBG") != nullptr;
+}
+void dbg(const char* fmt, ...) {
+    if (!dbgEnabled())
+        return;
+    char buf[256];
+        va_list ap;
+        va_start(ap, fmt);
+        std::vsnprintf(buf, sizeof(buf), fmt, ap);
+        va_end(ap);
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_dbgT0).count();
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] %s (t+%lld ms)\n", buf, ms);
+    }
     /// clamp v into [lo, hi] (mirrors the main.cpp swapchain-clamp helper).
     uint32_t clamp32(uint32_t v, uint32_t lo, uint32_t hi) {
         return v < lo ? lo : (v > hi ? hi : v);
@@ -137,17 +157,24 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     std::vector<VkColorSpaceKHR> colorspaces;
     wsi->surfaceCaps(surface, caps, colorspaces);
 
-    VkExtent2D extent{ w, h };
+    // match the swapchain to the window size the compositor reports: on
+    // Wayland a presented buffer smaller than the window implicitly resizes
+    // the window every frame, which would tear the stream down. the stream
+    // images are blit-scaled into the swapchain instead. 0x0 (no size report
+    // yet) falls back to the stream size.
+    VkExtent2D extent = wsi->windowExtent();
+    if (extent.width == 0 || extent.height == 0)
+        extent = VkExtent2D{ w, h };
     // only clamp to caps when the reported range is sane (min<=max, max>0);
     // RADV/XCB under XWayland can report a degenerate 0x0 max, so fall back to
     // the requested extent clamped to a sane [1, 16384] band (main.cpp:361-377).
     if (caps.minImageExtent.width <= caps.maxImageExtent.width
             && caps.maxImageExtent.width > 0 && caps.maxImageExtent.height > 0) {
-        extent.width = clamp32(w, caps.minImageExtent.width, caps.maxImageExtent.width);
-        extent.height = clamp32(h, caps.minImageExtent.height, caps.maxImageExtent.height);
+        extent.width = clamp32(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+        extent.height = clamp32(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
     } else {
-        extent.width = clamp32(w, 1u, 16384u);
-        extent.height = clamp32(h, 1u, 16384u);
+        extent.width = clamp32(extent.width, 1u, 16384u);
+        extent.height = clamp32(extent.height, 1u, 16384u);
     }
     if (extent.width == 0 || extent.height == 0)
         throw ls::error("surface supported extent is 0x0");
@@ -181,11 +208,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     ci.surface = surface;
     ci.minImageCount = minImages;
-    ci.imageFormat = VK_FORMAT_R8G8B8A8_UNORM;
+    ci.imageFormat = wsi->swapchainFormat(surface);
     ci.imageColorSpace = colorSpace;
     ci.imageExtent = extent;
     ci.imageArrayLayers = 1;
-    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    ci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     ci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     ci.pQueueFamilyIndices = nullptr;
     ci.preTransform = caps.currentTransform;
@@ -193,6 +220,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = VK_NULL_HANDLE;
+
+if (dbgEnabled())
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] swapchain extent %ux%u fmt=%u (stream %ux%u)\n",
+                     extent.width, extent.height, ci.imageFormat, w, h);
 
     VkSwapchainKHR swapchain{VK_NULL_HANDLE};
     const auto createRes = vk.df().CreateSwapchainKHR(vk.dev(), &ci, VK_NULL_HANDLE, &swapchain);
@@ -233,10 +264,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         VkSwapchainKHR swapchain;
         ls::wsi::SurfaceBackend* wsi;
         ~SwapchainGuard() {
+            dbg("guard: destroying swapchain");
             if (swapchain != VK_NULL_HANDLE && vk != nullptr)
                 vk->df().DestroySwapchainKHR(vk->dev(), swapchain, VK_NULL_HANDLE);
+            dbg("guard: swapchain destroyed, destroying wsi");
             if (wsi != nullptr)
                 wsi->destroy();
+            dbg("guard: wsi destroyed");
         }
     };
     SwapchainGuard guard{ &vk, swapchain, wsi.get() };
@@ -250,6 +284,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     uint32_t lastFrameStagingIdx = 0;
     const auto idleThreshold = std::chrono::seconds(5);
     const auto statsInterval = std::chrono::seconds(1);
+
+    // Helper to process Wayland events before blocking Vulkan calls.
+    // On Wayland, the compositor requires the client to process events
+    // (frame callbacks, configure) before AcquireNextImageKHR/QueuePresentKHR
+    // can make progress. X11 backend's processEvents is a no-op when there's
+    // nothing to do, so this is safe for both backends.
+    auto processWsiEvents = [&](int timeout_ms = 0) {
+        wsi->processEvents(timeout_ms);
+    };
 
     // --- the present loop ----------------------------------------------------
     size_t fidx{ 0 };
@@ -271,9 +314,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         // idle detection: if no FRAME for >5 s, present the last real frame once
         // and log a single notification. the window stays alive.
         if (pr == 0 || !(pfd.revents & POLLIN)) {
+            dbg("present: idle branch (pr=%d revents=0x%x, since frame %.1fs)",
+                pr, (unsigned)(pfd.revents & 0xffff),
+                std::chrono::duration<double>(now - lastFrameTime).count());
             if (!idleLogged && now - lastFrameTime >= idleThreshold) {
                 // present the last captured game frame to keep the window alive
                 uint32_t idx{};
+                processWsiEvents(0); // process events before acquire
                 const auto aq = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
                     UINT64_MAX, acquireSem.handle(), VK_NULL_HANDLE, &idx);
                 if (aq == VK_SUCCESS || aq == VK_SUBOPTIMAL_KHR) {
@@ -290,12 +337,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
                         },
                         { srcImage.mut().handle(), dstImage },
-                        VkExtent2D{ w, h },
+                        extent,
                         {
                             makeBlitBarrier(dstImage,
                                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                 VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
-                        }
+                        },
+                        VkExtent2D{ w, h },
+                        VK_FILTER_LINEAR
                     );
                     cmdbuf.end(vk);
                     cmdbuf.submit(vk,
@@ -303,6 +352,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         { signalSem.at(destCount).handle() }, VK_NULL_HANDLE, 0,
                         VK_NULL_HANDLE
                     );
+                    processWsiEvents(0); // process events before present
                     const VkPresentInfoKHR presentInfo{
                         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                         .waitSemaphoreCount = 1,
@@ -325,6 +375,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 frameCount = 0;
                 statsLastTime = now;
             }
+            // Process WSI events even during idle to keep Wayland connection alive
+            processWsiEvents(0);
             continue;
         }
 
@@ -345,6 +397,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         // the FRAME carries the capture sync fd; scheduleFrames consumes it.
         const int captureFd = conn.takeReceivedFd();
 
+        // TEMP DEBUG: probe the raw kernel sync fds (poll = non-destructive) to
+        // find which fence never signals: the layer's capture blit fd, then the
+        // backend's per-destination done fds. gated: the 500 ms polls add
+        // latency per frame when enabled.
+        if (dbgEnabled()) {
+            pollfd cf{captureFd, POLLIN, 0};
+            const int cr = captureFd >= 0 ? ::poll(&cf, 1, 500) : -1;
+            dbg("present: captureFd %d signaled within 500ms: %s (fidx %zu)",
+                captureFd, (cr == 1 && (cf.revents & POLLIN)) ? "yes" : "NO", fidx);
+        }
+
         // cross-frame gate: the previous frame's last submit signaled the
         // fence; wait for it before reusing the command buffer / re-reading the
         // source images (mirrors the layer's renderFence gate).
@@ -352,12 +415,23 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
         fence.reset(vk);
 
+        dbg("present: FRAME received, scheduleFrames start (fidx %zu)", fidx);
         std::vector<int> doneFds;
         try {
             doneFds = backend.scheduleFrames(*state.context, captureFd);
         } catch (const std::exception& e) {
             throw ls::error("failed to schedule frames", e);
         }
+        dbg("present: scheduleFrames done (fidx %zu)", fidx);
+        if (dbgEnabled())
+            for (size_t i = 0; i < doneFds.size(); ++i) {
+                if (doneFds.at(i) < 0)
+                    continue;
+                pollfd df{doneFds.at(i), POLLIN, 0};
+                const int dr = ::poll(&df, 1, 500);
+                dbg("present: doneFd[%zu] %d signaled within 500ms: %s (fidx %zu)",
+                    i, doneFds.at(i), (dr == 1 && (df.revents & POLLIN)) ? "yes" : "NO", fidx);
+            }
         if (doneFds.size() != destCount)
             throw ls::error("backend returned " + std::to_string(doneFds.size())
                 + " done fds, expected " + std::to_string(destCount));
@@ -367,7 +441,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         // --- generated presents: one per destination image -----------------
         for (size_t i = 0; i < destCount; ++i) {
             // acquire a swapchain image (wait: acquireSem is always unsignaled).
+            dbg("present: acquire gen %zu/%zu (fidx %zu)", i, destCount, fidx);
             uint32_t idx{};
+            processWsiEvents(0); // process events before acquire
             const auto aq = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
                 UINT64_MAX, acquireSem.handle(), VK_NULL_HANDLE, &idx);
             if (aq != VK_SUCCESS && aq != VK_SUBOPTIMAL_KHR)
@@ -391,12 +467,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
                 },
                 { state.destinationImages.at(i).mut().handle(), dstImage },
-                imgExtent,
+                extent,
                 {
                     makeBlitBarrier(dstImage,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
-                }
+                },
+                imgExtent,
+                VK_FILTER_LINEAR
             );
             cmdbuf.end(vk);
             cmdbuf.submit(vk,
@@ -406,6 +484,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 VK_NULL_HANDLE
             );
 
+            processWsiEvents(0); // process events before present
             const VkPresentInfoKHR presentInfo{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                 .waitSemaphoreCount = 1,
@@ -421,7 +500,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
         // --- ONE real frame: blit the latest captured game frame -----------
         {
+            dbg("present: acquire real (fidx %zu)", fidx);
             uint32_t idx{};
+            processWsiEvents(0); // process events before acquire
             const auto aq = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
                 UINT64_MAX, acquireSem.handle(), VK_NULL_HANDLE, &idx);
             if (aq != VK_SUCCESS && aq != VK_SUBOPTIMAL_KHR)
@@ -440,12 +521,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
                 },
                 { srcImage.mut().handle(), dstImage },
-                imgExtent,
+                extent,
                 {
                     makeBlitBarrier(dstImage,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                         VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
-                }
+                },
+                imgExtent,
+                VK_FILTER_LINEAR
             );
             cmdbuf.end(vk);
             // the real present is the last submit of the frame: signal the fence
@@ -456,6 +539,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 fence.handle()
             );
 
+            processWsiEvents(0); // process events before present
             const VkPresentInfoKHR presentInfo{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                 .waitSemaphoreCount = 1,
@@ -470,7 +554,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         }
 
         if (verboseEnabled())
-            std::cerr << "[gen gen real]\n";
+            std::cerr << "[gen x " << destCount << " + real]\n";
 
         // backpressure: tell the layer this slot is free so it can recapture
         // into it (the ring is 2 deep, so the layer will not reuse it until a

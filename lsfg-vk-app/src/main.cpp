@@ -26,9 +26,11 @@
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 
 #include <array>
+#include <chrono>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -56,6 +58,17 @@ namespace {
     std::atomic<bool> g_stop{false};
     /// write end of the SIGINT self-pipe; the handler signals via it
     int g_selfPipeWrite{-1};
+
+    /// TEMP DEBUG: monotonic elapsed-ms probe for reconnection timing. gated
+    /// on LSFGVK_APP_DBG so the default stream stays clean.
+    std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
+    void dbg(const char* what) {
+        if (std::getenv("LSFGVK_APP_DBG") == nullptr)
+            return;
+        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - g_dbgT0).count();
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] main: %s (t+%lld ms)\n", what, ms);
+    }
 
     /// process-level frame-gen backend instance (never freed: makeLeaking).
     /// created once before the accept loop, alive for the whole run. its
@@ -422,8 +435,10 @@ int main(int argc, char** argv) {
             // accept() returns a Connection by value (move-only, no default
             // ctor); bind it before touching the registry so a failed accept
             // cannot leave a stray fd open.
+            dbg("listener ready, accepting");
             try {
                 auto conn = listener.accept();
+                dbg("accept returned");
 
                 // own the stream's registry entry for the connection's lifetime;
                 // erasing it after runStream returns destroys the StreamState,
@@ -440,14 +455,19 @@ int main(int argc, char** argv) {
                 try {
                     ls::ipc::runStream(conn, it.first->second, g_stop, *vk, *g_backend, conf, session);
                 } catch (const std::exception& e) {
+                    dbg("runStream returned (catch)");
                     std::cerr << "lsfg-vk-app: stream ended: " << e.what() << "\n";
+                    dbg("about to erase stream state (dtor)");
                 }
+                dbg("erasing stream state");
                 streams.erase(it.first);  // StreamState dtor closes stored fds
+                dbg("stream state erased (dtor done)");
             } catch (const ls::ipc::socket_error& e) {
                 if (g_stop.load())
                     break;
                 std::cerr << "lsfg-vk-app: accept failed: " << e.what() << "\n";
             }
+            dbg("about to poll listener");
         }
 
         // --- shutdown: RAII closes the Listener socket + unlinks the file,

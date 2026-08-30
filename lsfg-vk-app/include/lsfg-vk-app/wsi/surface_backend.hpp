@@ -32,6 +32,7 @@ namespace ls::wsi {
     /// resize/close events, and tear everything down. One instance per backend type.
     class SurfaceBackend {
     public:
+        virtual ~SurfaceBackend() = default;
         /// @param session "x11" | "wayland" | "auto"
         [[nodiscard]] virtual bool connect(std::string_view session) = 0;
         [[nodiscard]] virtual std::vector<OutputGeometry> outputs() const = 0;
@@ -41,9 +42,17 @@ namespace ls::wsi {
             createWindow(std::string_view output_name, VkExtent2D extent, uint32_t colorspace) = 0;
         [[nodiscard]] virtual VkSurfaceKHR
             createSurface(const vk::Vulkan& vk, WindowHandle handle) = 0;
+        /// the window size as reported by the compositor (0x0 until the first
+        /// size report). callers size the swapchain to this so presented buffers
+        /// do not implicitly resize the window
+        [[nodiscard]] virtual VkExtent2D windowExtent() const = 0;
         /// fill @p caps (extent range) + @p colorspaces from the surface for swapchain clamp
         virtual void surfaceCaps(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR& caps,
                 std::vector<VkColorSpaceKHR>& colorspaces) = 0;
+        /// the swapchain image format to present with: an 8-bit UNORM RGBA format
+        /// matching the surface's native pixel layout (X11: the window visual's
+        /// byte order; a mismatched format presents with red and blue swapped)
+        [[nodiscard]] virtual VkFormat swapchainFormat(VkSurfaceKHR surface) = 0;
         /// pump display/WM events for up to @p timeout_ms; return true if window resized or closed
         virtual bool processEvents(int timeout_ms) = 0;
         /// tear down window + surface + connection (idempotent)

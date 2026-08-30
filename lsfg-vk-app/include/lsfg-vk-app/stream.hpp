@@ -39,9 +39,11 @@ namespace ls::ipc {
         /// phase completes; the vk::Image members RAII their own handles.
         std::array<ls::lazy<vk::Image>, 2> sourceImages{};
 
-        /// the two B-local destination images, created natively on this device
-        /// and self-exported to become the backend's destination descriptors.
-        std::array<ls::lazy<vk::Image>, 2> destinationImages{};
+        /// the (multiplier-1) B-local destination images, created natively on this
+        /// device and self-exported to become the backend's destination
+        /// descriptors. the backend infers the generation multiplier from the
+        /// destination count (multiplier = dests + 1, lsfgvk.hpp:150).
+        std::vector<ls::lazy<vk::Image>> destinationImages;
 
         /// the backend frame-generation context; closed through the backend's
         /// closeContext on erase (mirrors the layer's swapchain.cpp ctx janitor).

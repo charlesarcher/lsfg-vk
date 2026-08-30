@@ -9,3 +9,9 @@
 /.clangd
 /.cache
 /.ccls
+
+# local build/data artifacts
+/build-asan
+/measurements/raw
+.omo/run-continuation/
+.omo/boulder.json

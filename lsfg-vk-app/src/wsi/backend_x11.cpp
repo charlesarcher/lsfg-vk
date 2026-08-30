@@ -139,6 +139,37 @@ public:
             throw ls::error("X server does not support the RandR extension");
 
         mOutputs = enumerateOutputs();
+
+        // The app window inherits the root visual, whose channel masks define
+        // the X pixel byte layout. On an LSBFirst screen the channel whose
+        // mask holds the low byte sits at the lowest memory address and is
+        // the first-listed component of the matching Vulkan 8888 format: the
+        // standard X TrueColor visual (red mask 0xff0000) stores B,G,R,X and
+        // maps to B8G8R8A8. Presenting a swapchain in the non-native 8888
+        // format on such a surface shows red and blue swapped.
+        mNativeSwapFormat = VK_FORMAT_B8G8R8A8_UNORM;
+        const xcb_visualid_t visId = mScreen->root_visual;
+        bool visualFound = false;
+        for (xcb_depth_iterator_t di = xcb_screen_allowed_depths_iterator(mScreen);
+                di.rem > 0 && !visualFound; xcb_depth_next(&di)) {
+            xcb_visualtype_iterator_t vi = xcb_depth_visuals_iterator(di.data);
+            while (vi.rem > 0 && !visualFound) {
+                const xcb_visualtype_t* vt = vi.data;
+                xcb_visualtype_next(&vi);
+                if (vt->visual_id != visId)
+                    continue;
+                visualFound = true;
+                const bool lowByteBlue = (vt->blue_mask & 0x000000ffu) != 0;
+                const bool lowByteRed = (vt->red_mask & 0x000000ffu) != 0;
+                if (lowByteBlue == lowByteRed)
+                    continue;
+                const bool lsbFirst =
+                    setup->image_byte_order == XCB_IMAGE_ORDER_LSB_FIRST;
+                const bool blueFirstMemory = lsbFirst ? lowByteBlue : lowByteRed;
+                mNativeSwapFormat = blueFirstMemory ? VK_FORMAT_B8G8R8A8_UNORM
+                                                    : VK_FORMAT_R8G8B8A8_UNORM;
+            }
+        }
         return true;
     }
 
@@ -156,6 +187,15 @@ public:
 
         const OutputEntry* target = selectWindow(output_name);
 
+        // the overlay covers the whole chosen output; game frames are blit-
+        // scaled into the (larger) swapchain. the requested extent is the
+        // fallback for outputs whose geometry is unknown (0x0).
+        uint32_t winW = extent.width, winH = extent.height;
+        if (target->geom.width > 0 && target->geom.height > 0) {
+            winW = target->geom.width;
+            winH = target->geom.height;
+        }
+
         const uint32_t backPixel = mScreen->black_pixel;
         mWindow = xcb_generate_id(mConn);
         xcb_create_window(mConn,
@@ -164,8 +204,8 @@ public:
             mScreen->root,               // parent = root, covering the output
             static_cast<int16_t>(target->geom.x),
             static_cast<int16_t>(target->geom.y),
-            static_cast<uint16_t>(extent.width),
-            static_cast<uint16_t>(extent.height),
+            static_cast<uint16_t>(winW),
+            static_cast<uint16_t>(winH),
             0,                           // border width
             XCB_WINDOW_CLASS_INPUT_OUTPUT,
             mScreen->root_visual,        // inherit the root visual
@@ -175,6 +215,13 @@ public:
         if (xcb_connection_has_error(mConn) != 0)
             throw ls::error("xcb_create_window failed for output '" +
                     std::string(output_name) + "'");
+
+        // no event mask is selected on this window (xcb_create_window has
+        // none), so no ConfigureNotify ever arrives: seed the last-observed
+        // size with the created size so windowExtent() is valid from the
+        // first caller, and a later attribute change is still detectable.
+        mLastWidth = static_cast<uint16_t>(winW);
+        mLastHeight = static_cast<uint16_t>(winH);
 
         applyWindowChrome(mWindow);
 
@@ -215,14 +262,19 @@ public:
 
     void surfaceCaps(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR& caps,
             std::vector<VkColorSpaceKHR>& colorspaces) override {
-        // Fetch the capability query from the loader (it is not reliably in
-        // VulkanInstanceFuncs — it is NULL when the vk::Vulkan was built
-        // non-graphical). Guarded so an absent symbol cannot deref null.
+        // the instance enables VK_KHR_surface (createInstance in vulkan.cpp),
+        // so the surface queries must resolve; a null pointer here means the
+        // instance was built without the surface extensions, in which case the
+        // swapchain would be created on zeroed caps, so fail loudly.
         const PFN_vkGetInstanceProcAddr mpa = loaderGetProc();
         auto getCaps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
             mpa(mVkInstance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
-        if (getCaps != nullptr)
-            getCaps(mPhysDev, surface, &caps);
+        if (getCaps == nullptr)
+            throw ls::error("vkGetPhysicalDeviceSurfaceCapabilitiesKHR unavailable "
+                "(instance missing VK_KHR_surface)");
+        const VkResult res = getCaps(mPhysDev, surface, &caps);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
 
         // GetPhysicalDeviceSurfaceFormatsKHR is NOT in VulkanInstanceFuncs, so
         // fetch it from the loader like the surface-creation function. Reuse the
@@ -230,8 +282,10 @@ public:
         auto getFormats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
             mpa(mVkInstance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
         if (getFormats == nullptr)
-            return; // color-space list is optional
+            throw ls::error("vkGetPhysicalDeviceSurfaceFormatsKHR unavailable "
+                "(instance missing VK_KHR_surface)");
 
+        // the color-space list is optional
         uint32_t count{};
         if (getFormats(mPhysDev, surface, &count, nullptr) != VK_SUCCESS || count == 0)
             return;
@@ -241,6 +295,35 @@ public:
         colorspaces.reserve(colorspaces.size() + count);
         for (const auto& f : formats)
             colorspaces.push_back(f.colorSpace);
+    }
+
+    VkFormat swapchainFormat(VkSurfaceKHR surface) override {
+        // Prefer the driver's own answer when it reports a usable 8-bit UNORM
+        // RGBA format. Under XWayland the surface format query is degenerate
+        // (zero formats), in which case the visual-derived native format is
+        // the only correct choice.
+        const PFN_vkGetInstanceProcAddr mpa = loaderGetProc();
+        auto getFormats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+            mpa(mVkInstance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+        uint32_t count{};
+        if (getFormats != nullptr && mPhysDev != VK_NULL_HANDLE
+                && getFormats(mPhysDev, surface, &count, nullptr) == VK_SUCCESS
+                && count != 0) {
+            std::vector<VkSurfaceFormatKHR> formats(count);
+            if (getFormats(mPhysDev, surface, &count, formats.data()) == VK_SUCCESS) {
+                for (const auto& f : formats)
+                    if (f.format == VK_FORMAT_R8G8B8A8_UNORM
+                            || f.format == VK_FORMAT_B8G8R8A8_UNORM)
+                        return f.format;
+            }
+        }
+        return mNativeSwapFormat;
+    }
+
+    VkExtent2D windowExtent() const override {
+        // the last ConfigureNotify size; 0x0 before the first one (the window
+        // was created at the requested extent, so the caller falls back to it)
+        return VkExtent2D{ mLastWidth, mLastHeight };
     }
 
     bool processEvents(int timeout_ms) override {
@@ -411,6 +494,11 @@ private:
 
         if (code == XCB_CONFIGURE_NOTIFY) {
             auto* e = reinterpret_cast<xcb_configure_notify_event_t*>(ev);
+            // ConfigureNotify also arrives on the initial map; only report a
+            // resize when the size actually changed (mLastWidth/Height are the
+            // last observed size and start at 0).
+            if (e->width == mLastWidth && e->height == mLastHeight)
+                return false;
             mLastWidth = e->width;
             mLastHeight = e->height;
             return true; // resize to the new extent
@@ -431,6 +519,7 @@ private:
     std::vector<OutputEntry> mOutputs;
     xcb_window_t mWindow{0};
     xcb_atom_t mDeleteWindowAtom{XCB_ATOM_NONE};
+    VkFormat mNativeSwapFormat{VK_FORMAT_B8G8R8A8_UNORM};
 
     // captured from vk in createSurface() for the queries surfaceCaps()/destroy()
     // run without a vk parameter.

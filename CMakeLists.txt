@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.10)
-project(lsfg-vk LANGUAGES CXX)
+project(lsfg-vk LANGUAGES CXX C)
 include(GNUInstallDirs)
 
 # === READ HERE FOR BUILD OPTIONS ===

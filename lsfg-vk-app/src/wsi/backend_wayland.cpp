@@ -18,7 +18,9 @@
 #include "lsfg-vk-common/helpers/errors.hpp"
 
 #include <chrono>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
@@ -40,6 +42,59 @@
 
 namespace ls::wsi {
 namespace {
+
+/// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
+/// on LSFGVK_APP_DBG so the default stream stays clean.
+const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
+bool dbgEnabled() {
+    return std::getenv("LSFGVK_APP_DBG") != nullptr;
+}
+void dbg(const char* fmt, ...) {
+    if (!dbgEnabled())
+        return;
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_dbgT0).count();
+    std::fprintf(stderr, "lsfg-vk-app: [dbg] wl: %s (t+%lld ms)\n", buf, ms);
+}
+
+/// TEMP DEBUG: wl_surface enter/leave an OUTPUT's scanout region (leave means
+/// the compositor stopped displaying this surface anywhere)
+void surfaceEnter(void* data, wl_surface* /*s*/, wl_output* output) {
+    dbg("wl_surface ENTERED output %p", (void*)output);
+    (void)data;
+}
+
+void surfaceLeave(void* data, wl_surface* /*s*/, wl_output* output) {
+    dbg("wl_surface LEFT output %p (compositor stopped scanning it out)", (void*)output);
+    (void)data;
+}
+
+const wl_surface_listener surfaceListener = {
+    .enter = surfaceEnter,
+    .leave = surfaceLeave
+};
+
+/// TEMP DEBUG: frame callback listener (one wl_callback at a time; each
+/// fires once when the compositor displays the buffer committed after the
+/// request - zero callbacks means the compositor stopped showing the surface)
+uint32_t g_dbgFrameCount = 0;
+bool g_dbgFrameCbPending = false;
+
+void surfaceFrameEvent(void* /*data*/, wl_callback* cb, uint32_t /*time*/) {
+    g_dbgFrameCbPending = false;
+    ++g_dbgFrameCount;
+    dbg("wl_surface frame callback #%u (compositor displayed a buffer)", g_dbgFrameCount);
+    wl_callback_destroy(cb);
+}
+
+const wl_callback_listener surfaceFrameListener = {
+    .done = surfaceFrameEvent
+};
 
 /// Wayland registry globals we bind
 struct Globals {
@@ -86,8 +141,13 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
         g->xdgWmBase = static_cast<xdg_wm_base*>(
             wl_registry_bind(registry, name, &xdg_wm_base_interface, 1));
     } else if (std::strcmp(interface, zxdg_output_manager_v1_interface.name) == 0) {
+        // Bind at the protocol's true interface version (3). The xdg-output
+        // unstable v4 protocol declares zxdg_output_manager_v1 and
+        // zxdg_output_v1 at version 3; requesting 4 trips compositors (KWin
+        // errors with "invalid version ... expected at most 3"). Version 3
+        // still exposes the `name`/`description` events (v2+) we rely on.
         g->xdgOutputManager = static_cast<zxdg_output_manager_v1*>(
-            wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, 4));
+            wl_registry_bind(registry, name, &zxdg_output_manager_v1_interface, 3));
     } else if (std::strcmp(interface, wl_seat_interface.name) == 0) {
         g->seat = static_cast<wl_seat*>(
             wl_registry_bind(registry, name, &wl_seat_interface, 1));
@@ -116,6 +176,14 @@ const xdg_wm_base_listener xdgWmBaseListener = {
 void xdgOutputName(void* data, zxdg_output_v1* /*output*/, const char* name) {
     auto* entry = static_cast<OutputEntry*>(data);
     entry->geom.name = name;
+    // KWin sends every xdg_output property (logical_position/size, name,
+    // description) but never the trailing `done` event, so we cannot wait on
+    // `done` to know an output is ready - that would busy-spin forever in the
+    // enumeration roundtrip loop. `name` is always delivered and is exactly
+    // what enumerateOutputs()/selectOutput() need, so treat it as the ready
+    // signal (the `done` handler sets it too, as a safety for compositors
+    // that do emit done).
+    entry->xdgOutputDone = true;
 }
 
 void xdgOutputDescription(void* /*data*/, zxdg_output_v1* /*output*/,
@@ -271,6 +339,7 @@ public:
         mSurface = wl_compositor_create_surface(mGlobals.compositor);
         if (!mSurface)
             throw ls::error("wl_compositor_create_surface failed");
+        wl_surface_add_listener(mSurface, &surfaceListener, this); // TEMP DEBUG
 
         // Create xdg_surface
         mXdgSurface = xdg_wm_base_get_xdg_surface(mGlobals.xdgWmBase, mSurface);
@@ -288,26 +357,41 @@ public:
         xdg_toplevel_set_app_id(mXdgToplevel, "lsfg-vk-app");
 
         // Fullscreen on specified output or primary
-        if (!output_name.empty()) {
-            for (const auto& o : mOutputs) {
-                if (o.geom.name == output_name && o.wlOutput) {
-                    xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
-                    break;
+        // TEMP DEBUG: LSFGVK_APP_NO_FS=1 skips the fullscreen request (plain
+        // toplevel) to isolate KWin fullscreen handling as the stall cause.
+        const bool noFullscreen = std::getenv("LSFGVK_APP_NO_FS") != nullptr;
+        if (!noFullscreen) {
+            if (!output_name.empty()) {
+                for (const auto& o : mOutputs) {
+                    if (o.geom.name == output_name && o.wlOutput) {
+                        xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
+                        break;
+                    }
+                }
+            } else {
+                // Primary output: first connected output with xdg_output done
+                for (const auto& o : mOutputs) {
+                    if (o.connected && o.xdgOutputDone && o.wlOutput) {
+                        xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
+                        break;
+                    }
                 }
             }
+            dbg("fullscreen requested (noFullscreen=%d)", noFullscreen);
         } else {
-            // Primary output: first connected output with xdg_output done
-            for (const auto& o : mOutputs) {
-                if (o.connected && o.xdgOutputDone && o.wlOutput) {
-                    xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
-                    break;
-                }
-            }
+            dbg("fullscreen SKIPPED (LSFGVK_APP_NO_FS set)");
         }
 
         // Commit initial surface state
         wl_surface_commit(mSurface);
-        wl_display_roundtrip(mDisplay); // wait for configure
+        // wait for the initial configure: KWin may deliver it only after the
+        // sync callback of a single roundtrip, so loop (bounded) until a size
+        // was reported; the caller falls back to the requested extent if not.
+        for (int i = 0; i < 50; ++i) {
+            if (mWindowExtent.width > 0 && mWindowExtent.height > 0)
+                break;
+            wl_display_roundtrip(mDisplay);
+        }
 
         // Apply pending size from configure if any
         if (mResizePending) {
@@ -316,7 +400,11 @@ public:
             mResizePending = false;
         }
 
-        mWindowExtent = extent;
+        // the configure dispatched during the roundtrip above already recorded
+        // the compositor's actual size; only fall back to the requested extent
+        // when no size was reported (lazy compositor).
+        if (mWindowExtent.width == 0 && mWindowExtent.height == 0)
+            mWindowExtent = extent;
         return reinterpret_cast<WindowHandle>(mSurface);
     }
 
@@ -326,10 +414,11 @@ public:
         if (!createWaylandSurface)
             throw ls::error("vkGetInstanceProcAddr(vkCreateWaylandSurfaceKHR) returned null");
 
+        auto* surf = static_cast<wl_surface*>(handle);
         VkWaylandSurfaceCreateInfoKHR ci{};
         ci.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
         ci.display = mDisplay;
-        ci.surface = static_cast<wl_surface*>(handle);
+        ci.surface = surf;
 
         VkSurfaceKHR surface{VK_NULL_HANDLE};
         VkResult result = createWaylandSurface(vk.inst(), &ci, nullptr, &surface);
@@ -345,19 +434,34 @@ public:
         return surface;
     }
 
+    VkExtent2D windowExtent() const override {
+        // last size reported by the compositor (0x0 until the first configure)
+        return mWindowExtent;
+    }
+
     void surfaceCaps(VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR& caps,
                      std::vector<VkColorSpaceKHR>& colorspaces) override {
+        // the instance enables VK_KHR_surface (createInstance in vulkan.cpp),
+        // so the surface queries must resolve; a null pointer here means the
+        // instance was built without the surface extensions, in which case the
+        // swapchain would be created on zeroed caps, so fail loudly.
         const PFN_vkGetInstanceProcAddr mpa = loaderGetProc();
         auto getCaps = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(
             mpa(mVkInstance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR"));
-        if (getCaps != nullptr)
-            getCaps(mPhysDev, surface, &caps);
+        if (getCaps == nullptr)
+            throw ls::error("vkGetPhysicalDeviceSurfaceCapabilitiesKHR unavailable "
+                "(instance missing VK_KHR_surface)");
+        const VkResult res = getCaps(mPhysDev, surface, &caps);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
 
         auto getFormats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
             mpa(mVkInstance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
         if (getFormats == nullptr)
-            return;
+            throw ls::error("vkGetPhysicalDeviceSurfaceFormatsKHR unavailable "
+                "(instance missing VK_KHR_surface)");
 
+        // the color-space list is optional
         uint32_t count{};
         if (getFormats(mPhysDev, surface, &count, nullptr) != VK_SUCCESS || count == 0)
             return;
@@ -369,9 +473,43 @@ public:
             colorspaces.push_back(f.colorSpace);
     }
 
+    VkFormat swapchainFormat(VkSurfaceKHR surface) override {
+        // Wayland surfaces report their formats; pick the first 8-bit UNORM
+        // RGBA the compositor accepts. B8G8R8A8 (GBM XRGB8888) is the
+        // near-universal native layout of wlroots/KWin/Mutter.
+        const PFN_vkGetInstanceProcAddr mpa = loaderGetProc();
+        auto getFormats = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>(
+            mpa(mVkInstance, "vkGetPhysicalDeviceSurfaceFormatsKHR"));
+        uint32_t count{};
+        if (getFormats != nullptr
+                && getFormats(mPhysDev, surface, &count, nullptr) == VK_SUCCESS
+                && count != 0) {
+            std::vector<VkSurfaceFormatKHR> formats(count);
+            if (getFormats(mPhysDev, surface, &count, formats.data()) == VK_SUCCESS) {
+                for (const auto& f : formats)
+                    if (f.format == VK_FORMAT_R8G8B8A8_UNORM
+                            || f.format == VK_FORMAT_B8G8R8A8_UNORM)
+                        return f.format;
+            }
+        }
+        return VK_FORMAT_B8G8R8A8_UNORM;
+    }
+
     bool processEvents(int timeout_ms) override {
         if (!mDisplay || !mSurface)
             return false;
+
+        // TEMP DEBUG: keep exactly one frame callback outstanding; it fires
+        // once per displayed buffer, so its rate shows whether the compositor
+        // is still presenting this surface. gated: issuing a frame request on
+        // every loop iteration would add a protocol round-trip per frame.
+        if (dbgEnabled() && !g_dbgFrameCbPending) {
+            wl_callback* cb = wl_surface_frame(mSurface);
+            if (cb != nullptr) {
+                wl_callback_add_listener(cb, &surfaceFrameListener, nullptr);
+                g_dbgFrameCbPending = true;
+            }
+        }
 
         // Dispatch pending events
         int ret = wl_display_dispatch_pending(mDisplay);
@@ -392,11 +530,15 @@ public:
         // Check for resize
         if (mResizePending) {
             mResizePending = false;
+            if (dbgEnabled())
+                std::fprintf(stderr, "lsfg-vk-app: [dbg] processEvents exit: resize\n");
             return true;
         }
 
         // Check for close
         if (mClosePending) {
+            if (dbgEnabled())
+                std::fprintf(stderr, "lsfg-vk-app: [dbg] processEvents exit: close\n");
             return true;
         }
 
@@ -466,17 +608,29 @@ private:
                                const char* interface, uint32_t version) {
             auto* c = static_cast<OutputCollector*>(data);
             if (std::strcmp(interface, wl_output_interface.name) == 0) {
+                // Bind wl_output at v2: versions 3+ add the `name`/`description`
+                // events (opcodes 4/5) that wlOutputListener does not implement,
+                // and KWin sends them, crashing the client ("listener function
+                // for opcode 4 of wl_output is NULL"). Names come from xdg-output,
+                // so v2 (geometry/mode/done/scale only) is all we need.
                 wl_output* output = static_cast<wl_output*>(
-                    wl_registry_bind(registry, name, &wl_output_interface, 4));
-                OutputEntry entry{};
-                entry.wlOutput = output;
-                entry.connected = true;
-                wl_output_add_listener(output, &wlOutputListener, &entry);
-                c->entries->push_back(std::move(entry));
+                    wl_registry_bind(registry, name, &wl_output_interface, 2));
+                // push the entry into the vector FIRST, then attach the wl_output
+                // listener to the stable heap element (&vector.back()). Binding to a
+                // stack-local `entry` here and moving it into the vector afterwards
+                // leaves the listener pointing at a dead stack frame: KWin's later
+                // wl_output mode/geometry/done events would write through it (ASan:
+                // stack-use-after-return in wlOutputMode). Guaranteeing vector
+                // element stability requires reserve() up front (no reallocation
+                // moves the element the listener points at).
+                c->entries->push_back(OutputEntry{});
+                auto& back = c->entries->back();
+                back.wlOutput = output;
+                back.connected = true;
+                wl_output_add_listener(output, &wlOutputListener, &back);
 
                 // Also get xdg_output for this wl_output
                 if (c->globals->xdgOutputManager) {
-                    auto& back = c->entries->back();
                     back.xdgOutput = zxdg_output_manager_v1_get_xdg_output(
                         c->globals->xdgOutputManager, output);
                     zxdg_output_v1_add_listener(back.xdgOutput, &xdgOutputListener, &back);
@@ -489,13 +643,23 @@ private:
             .global_remove = registryGlobalRemove
         };
         wl_registry_add_listener(registry, &collectorListener, &collector);
+        // reserve before the roundtrip: once outputGlobal binds a wl_output and
+        // registers its listener against &entries->back(), any later push_back
+        // that reallocates would invalidate that pointer too; sizing the vector
+        // up front keeps every element at a stable address for the listener.
+        collector.entries->reserve(4);
         wl_display_roundtrip(mDisplay);
         wl_registry_destroy(registry);
 
-        // Wait for xdg_output done events
+        // Wait for xdg_output done events. wl_display_roundtrip (not the
+        // blocking wl_display_dispatch) is mandatory here: dispatch blocks on
+        // idle waiting for any event and hangs forever when the done event was
+        // already delivered during the roundtrip above. A roundtrip forces the
+        // compositor to reply to our sync request and dispatches whatever
+        // xdg_output events are queued, so the done handler reliably fires.
         for (auto& entry : entries) {
             while (!entry.xdgOutputDone && entry.xdgOutput) {
-                wl_display_dispatch(mDisplay);
+                wl_display_roundtrip(mDisplay);
             }
         }
 
@@ -558,13 +722,37 @@ std::unique_ptr<SurfaceBackend> createWaylandSurfaceBackend() {
 /// xdg_toplevel listener implementations (in ls::wsi namespace for access to WaylandSurfaceBackend)
 void xdgToplevelConfigure(void* data, xdg_toplevel* /*toplevel*/,
                           int32_t width, int32_t height,
-                          wl_array* /*states*/) {
+                          wl_array* states) {
     auto* backend = static_cast<WaylandSurfaceBackend*>(data);
-    if (width > 0 && height > 0) {
-        backend->mPendingWidth = static_cast<uint32_t>(width);
-        backend->mPendingHeight = static_cast<uint32_t>(height);
-        backend->mResizePending = true;
+    // TEMP DEBUG: log every configure with its states (KWin signals
+    // fullscreen/activation changes here)
+    std::string stateStr;
+    if (states != nullptr) {
+        const auto* statePtr = static_cast<const uint32_t*>(states->data);
+        size_t count = states->size / sizeof(uint32_t);
+        for (size_t i = 0; i < count; ++i) {
+            if (!stateStr.empty())
+                stateStr += ",";
+            stateStr += std::to_string(statePtr[i]);
+        }
     }
+    dbg("toplevel configure %dx%d states=[%s]", width, height, stateStr.c_str());
+    if (width <= 0 || height <= 0)
+        return;
+    // xdg-shell emits a configure after every buffer commit, not only on real
+    // resizes (KWin acks each presented frame this way). Flag a resize only
+    // when the size actually changed; mWindowExtent is the last observed size.
+    const uint32_t w = static_cast<uint32_t>(width);
+    const uint32_t h = static_cast<uint32_t>(height);
+    if (w == backend->mWindowExtent.width && h == backend->mWindowExtent.height)
+        return;
+if (dbgEnabled())
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] configure %ux%u (was %ux%u) -> FLAG\n",
+                     w, h, backend->mWindowExtent.width, backend->mWindowExtent.height);
+    backend->mWindowExtent = VkExtent2D{ w, h };
+    backend->mPendingWidth = w;
+    backend->mPendingHeight = h;
+    backend->mResizePending = true;
 }
 
 void xdgToplevelClose(void* data, xdg_toplevel* /*toplevel*/) {
@@ -576,6 +764,6 @@ void xdgToplevelConfigureBounds(void* /*data*/, xdg_toplevel* /*toplevel*/,
                                 int32_t /*width*/, int32_t /*height*/) {}
 
 void xdgToplevelWmCapabilities(void* /*data*/, xdg_toplevel* /*toplevel*/,
-                               wl_array* /*capabilities*/) {}
+                                wl_array* /*capabilities*/) {}
 
 } // namespace ls::wsi

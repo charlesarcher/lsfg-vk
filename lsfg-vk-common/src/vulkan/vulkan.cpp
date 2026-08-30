@@ -66,8 +66,11 @@ namespace {
     /// create a vulkan instance
     /// @param enableSurfaceExtensions when true (graphical instances) the
     ///        presentation-surface instance extensions are enabled so their
-    ///        creation functions (e.g. vkCreateXcbSurfaceKHR) resolve via
-    ///        vkGetInstanceProcAddr. Availability-filtered: only an extension
+    ///        entry points resolve via vkGetInstanceProcAddr: the platform
+    ///        surface extensions (vkCreateXcbSurfaceKHR /
+    ///        vkCreateWaylandSurfaceKHR) plus the base VK_KHR_surface (the
+    ///        vkGetPhysicalDeviceSurface* queries and vkDestroySurfaceKHR the
+    ///        WSI backends resolve). Availability-filtered: only an extension
     ///        the loader actually reports is requested.
     ls::owned_ptr<VkInstance> createInstance(
             const std::string& appName, version appVersion,
@@ -93,7 +96,14 @@ namespace {
         // creation functions to be exported by the loader. Only enable an
         // extension the loader actually reports as available, so we never ask
         // for an unavailable one and hit VK_ERROR_EXTENSION_NOT_PRESENT.
-        const char* surfaceExtNames[] = { "VK_KHR_xcb_surface" };
+        // the base extension is mandatory: the vkGetPhysicalDeviceSurface*
+        // queries and vkDestroySurfaceKHR are VK_KHR_surface entry points, and
+        // the loader resolves them via ipa only when the extension is enabled.
+        const char* surfaceExtNames[] = {
+            "VK_KHR_surface",
+            "VK_KHR_xcb_surface",
+            "VK_KHR_wayland_surface"
+        };
         std::vector<const char*> enabledExtensions;
         if (enableSurfaceExtensions) {
             // every vulkan function is pulled from the loader via
