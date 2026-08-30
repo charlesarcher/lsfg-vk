@@ -84,17 +84,47 @@ add_custom_command(
     COMMENT "Generating xdg-output protocol headers"
     VERBATIM)
 
+# wlr-layer-shell (unstable v1) - the overlay-layer surface type the app window
+# prefers over an xdg_toplevel: the overlay layer stacks above every toplevel
+# and never takes keyboard focus, so the app window cannot enter the
+# compositor's toplevel focus/stacking cycle (KWin re-asserts focus ~20 Hz on
+# two fullscreen toplevels; that ping-pong flickers the two windows and eats
+# the game's keyboard input). Shipped in the wlr-protocols package.
+find_path(WAYLAND_PROTOCOLS_LAYER_SHELL_XML wlr-layer-shell-unstable-v1.xml
+    PATHS /usr/share/wlr-protocols/unstable /usr/share/wayland-protocols/unstable
+    NO_DEFAULT_PATH)
+if(NOT WAYLAND_PROTOCOLS_LAYER_SHELL_XML)
+    message(FATAL_ERROR "wlr-layer-shell-unstable-v1.xml not found (wlr-protocols package)")
+endif()
+
+add_custom_command(
+    OUTPUT "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-client-protocol.h"
+           "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-protocol.c"
+    COMMAND ${WAYLAND_SCANNER} client-header
+            "${WAYLAND_PROTOCOLS_LAYER_SHELL_XML}/wlr-layer-shell-unstable-v1.xml"
+            "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-client-protocol.h"
+    COMMAND ${WAYLAND_SCANNER} private-code
+            "${WAYLAND_PROTOCOLS_LAYER_SHELL_XML}/wlr-layer-shell-unstable-v1.xml"
+            "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-protocol.c"
+    DEPENDS "${WAYLAND_PROTOCOLS_LAYER_SHELL_XML}/wlr-layer-shell-unstable-v1.xml"
+            ${WAYLAND_SCANNER}
+    COMMENT "Generating wlr-layer-shell protocol headers"
+    VERBATIM)
+
 # Custom target to ensure protocol generation runs before compilation
 add_custom_target(wayland_protocols ALL
     DEPENDS "${WAYLAND_PROTOCOLS_DIR}/xdg-shell-client-protocol.h"
             "${WAYLAND_PROTOCOLS_DIR}/xdg-shell-protocol.c"
             "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-client-protocol.h"
-            "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-protocol.c")
+            "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-protocol.c"
+            "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-client-protocol.h"
+            "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-protocol.c")
 
 # Link the generated protocol C files into the app (compile as C)
 add_library(wayland_protocols_gen STATIC
     "${WAYLAND_PROTOCOLS_DIR}/xdg-shell-protocol.c"
-    "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-protocol.c")
+    "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-protocol.c"
+    "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-protocol.c")
 set_target_properties(wayland_protocols_gen PROPERTIES
     LINKER_LANGUAGE C
     POSITION_INDEPENDENT_CODE ON)

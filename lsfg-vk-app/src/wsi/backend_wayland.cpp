@@ -31,6 +31,7 @@
 #include <vector>
 
 #include <poll.h>
+#include <unistd.h>
 #include <wayland-client.h>
 #include <wayland-client-protocol.h>
 #include <vulkan/vulkan.h>
@@ -39,6 +40,11 @@
 // Generated protocol headers (from wayland-scanner in CMake)
 #include "xdg-shell-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
+// wlr-layer-shell v5 names a request parameter `namespace` (C keyword), which
+// breaks C++ compilation of the scanner output; shadow it for this include.
+#define namespace ns_
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#undef namespace
 
 namespace ls::wsi {
 namespace {
@@ -96,12 +102,139 @@ const wl_callback_listener surfaceFrameListener = {
     .done = surfaceFrameEvent
 };
 
+/// TEMP DEBUG (LSFGVK_APP_DBG): input-event probe. With the empty input
+/// region the compositor must NEVER deliver pointer events to this
+/// surface, and keyboard events can only arrive while the app toplevel
+/// holds keyboard focus (KWin focuses it at map; the first click - routed
+/// to the game through the click-through surface - moves focus back).
+/// Every such event is logged so a live-game test can prove the input
+/// flow (or catch a compositor that ignores input regions).
+struct InputProbe {
+    wl_pointer* pointer{nullptr};
+    wl_keyboard* keyboard{nullptr};
+    uint32_t pointerEvents{0};
+    uint32_t keyboardEvents{0};
+};
+InputProbe g_inputProbe{};
+
+// Every wl_listener struct member must be non-NULL: libwayland aborts the
+// client when the compositor sends an event whose listener slot is NULL
+// (observed: the app core-dumped on the first wl_keyboard.keymap event from
+// KWin). The slots the probe does not care about get no-op handlers; the
+// keymap handler must close its fd (protocol: the client owns it).
+void probePointerFrameNoop(void* /*data*/, wl_pointer* /*p*/) {}
+
+void probePointerAxisNoop(void* /*data*/, wl_pointer* /*p*/, uint32_t /*t*/,
+                          uint32_t /*axis*/, wl_fixed_t /*value*/) {}
+
+void probePointerAxisSourceNoop(void* /*data*/, wl_pointer* /*p*/,
+                                uint32_t /*axisSource*/) {}
+
+void probePointerAxisStopNoop(void* /*data*/, wl_pointer* /*p*/, uint32_t /*t*/,
+                              uint32_t /*axis*/) {}
+
+void probePointerAxisDiscreteNoop(void* /*data*/, wl_pointer* /*p*/,
+                                  uint32_t /*axis*/, int32_t /*discrete*/) {}
+
+void probePointerAxisRelativeDirectionNoop(void* /*data*/, wl_pointer* /*p*/,
+                                           uint32_t /*axis*/,
+                                           uint32_t /*direction*/) {}
+
+void probePointerWarpNoop(void* /*data*/, wl_pointer* /*p*/, wl_fixed_t /*x*/,
+                          wl_fixed_t /*y*/) {}
+
+void probeKeyboardKeymapNoop(void* /*data*/, wl_keyboard* /*k*/,
+                             uint32_t /*format*/, int32_t fd, uint32_t /*size*/) {
+    ::close(fd);
+}
+
+void probeKeyboardModifiersNoop(void* /*data*/, wl_keyboard* /*k*/, uint32_t /*serial*/,
+                                uint32_t /*modsDepressed*/, uint32_t /*modsLatched*/,
+                                uint32_t /*modsLocked*/, uint32_t /*group*/) {}
+
+void probeKeyboardRepeatInfoNoop(void* /*data*/, wl_keyboard* /*k*/, int32_t /*rate*/,
+                                 int32_t /*delay*/) {}
+
+void probePointerEnter(void* /*data*/, wl_pointer* /*p*/, uint32_t /*serial*/,
+                       wl_surface* /*s*/, wl_fixed_t /*x*/, wl_fixed_t /*y*/) {
+    ++g_inputProbe.pointerEvents;
+    std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: pointer ENTERED the app window "
+                 "(input region NOT effective - input is being stolen)\n");
+}
+
+void probePointerLeave(void* /*data*/, wl_pointer* /*p*/, uint32_t /*serial*/,
+                       wl_surface* /*s*/) {
+    std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: pointer left the app window\n");
+}
+
+void probePointerMotion(void* /*data*/, wl_pointer* /*p*/, uint32_t /*t*/,
+                        wl_fixed_t /*x*/, wl_fixed_t /*y*/) {
+    if (g_inputProbe.pointerEvents % 60 == 0)
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: %u pointer events on the app window "
+                     "(input is being stolen)\n", ++g_inputProbe.pointerEvents);
+    else
+        ++g_inputProbe.pointerEvents;
+}
+
+void probePointerButton(void* /*data*/, wl_pointer* /*p*/, uint32_t /*serial*/,
+                        uint32_t /*t*/, uint32_t /*button*/, uint32_t /*state*/) {
+    ++g_inputProbe.pointerEvents;
+    std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: pointer BUTTON on the app window "
+                 "(input is being stolen, %u total)\n", g_inputProbe.pointerEvents);
+}
+
+const wl_pointer_listener probePointerListener = {
+    .enter = probePointerEnter,
+    .leave = probePointerLeave,
+    .motion = probePointerMotion,
+    .button = probePointerButton,
+    .axis = probePointerAxisNoop,
+    .frame = probePointerFrameNoop,
+    .axis_source = probePointerAxisSourceNoop,
+    .axis_stop = probePointerAxisStopNoop,
+    .axis_discrete = probePointerAxisDiscreteNoop,
+    .axis_relative_direction = probePointerAxisRelativeDirectionNoop,
+    .warp = probePointerWarpNoop
+};
+
+void probeKeyboardEnter(void* /*data*/, wl_keyboard* /*k*/, uint32_t /*serial*/,
+                        wl_surface* /*s*/, wl_array* /*keys*/) {
+    std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: app window GOT keyboard focus "
+                 "(expected once at map; the first click returns it to the game)\n");
+}
+
+void probeKeyboardLeave(void* /*data*/, wl_keyboard* /*k*/, uint32_t /*serial*/,
+                        wl_surface* /*s*/) {
+    std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: app window LOST keyboard focus "
+                 "(the game should have it now)\n");
+}
+
+void probeKeyboardKey(void* /*data*/, wl_keyboard* /*k*/, uint32_t /*serial*/,
+                      uint32_t /*t*/, uint32_t /*key*/, uint32_t /*state*/) {
+    if (g_inputProbe.keyboardEvents < 8)
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: app window EATING key events "
+                     "(it still holds keyboard focus)\n");
+    else if ((++g_inputProbe.keyboardEvents) % 60 == 0)
+        std::fprintf(stderr, "lsfg-vk-app: [dbg] PROBE: %u key events eaten by the app window\n",
+                     g_inputProbe.keyboardEvents);
+}
+
+const wl_keyboard_listener probeKeyboardListener = {
+    .keymap = probeKeyboardKeymapNoop,
+    .enter = probeKeyboardEnter,
+    .leave = probeKeyboardLeave,
+    .key = probeKeyboardKey,
+    .modifiers = probeKeyboardModifiersNoop,
+    .repeat_info = probeKeyboardRepeatInfoNoop
+};
+
 /// Wayland registry globals we bind
 struct Globals {
     wl_compositor* compositor{nullptr};
     xdg_wm_base* xdgWmBase{nullptr};
     zxdg_output_manager_v1* xdgOutputManager{nullptr};
     wl_seat* seat{nullptr};
+    zwlr_layer_shell_v1* layerShell{nullptr};
 };
 
 /// one Wayland output plus its xdg_output wrapper
@@ -151,6 +284,13 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
     } else if (std::strcmp(interface, wl_seat_interface.name) == 0) {
         g->seat = static_cast<wl_seat*>(
             wl_registry_bind(registry, name, &wl_seat_interface, 1));
+    } else if (std::strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+        // The overlay-layer window type (see createWindow): bind at the
+        // advertised version, capped at the protocol version we compiled
+        // against (5 in the current wlr-protocols XML).
+        g->layerShell = static_cast<zwlr_layer_shell_v1*>(
+            wl_registry_bind(registry, name, &zwlr_layer_shell_v1_interface,
+                             version > 5 ? 5 : version));
     }
 }
 
@@ -283,6 +423,16 @@ const xdg_toplevel_listener xdgToplevelListener = {
     .wm_capabilities = xdgToplevelWmCapabilities
 };
 
+// Forward declaration for the layer-surface listeners (implemented after class)
+void layerSurfaceConfigure(void* data, zwlr_layer_surface_v1* layerSurface,
+                           uint32_t serial, uint32_t width, uint32_t height);
+void layerSurfaceClosed(void* data, zwlr_layer_surface_v1* layerSurface);
+
+const zwlr_layer_surface_v1_listener layerSurfaceListener = {
+    .configure = layerSurfaceConfigure,
+    .closed = layerSurfaceClosed
+};
+
 class WaylandSurfaceBackend : public SurfaceBackend {
 public:
     ~WaylandSurfaceBackend() { destroy(); }
@@ -292,6 +442,9 @@ public:
                                      int32_t width, int32_t height,
                                      wl_array* /*states*/);
     friend void xdgToplevelClose(void* data, xdg_toplevel* /*toplevel*/);
+    friend void layerSurfaceConfigure(void* data, zwlr_layer_surface_v1* layerSurface,
+                                      uint32_t serial, uint32_t width, uint32_t height);
+    friend void layerSurfaceClosed(void* data, zwlr_layer_surface_v1* layerSurface);
 
     bool connect(std::string_view session) override {
         // Only connect if explicitly "wayland" or "auto" with WAYLAND_DISPLAY set
@@ -315,6 +468,17 @@ public:
             throw ls::error("Wayland compositor missing required globals (compositor, xdg_wm_base)");
 
         xdg_wm_base_add_listener(mGlobals.xdgWmBase, &xdgWmBaseListener, this);
+
+        // TEMP DEBUG (LSFGVK_APP_DBG): bind pointer/keyboard so the input
+        // probe can log any event the compositor routes to this window.
+        if (dbgEnabled() && mGlobals.seat != nullptr) {
+            g_inputProbe.pointer = wl_seat_get_pointer(mGlobals.seat);
+            if (g_inputProbe.pointer != nullptr)
+                wl_pointer_add_listener(g_inputProbe.pointer, &probePointerListener, nullptr);
+            g_inputProbe.keyboard = wl_seat_get_keyboard(mGlobals.seat);
+            if (g_inputProbe.keyboard != nullptr)
+                wl_keyboard_add_listener(g_inputProbe.keyboard, &probeKeyboardListener, nullptr);
+        }
 
         // Enumerate outputs
         mOutputs = enumerateOutputs();
@@ -341,49 +505,107 @@ public:
             throw ls::error("wl_compositor_create_surface failed");
         wl_surface_add_listener(mSurface, &surfaceListener, this); // TEMP DEBUG
 
-        // Create xdg_surface
-        mXdgSurface = xdg_wm_base_get_xdg_surface(mGlobals.xdgWmBase, mSurface);
-        if (!mXdgSurface)
-            throw ls::error("xdg_wm_base_get_xdg_surface failed");
-        xdg_surface_add_listener(mXdgSurface, &xdgSurfaceListener, this);
+        // Click-through: an empty input region makes this surface insensitive
+        // to all pointer and touch input, so the compositor's pointer
+        // hit-test skips it and delivers the input to the window beneath (the
+        // game). Wayland has no WM_HINTS input=False; the empty input region
+        // is the protocol's click-through mechanism (same pattern GTK uses
+        // for non-interactive surfaces). Keyboard focus is NOT governed by
+        // the input region: the compositor still focuses this toplevel at
+        // map, and the first click - which the game receives because the
+        // pointer passes through - returns keyboard focus to the game.
+        wl_region* clickThrough = wl_compositor_create_region(mGlobals.compositor);
+        if (clickThrough == nullptr)
+            throw ls::error("wl_compositor_create_region failed");
+        wl_surface_set_input_region(mSurface, clickThrough);
+        // The region's state (the empty box list) travels with the
+        // set_input_region request; the object is destroyed by the client
+        // immediately after issuing it (the compositor keeps its own copy).
+        wl_region_destroy(clickThrough);
 
-        // Create xdg_toplevel
-        mXdgToplevel = xdg_surface_get_toplevel(mXdgSurface);
-        if (!mXdgToplevel)
-            throw ls::error("xdg_surface_get_toplevel failed");
-        xdg_toplevel_add_listener(mXdgToplevel, &xdgToplevelListener, this);
-
-        // Set app ID for WM identification
-        xdg_toplevel_set_app_id(mXdgToplevel, "lsfg-vk-app");
-
-        // Fullscreen on specified output or primary
-        // TEMP DEBUG: LSFGVK_APP_NO_FS=1 skips the fullscreen request (plain
-        // toplevel) to isolate KWin fullscreen handling as the stall cause.
-        const bool noFullscreen = std::getenv("LSFGVK_APP_NO_FS") != nullptr;
-        if (!noFullscreen) {
-            if (!output_name.empty()) {
-                for (const auto& o : mOutputs) {
-                    if (o.geom.name == output_name && o.wlOutput) {
-                        xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
-                        break;
-                    }
-                }
-            } else {
-                // Primary output: first connected output with xdg_output done
-                for (const auto& o : mOutputs) {
-                    if (o.connected && o.xdgOutputDone && o.wlOutput) {
-                        xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
-                        break;
-                    }
-                }
-            }
-            dbg("fullscreen requested (noFullscreen=%d)", noFullscreen);
+        // The app window must sit ABOVE the game window permanently and must
+        // NEVER participate in the compositor's toplevel focus/stacking cycle:
+        // an xdg_toplevel on KWin is re-activated ~20 Hz while two
+        // fullscreen toplevels compete (observed: toplevel configure states
+        // cycle activating/activated at the compositor's refresh rate, each
+        // cycle re-focusing the app window and re-stacking the two windows -
+        // the visible "flicker" that only a click used to pin). A layer-shell
+        // OVERLAY-layer surface is outside that cycle: it always stacks above
+        // toplevels and is never focusable, so the game keeps keyboard focus
+        // without any user action. The xdg_toplevel remains as the fallback
+        // for compositors without layer-shell.
+        if (mGlobals.layerShell != nullptr) {
+            mLayerSurface = zwlr_layer_shell_v1_get_layer_surface(
+                mGlobals.layerShell, mSurface,
+                target->wlOutput,  // null (no xdg-output) = default output
+                ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+                "lsfg-vk");
+            if (mLayerSurface == nullptr)
+                throw ls::error("zwlr_layer_shell_v1_get_layer_surface failed");
+            zwlr_layer_surface_v1_add_listener(mLayerSurface, &layerSurfaceListener, this);
+            zwlr_layer_surface_v1_set_anchor(mLayerSurface,
+                ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
+            // exclusive zone -1: do NOT claim space (anchored to all four
+            // sides the surface is output-sized anyway); claiming a zone
+            // would push/resize the game's window, which must stay put.
+            zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, -1);
+            // Protocol default keyboard_interactivity is `exclusive`, which
+            // would steal the keyboard from the game - set it to none so the
+            // overlay is input-transparent for keyboard focus as well.
+            zwlr_layer_surface_v1_set_keyboard_interactivity(
+                mLayerSurface,
+                ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+            wl_surface_commit(mSurface);
+            dbg("window type: layer-shell overlay on %s (wl_output %p)",
+                target->geom.name.c_str(), (void*)target->wlOutput);
         } else {
-            dbg("fullscreen SKIPPED (LSFGVK_APP_NO_FS set)");
-        }
+            // Fallback: xdg_toplevel (compositor without layer-shell)
+            // Create xdg_surface
+            mXdgSurface = xdg_wm_base_get_xdg_surface(mGlobals.xdgWmBase, mSurface);
+            if (!mXdgSurface)
+                throw ls::error("xdg_wm_base_get_xdg_surface failed");
+            xdg_surface_add_listener(mXdgSurface, &xdgSurfaceListener, this);
 
-        // Commit initial surface state
-        wl_surface_commit(mSurface);
+            // Create xdg_toplevel
+            mXdgToplevel = xdg_surface_get_toplevel(mXdgSurface);
+            if (!mXdgToplevel)
+                throw ls::error("xdg_surface_get_toplevel failed");
+            xdg_toplevel_add_listener(mXdgToplevel, &xdgToplevelListener, this);
+
+            // Set app ID for WM identification
+            xdg_toplevel_set_app_id(mXdgToplevel, "lsfg-vk-app");
+
+            // Fullscreen on specified output or primary
+            // TEMP DEBUG: LSFGVK_APP_NO_FS=1 skips the fullscreen request
+            // (plain toplevel) to isolate KWin fullscreen handling.
+            const bool noFullscreen = std::getenv("LSFGVK_APP_NO_FS") != nullptr;
+            if (!noFullscreen) {
+                if (!output_name.empty()) {
+                    for (const auto& o : mOutputs) {
+                        if (o.geom.name == output_name && o.wlOutput) {
+                            xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
+                            break;
+                        }
+                    }
+                } else {
+                    // Primary output: first connected output with xdg_output done
+                    for (const auto& o : mOutputs) {
+                        if (o.connected && o.xdgOutputDone && o.wlOutput) {
+                            xdg_toplevel_set_fullscreen(mXdgToplevel, o.wlOutput);
+                            break;
+                        }
+                    }
+                }
+                dbg("fullscreen requested (noFullscreen=%d)", noFullscreen);
+            } else {
+                dbg("fullscreen SKIPPED (LSFGVK_APP_NO_FS set)");
+            }
+            dbg("window type: xdg_toplevel (no layer-shell global)");
+
+            // Commit initial surface state
+            wl_surface_commit(mSurface);
+        }
         // wait for the initial configure: KWin may deliver it only after the
         // sync callback of a single roundtrip, so loop (bounded) until a size
         // was reported; the caller falls back to the requested extent if not.
@@ -558,6 +780,10 @@ public:
     }
 
     void destroy() override {
+        if (mLayerSurface) {
+            zwlr_layer_surface_v1_destroy(mLayerSurface);
+            mLayerSurface = nullptr;
+        }
         if (mXdgToplevel) {
             xdg_toplevel_destroy(mXdgToplevel);
             mXdgToplevel = nullptr;
@@ -712,6 +938,7 @@ private:
     wl_surface* mSurface{nullptr};
     xdg_surface* mXdgSurface{nullptr};
     xdg_toplevel* mXdgToplevel{nullptr};
+    zwlr_layer_surface_v1* mLayerSurface{nullptr};
 
     // Cached from createSurface for queries
     vk::VulkanInstanceFuncs mFuncs{};
@@ -777,5 +1004,32 @@ void xdgToplevelConfigureBounds(void* /*data*/, xdg_toplevel* /*toplevel*/,
 
 void xdgToplevelWmCapabilities(void* /*data*/, xdg_toplevel* /*toplevel*/,
                                 wl_array* /*capabilities*/) {}
+
+void layerSurfaceConfigure(void* data, zwlr_layer_surface_v1* layerSurface,
+                           uint32_t serial, uint32_t width, uint32_t height) {
+    // ack is mandatory: the compositor withholds subsequent buffer
+    // presentation until the client acknowledges the configure.
+    zwlr_layer_surface_v1_ack_configure(layerSurface, serial);
+    auto* backend = static_cast<WaylandSurfaceBackend*>(data);
+    if (width == 0 || height == 0)
+        return;
+    if (width == backend->mWindowExtent.width && height == backend->mWindowExtent.height)
+        return;
+    dbg("layer configure %ux%u (was %ux%u) -> FLAG", width, height,
+        backend->mWindowExtent.width, backend->mWindowExtent.height);
+    backend->mWindowExtent = VkExtent2D{ width, height };
+    backend->mPendingWidth = width;
+    backend->mPendingHeight = height;
+    backend->mResizePending = true;
+}
+
+void layerSurfaceClosed(void* data, zwlr_layer_surface_v1* /*layerSurface*/) {
+    // Compositor removed the layer (output unplug / user dismissed it);
+    // processEvents signals the host to tear down via mClosePending,
+    // matching the xdg_toplevel close path.
+    auto* backend = static_cast<WaylandSurfaceBackend*>(data);
+    dbg("layer surface closed");
+    backend->mClosePending = true;
+}
 
 } // namespace ls::wsi
