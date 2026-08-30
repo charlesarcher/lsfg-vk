@@ -226,6 +226,11 @@ public:
         applyWindowChrome(mWindow);
 
         xcb_map_window(mConn, mWindow);
+        // the state request must follow the map: the WM only starts managing
+        // the window after seeing the map, and EWMH mandates a post-map
+        // ClientMessage. a pre-map property set is ignored by KWin, which
+        // then placed the window at (0,28) 2560x1382 instead of (0,0) 2560x1440.
+        requestFullscreenState(mWindow);
         xcb_flush(mConn);
 
         if (xcb_connection_has_error(mConn) != 0)
@@ -447,12 +452,14 @@ private:
         throw ls::error("output '" + want + "' not found; available: " + available);
     }
 
-    /// borderless + above + fullscreen + never-focus, per the presentation spec.
+    /// never-focus + utility type, per the presentation spec. The FULLSCREEN +
+    /// ABOVE state is NOT set here: _NET_WM_STATE is owned by the window
+    /// manager and clients must request it with a post-map ClientMessage
+    /// (requestFullscreenState). KWin ignores a client-set property and
+    /// places the window below its top panel otherwise (observed: created at
+    /// (0,0) 2560x1440, placed at (0,28) 2560x1382).
     void applyWindowChrome(xcb_window_t window) {
         const xcb_atom_t netWmWindowType = internAtom("_NET_WM_WINDOW_TYPE");
-        const xcb_atom_t netWmState = internAtom("_NET_WM_STATE");
-        const xcb_atom_t stateFullscreen = internAtom("_NET_WM_STATE_FULLSCREEN");
-        const xcb_atom_t stateAbove = internAtom("_NET_WM_STATE_ABOVE");
         const xcb_atom_t typeUtility = internAtom("_NET_WM_WINDOW_TYPE_UTILITY");
         mDeleteWindowAtom = internAtom("_NET_WM_DELETE_WINDOW");
 
@@ -467,13 +474,35 @@ private:
         xcb_change_property(mConn, XCB_PROP_MODE_REPLACE, window,
             netWmWindowType, netWmWindowType, 32, 1, &typeUtility);
 
-        // _NET_WM_STATE = FULLSCREEN + ABOVE.
-        xcb_atom_t states[2] = {stateFullscreen, stateAbove};
-        xcb_change_property(mConn, XCB_PROP_MODE_REPLACE, window,
-            netWmState, netWmState, 32, 2, states);
-
         if (xcb_connection_has_error(mConn) != 0)
             throw ls::error("failed to set EWMH properties on window");
+    }
+
+    /// EWMH: a client may only change _NET_WM_STATE by sending a ClientMessage
+    /// to the root window; the 32-bit data fields carry action (2 = add state),
+    /// the state atoms, and the source indicator (0 = client). KWin ignores a
+    /// client-set property, so this must be a post-map message.
+    void requestFullscreenState(xcb_window_t window) {
+        const xcb_atom_t netWmState = internAtom("_NET_WM_STATE");
+        const xcb_atom_t stateFullscreen = internAtom("_NET_WM_STATE_FULLSCREEN");
+        const xcb_atom_t stateAbove = internAtom("_NET_WM_STATE_ABOVE");
+        const xcb_screen_t* root = mScreen;
+
+        xcb_client_message_event_t cm;
+        std::memset(&cm, 0, sizeof(cm));
+        cm.response_type = XCB_CLIENT_MESSAGE;
+        cm.format = 32;
+        cm.window = window;
+        cm.type = netWmState;
+        cm.data.data32[0] = 2;
+        cm.data.data32[1] = static_cast<uint32_t>(stateFullscreen);
+        cm.data.data32[2] = static_cast<uint32_t>(stateAbove);
+        cm.data.data32[3] = 0;
+
+        xcb_send_event(mConn, 0, root->root,
+            XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT |
+            XCB_EVENT_MASK_SUBSTRUCTURE_NOTIFY,
+            reinterpret_cast<const char*>(&cm));
     }
 
     xcb_atom_t internAtom(const char* name) {
