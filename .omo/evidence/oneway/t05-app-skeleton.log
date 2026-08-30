@@ -1,0 +1,56 @@
+================================================================================
+Task 5 QA: lsfg-vk-app skeleton with ipc streams
+Plan: .omo/plans/oneway-dualgpu.md  |  task 5
+================================================================================
+
+## Build (clean from scratch)
+    rm -rf build
+    cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    cmake --build build -j
+    -> [100%] Built target lsfg-vk-app  (no warnings)
+
+App source (spec-mandated only):
+    lsfg-vk-app/CMakeLists.txt
+    lsfg-vk-app/src/main.cpp     (cli/config/instance/listener/sigint)
+    lsfg-vk-app/src/stream.cpp   (per-stream HELLO->NEGOTIATED->2xSTAGING->READY->FRAME/RELEASE)
+NOT shipped here (deferred to later tasks): wsi.cpp, output.cpp
+
+## QA setup
+    XDG_RUNTIME_DIR=/run/user/1000
+    XDG_CONFIG_HOME=/tmp/lsfgq          -> conf.toml with profiles:
+        vkcube-game : active_in=vkcube, gpu="Intel(R) Graphics (ARL)", presentation=external
+        vkcube-app  : gpu="AMD Radeon RX 9060 XT (RADV GFX1200)"
+    Layer rig: cd /tmp/opencode/layer-test
+               VK_LAYER_PATH=/tmp/opencode/layer-test
+               VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation
+    Socket:    /run/user/1000/lsfg-vk/app.sock
+
+## App startup (app launched with --profile vkcube-app)
+    lsfg-vk-app: listening on /run/user/1000/lsfg-vk/app.sock (processing on 'AMD Radeon RX 9060 XT (RADV GFX1200)')
+
+## 10 rapid vkcube restart cycles (timeout 6s each, layer-driven external presentation)
+run 1  ext=2  using profile with name 'vkcube-game'
+run 2  ext=2  using profile with name 'vkcube-game'
+run 3  ext=2  using profile with name 'vkcube-game'
+run 4  ext=2  using profile with name 'vkcube-game'
+run 5  ext=2  using profile with name 'vkcube-game'
+run 6  ext=2  using profile with name 'vkcube-game'
+run 7  ext=2  using profile with name 'vkcube-game'
+run 8  ext=2  using profile with name 'vkcube-game'
+run 9  ext=2  using profile with name 'vkcube-game'
+run 10 ext=2  using profile with name 'vkcube-game'
+-> 10/10 cycles: layer connected and established external presentation on 'Intel(R) Graphics (ARL)'
+
+## Handshake completed per stream (app side logs)
+    lsfg-vk-app: stream from 'Intel(R) Graphics (ARL)' 500x500 VkFormat(58)
+-> 20 total streams received across 10 cycles (2 per cycle), app stayed alive through all churn.
+
+## Listener / fd stability
+    ss -lxp  ->  1 listener: /run/user/1000/lsfg-vk/app.sock users:(("lsfg-vk-app",fd=7))
+    app fd count before cycles : 8
+    app fd count after  cycles : 8   (no fd leak over 20 streams)
+
+## RESULT: PASS
+Binary launches, prints banner, completes full handshake (NEGOTIATED LINEAR + READY + per-frame
+RELEASE), survives 10 rapid stream churns with no fd leak and a single listener.
+================================================================================

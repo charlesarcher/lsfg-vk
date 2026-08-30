@@ -1,0 +1,7 @@
+== [6] FULL WSI SMOKE: --session x11 --wsi-test ==
+--- WM: _NET_WM_NAME(UTF8_STRING) = "KWin"
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+/usr/bin/bash: line 2: 212081 Segmentation fault         (core dumped) ./build/lsfg-vk-app/lsfg-vk-app --session x11 --wsi-test
+--- newest window: 
+import: missing an image filename `.omo/evidence/oneway/t07-x11/smoke-desktop.png' @ error/import.c/ImportImageCommand/1291.

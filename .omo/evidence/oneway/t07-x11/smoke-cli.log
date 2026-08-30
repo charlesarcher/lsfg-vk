@@ -1,0 +1,10 @@
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_KHR_swapchain
+DBG getDeviceProcAddr(vkGetDeviceQueue)=0x7f14fe7aca50
+DBG getDeviceProcAddr(vkSetDeviceLoaderData)=0
+DBG getDeviceProcAddr(vkCreateSwapchainKHR)=0x7f14fe7baf60 (post-setdata)
+--wsi-test: display GPU: AMD Radeon RX 9060 XT (RADV GFX1200)
+--wsi-test: output HDMI-A-3 3840x2160@59980927mHz
+--wsi-test: caps minImageExtent 0x0 maxImageExtent 0x0
+--wsi-test: smoke path completed

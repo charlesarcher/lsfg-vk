@@ -351,3 +351,53 @@ docs: one-way external presentation mode
 ```
 test(oneway): failure-mode audit
 ```
+
+---
+
+## 2026-08-28 Task 14: RFC #550 Reply Draft for One-Way Dual-GPU Frame Generation
+
+### Draft created: `measurements/rfc550-oneway-reply-draft.md`
+
+**Key content:**
+- Announces X architecture (thin capture-only layer + standalone app) built on maintainer's confirmed transport: "same external memory sharing"
+- Traffic-shape table with exact Task 11 numbers:
+  - Game GPU (Intel ARL): rcs0 +5,923 ms (9.9%), zero blitter/video
+  - Proc GPU (RX 9070 XT): 40% GFX + 53% VCN
+  - Return traffic (B→A): ZERO in one-way vs ACTIVE in two-way
+  - dma-buf flow: A→B only (one-way) vs A↔B (two-way)
+- Direct answer to maintainer's question: two-way = bidirectional dma-buf (copy back A←B); one-way X = unidirectional A→B, present on B
+- Asks upstream interest in: (1) frozen backend descriptor transport, (2) app topology (native X11 + native Wayland)
+- Offers rig data (KWin Wayland + XWayland, RX 9060 XT display, Intel ARL + RX 9070 XT game GPUs)
+- Explicitly notes: NO HDR claim, NO X11 automation claim, NO speculation on internals, NO commitments beyond data/access
+- Two-way remains selectable locally (`presentation = "game"`) but not the proposed contribution
+- Word count: 458 body (≤500), zero mismatched numbers vs Task 11
+
+### Commit
+```
+docs(measure): rfc 550 one-way reply draft
+```
+
+---
+
+## 2026-08-28 F1: Regression + Acceptance Gate
+
+### F1 Execution Summary
+- **Branch hygiene**: ✅ PASS — `git diff v10-dual-gpu..feat/dual-gpu-oneway -- lsfg-vk-backend` empty (backend frozen). All 15 commits in range belong to this plan. Touched dirs within allowed scope.
+- **Two-way regression**: ⚠️ BLOCKED — Requires `Lossless.dll` (not installed). Baseline logs exist at `.omo/evidence/oneway/baseline-twoway-*.log` but cannot be reproduced byte-for-byte without DLL.
+- **One-way acceptance (best cell: Cell-a Wayland, Intel→9060XT, m2)**: ⚠️ PARTIAL — Handshake succeeds ("external presentation active", cross-device=1, zero VUID), but presentation loop stalls: layer hits 500 ms backpressure deadline ("no free staging slots within 500 ms (app stalled)"). App not sending RELEASE fast enough. Task 11 achieved 4,503 counts/60s; current run 0 sustained.
+
+### Root Cause (Presentation Loop Stall)
+- Wayland backend `processEvents` / swapchain presentation path appears to block on first frame.
+- Same code path worked in Task 11 (4,503 counts), suggesting regression from Wayland protocol version fixes (xdg-output v4→min(version,4), wl_output v4→v3) or environmental difference.
+- App receives FRAME, calls `scheduleFrames`, but `AcquireNextImageKHR`/`QueuePresentKHR` may block indefinitely on Wayland surface not being configured/visible.
+- No verbose stats output (`LSFGVK_APP_VERBOSE=1`) → presentation loop never reaches stats logging code.
+
+### Recommendations
+1. Run two-way regression on DLL-equipped machine (Lossless Scaling installed).
+2. Debug Wayland backend: add logging around `AcquireNextImageKHR`/`QueuePresentKHR`; verify xdg_surface configure completes before first present.
+3. Re-run Cell-a Wayland 60s soak after fix; target ≥3,828 "external presentation active" counts (±15% of Task 11's 4,503).
+
+### Evidence
+- Verdict: `.omo/evidence/oneway/_final-f1.md`
+- Baseline logs: `.omo/evidence/oneway/baseline-twoway-debug.log`, `.omo/evidence/oneway/baseline-twoway-vkcube.log`
+- Task 11 reference: `.omo/evidence/oneway/t11-matrix/report.md`
