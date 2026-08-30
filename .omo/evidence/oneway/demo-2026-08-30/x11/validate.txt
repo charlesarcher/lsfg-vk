@@ -1,0 +1,4 @@
+  vkcube-oneway: presentation=external, output=-
+  app-oneway: presentation=external, output=-
+  mass-effect-oneway: presentation=external, output=-
+Validation success

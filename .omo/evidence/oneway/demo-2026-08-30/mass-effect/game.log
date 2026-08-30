@@ -1,0 +1,348 @@
+ProtonFixes[949538] WARN: Skipping fix execution. We are probably running a unit test.
+Proton: Upgrading prefix from CachyOS-11.0-100 to GE-Proton11-6 (/home/archerc/.local/share/Steam/steamapps/compatdata/1328670/)
+Proton: Prefix has an invalid version?! You may want to back up user files and delete this prefix.
+ProtonFixes[949538] WARN: Skipping fix execution. We are probably running a unit test.
+ntsync: up and running.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+Unhandled exception in Xalia:
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+  at Xalia.Win32.CommandThread.OnBackgroundThread[T] (System.Func`1[TResult] func, Xalia.Win32.CommandThreadPriority priority) [0x000d1] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Win32.NonclientScrollProvider.RefreshScrollInfo () [0x0009c] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Utils.DoRunTask (System.Object o) [0x00063] in <295968b5ae854da3893289dcfbfe889f>:0 
+Unhandled exception in Xalia:
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+  at Xalia.Win32.CommandThread.OnBackgroundThread[T] (System.Func`1[TResult] func, Xalia.Win32.CommandThreadPriority priority) [0x000d1] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Win32.NonclientScrollProvider.RefreshScrollBarInfo () [0x000b7] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Utils.DoRunTask (System.Object o) [0x00063] in <295968b5ae854da3893289dcfbfe889f>:0 
+Unhandled exception in Xalia:
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+  at Xalia.Win32.CommandThread.OnBackgroundThread[T] (System.Func`1[TResult] func, Xalia.Win32.CommandThreadPriority priority) [0x000d1] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Win32.NonclientScrollProvider.RefreshScrollBarInfo () [0x000b7] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Utils.DoRunTask (System.Object o) [0x00063] in <295968b5ae854da3893289dcfbfe889f>:0 
+Unhandled exception in Xalia:
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+  at Xalia.Win32.CommandThread.OnBackgroundThread[T] (System.Func`1[TResult] func, Xalia.Win32.CommandThreadPriority priority) [0x000d1] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Win32.NonclientScrollProvider.RefreshScrollBarInfo () [0x000b7] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Utils.DoRunTask (System.Object o) [0x00063] in <295968b5ae854da3893289dcfbfe889f>:0 
+Unhandled exception in Xalia:
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+  at Xalia.Win32.CommandThread.OnBackgroundThread[T] (System.Func`1[TResult] func, Xalia.Win32.CommandThreadPriority priority) [0x000d1] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Win32.NonclientScrollProvider.RefreshScrollBarInfo () [0x000b7] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Utils.DoRunTask (System.Object o) [0x00063] in <295968b5ae854da3893289dcfbfe889f>:0 
+Unhandled exception in Xalia:
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+  at Xalia.Win32.CommandThread.OnBackgroundThread[T] (System.Func`1[TResult] func, Xalia.Win32.CommandThreadPriority priority) [0x000d1] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Win32.NonclientScrollProvider.RefreshScrollInfo () [0x0009c] in <295968b5ae854da3893289dcfbfe889f>:0 
+  at Xalia.Utils.DoRunTask (System.Object o) [0x00063] in <295968b5ae854da3893289dcfbfe889f>:0 
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+selectable devices:
+  GPU 0: 1002:7550 "AMD Radeon RX 9070 XT (RADV GFX1201)" discrete GPU 0000:04:00.0
+  GPU 1: 1002:7590 "AMD Radeon RX 9060 XT (RADV GFX1200)" discrete GPU 0000:87:00.0
+  GPU 2: 8086:7d67 "Intel(R) Graphics (ARL)" integrated GPU 0000:00:02.0
+device-select: device_select_find_explicit_default for MESA_VK_DEVICE_SELECT selected 0
+Some threads failed to suspend before timeout reached. Continuing with shutdown.

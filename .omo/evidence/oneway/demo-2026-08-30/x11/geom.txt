@@ -1,0 +1,15 @@
+timestamp: 2026-08-30T06:21:31-05:00
+atom FULLSCREEN=0x167 ABOVE=0x168
+n clients: 4
+win 0x02a000db: pos=(0,10) size=414x1284
+  _NET_WM_NAME: ?
+  _NET_WM_STATE: (none)
+win 0x02a0003f: pos=(780,58) size=1738x1181
+  _NET_WM_NAME: ?
+  _NET_WM_STATE: (none)
+win 0x03200000: pos=(100,128) size=500x500
+  _NET_WM_NAME: ?
+  _NET_WM_STATE: (none)
+win 0x03400000: pos=(0,0) size=2560x1440
+  _NET_WM_NAME: ?
+  _NET_WM_STATE: other(0x161)  other(0x162)  FULLSCREEN  other(0x16b)  ABOVE  other(0x17e)
