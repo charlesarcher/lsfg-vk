@@ -189,12 +189,12 @@ creation fails loudly (see Troubleshooting).
 ### 3.1 Start the doubler app (on the 9060 XT)
 
 ```bash
-# X11 backend — verified working on this rig (see "Known issues" for Wayland)
+# X11 backend (XWayland) — verified working on this rig
 XAUTHORITY=/run/user/1000/xauth_OKuvCG \
     lsfg-vk-app --profile app-oneway --session x11
 
-# native Wayland backend
-# lsfg-vk-app --profile app-oneway --session wayland
+# native Wayland backend — verified working on this rig (60 s soak, demo record)
+lsfg-vk-app --profile app-oneway --session wayland
 ```
 
 `--session auto` (default) prefers Wayland when `WAYLAND_DISPLAY` is set, else
@@ -332,7 +332,7 @@ under
 | 5 | Mid-run engine capture | doubler card (9060 XT) `gpu_busy_percent` 4 % idle → 13–16 % during the run (`runB-new/engine-midrun.txt`) |
 | 6 | Failure: one-way with app **not** running | game: `failed to connect to app socket '/run/user/1000/lsfg-vk/app.sock'` / `connect() ... failed: Connection refused` — loud, named failure at swapchain creation |
 | 7 | Failure: app started with `--output BOGUS-OUT` | app: `stream ended: output 'BOGUS-OUT' not found; available: DP-7` |
-| 8 | One-way with `--session wayland` app backend | **stalls after ~1 cycle** (reproduced 2026-08-29 with the current build) — see Known issues |
+| 8 | One-way with `--session wayland` app backend, 60 s soak | **Fixed 2026-08-29** (bounded Wayland event dispatch + bounded `AcquireNextImageKHR` with event-pump retry): **9,088 cycles in 60 s**, `149 fps game / 300 fps presented` (ratio 2.005), 0 errors, clean SIGINT exit in 56 ms. Root cause: the blocking `wl_display_dispatch` deadlocked on wl_buffer-release events belonging to RADV's own event queue, and the infinite-timeout acquires made the stop flag unreachable. Stills: `runF-wayland-soak/soak-t*.png`; stall-state capture (pre-fix backtrace/strace): `runD-debug/` |
 
 ## How to prove the frames were doubled
 
@@ -413,25 +413,27 @@ sandbox (`--device=/dev/dri` plus the specific nodes; see the Flatpak Guide).
 
 ## Known issues
 
-1. **Wayland app backend stalls after ~1 cycle (reproduced 2026-08-29 with the
-   current build).** With `--session wayland`, the app presents its buffer
-   burst and then blocks in `AcquireNextImageKHR(UINT64_MAX)` — the compositor
-   (KWin) releases only the displayed buffer(s), and with no further frame
-   callbacks the app waits forever. While blocked in that call the SIGINT
-   handler cannot flip the stop flag the loop checks (the loop is not at its
-   poll), so `kill -INT` does not bring it down either; `kill -TERM`/`-9` are
-   required. *Workaround: run the app with `--session x11` (verified stable for
-   45+ s soaks — see the cadence proof above). The game's own WSI is
-   unaffected.*
-   Likely fixes (not yet implemented): finite-timeout
-   `AcquireNextImageKHR` + event-pumping retry loop, and/or pacing commits so
-   at most one buffer is committed ahead of the last frame callback.
-2. **One stream at a time**: a second game connecting to the same app is not
+1. **One stream at a time**: a second game connecting to the same app is not
    isolated; it fails. One app instance per `XDG_RUNTIME_DIR`.
-3. **No HDR verification** (the exchange is always 8-bit UNORM — B8G8R8A8 — in
+2. **No HDR verification** (the exchange is always 8-bit UNORM — B8G8R8A8 — in
    one-way mode; HDR staging is not implemented).
-4. **Unverified**: NVIDIA second cards, other WMs/compositors beyond KWin,
+3. **Unverified**: NVIDIA second cards, other WMs/compositors beyond KWin,
    exclusive fullscreen (frame generation ineffective, game unharmed).
+
+### Fixed: Wayland backend stall (2026-08-29)
+
+The `--session wayland` backend previously stalled after the first cycle and
+could not be stopped with SIGINT. Root cause (gdb/strace-confirmed):
+`processEvents` drained the display with the blocking `wl_display_dispatch`
+(default queue) — when the bytes it read carried only events for RADV's own
+event queue (the `wl_buffer` release listeners live there), it consumed the
+data, dispatched nothing, and waited forever on the empty socket. The
+present loop's `AcquireNextImageKHR(UINT64_MAX)` then made the stop flag
+unreachable as well. Fixed with a non-blocking bounded dispatch in
+`processEvents` and a 200 ms `AcquireNextImageKHR` timeout that pumps WSI
+events and re-checks the stop flag on each retry. Verified: 60 s Wayland soak
+(9,088 cycles, ratio 2.005, 0 errors, clean SIGINT in 56 ms) and an X11
+regression run (no change: 1,744 cycles / 30 s, ratio 2.010).
 
 ## Related docs
 
