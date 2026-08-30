@@ -387,6 +387,14 @@ namespace ls::ipc {
     // === Listener ===
 
     std::filesystem::path Listener::defaultPath() {
+        // LSFGVK_APP_SOCK overrides the path for BOTH the app and the layer.
+        // Needed for Steam/Proton games: the SteamLinuxRuntime container gives
+        // the game its OWN /run/user/UID, so the host's XDG_RUNTIME_DIR socket
+        // is invisible to the layer (connect() ENOENT). Point both processes
+        // at a path under a directory the container shares (e.g. $HOME).
+        const char* sockOverride = std::getenv("LSFGVK_APP_SOCK");
+        if (sockOverride && *sockOverride != '\0')
+            return std::filesystem::path(sockOverride);
         const char* runtimeDir = std::getenv("XDG_RUNTIME_DIR");
         if (!runtimeDir || *runtimeDir == '\0')
             throw ls::error("XDG_RUNTIME_DIR is not set; cannot locate the lsfg-vk app socket "

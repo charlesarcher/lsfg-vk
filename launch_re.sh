@@ -1,0 +1,1 @@
+VK_LAYER_PATH=/tmp/opencode/layer-test VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation LSFGVK_CONFIG=/home/archerc/.config/lsfg-vk/conf.toml LSFGVK_APP_SOCK=/home/archerc/.local/state/lsfg-vk/app.sock MESA_VK_DEVICE_SELECT=1002:7550 %command%

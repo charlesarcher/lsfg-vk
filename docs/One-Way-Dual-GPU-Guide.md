@@ -471,14 +471,23 @@ processing GPU.
    tokens before `%command%` into the game process's environment):
 
    ```
-   VK_LAYER_PATH=/tmp/opencode/layer-test VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation LSFGVK_CONFIG=/home/archerc/.config/lsfg-vk/conf.toml MESA_VK_DEVICE_SELECT=1002:7550 %command%
+   VK_LAYER_PATH=/tmp/opencode/layer-test VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation LSFGVK_CONFIG=/home/archerc/.config/lsfg-vk/conf.toml LSFGVK_APP_SOCK=/home/archerc/.local/state/lsfg-vk/app.sock MESA_VK_DEVICE_SELECT=1002:7550 %command%
    ```
 
    - `MESA_VK_DEVICE_SELECT=1002:7550` pins the game's render to the 9070 XT
      (the PCI id of the render card; use the doubler's id for the other
      pairing). The layer then does the cross-device work to the 9060 XT.
-   - For a **non-Steam** Vulkan game, the same env vars go in front of the
-     launch command in a shell instead of Steam launch options.
+   - **`LSFGVK_APP_SOCK` is REQUIRED for Steam games** (see Troubleshooting,
+     "Steam game fails with socket ENOENT"): the SteamLinuxRuntime container
+     gives the game its own `/run/user/UID`, so the default
+     `$XDG_RUNTIME_DIR/lsfg-vk/app.sock` socket is invisible to the game. The
+     doubler must be started with the same override:
+     `LSFGVK_APP_SOCK=$HOME/.local/state/lsfg-vk/app.sock lsfg-vk-app
+     --profile app-oneway --session wayland` (any path under `$HOME` works —
+     the container sees it).
+   - For a **non-Steam** Vulkan game, the same env vars (minus
+     `LSFGVK_APP_SOCK`) go in front of the launch command in a shell instead
+     of Steam launch options.
 
 ### Expect
 
@@ -489,13 +498,16 @@ RX 9070 XT ...' <WxH> ...` then `[gen x N + real]` per cycle. The monitor
 (9060 XT) shows the frame-doubled game with the `<game>/<presented>` HUD in the
 top-left.
 
-> **Verified 2026-08-30:** the layer/Profile/device side of this flow is
-> confirmed (profile matched under Proton, device pinned to the 9070 XT, doubler
-> app listening and healthy). The Mass Effect game itself was blocked by the
-> EA Desktop auth/bridge wall before creating a swapchain (see Known issues
-> #4 and `.omo/evidence/oneway/demo-2026-08-30/mass-effect/NOTES.md`), so the
-> full real-game E2E is pending an interactive EA session — the mechanism is
-> proven end-to-end by the vkcube runs on both backends.
+> **Verified 2026-08-30:** the layer/profile/device side of this flow is
+> confirmed (profile matched under Proton — RE2 reached the layer with
+> `using profile ... re2-oneway (identified via wine executable)` — and device
+> pinned to the 9070 XT). One Steam-specific blocker was found and fixed: the
+> SteamLinuxRuntime container gives the game its own `/run/user/UID`, so the
+> default socket was invisible to the game (`connect() ENOENT` at swapchain
+> creation). Fixed with the `LSFGVK_APP_SOCK` override both processes honor
+> (see "Start the doubler, then the game" and Troubleshooting). The Mass
+> Effect game was separately blocked by the EA Desktop auth wall (Known issues
+> #4); the mechanism is proven end-to-end by the vkcube runs on both backends.
 
 ## Verified demo record (this machine)
 
@@ -609,6 +621,19 @@ of the listed names to `--output` (or omit `--output` for the primary).
 `external stream error: poll() on ipc socket failed: Connection reset by peer`
 and the game's swapchain presentation fails; start a fresh app + game.
 Verified that app SIGKILL mid-stream surfaces the same named error.
+
+**Steam game fails with `connect() ... No such file or directory`** (socket
+error even though the app is running): the SteamLinuxRuntime container runs
+the game with its **own** `/run/user/UID` — only dbus/wayland/pipewire sockets
+are bind-mounted in, so the host's default
+`$XDG_RUNTIME_DIR/lsfg-vk/app.sock` does not exist for the game. Verified
+2026-08-30 (RE2: `ENOENT` at swapchain creation with the app listening on the
+host socket; `ls /run/user/1000` inside the container shows no `lsfg-vk/`).
+Fix: point both processes at a container-visible path (under `$HOME`):
+start the app with
+`LSFGVK_APP_SOCK=$HOME/.local/state/lsfg-vk/app.sock` and add the same
+`LSFGVK_APP_SOCK=...` token to the Steam launch options. Non-Steam games
+(own process, real `XDG_RUNTIME_DIR`) need no override.
 
 **Changing `gpu` / `presentation`**: requires restarting the game (and the app
 for its profile); the layer logs `gpu change requires restart to take effect`.
