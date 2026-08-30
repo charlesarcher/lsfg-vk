@@ -1,0 +1,27 @@
+# task-4 evidence: ExchangeDescriptor + PURE DRM-modifier negotiation core
+## date: 2026-08-23T22:21:35-05:00 | branch: feat/dual-gpu
+
+## standalone table-driven unit checks (g++ direct, no cmake)
+$ g++ -std=c++20 -O2 -Wall -Wextra -Wpedantic -I lsfg-vk-common/include test_exchange.cpp exchange.cpp errors.cpp -o t4test
+(compiler output: zero warnings)
+$ ./t4test
+PASS descriptor aggregate smoke
+PASS intel-vs-amd intersect at linear           -> LINEAR fallback
+PASS overlap proper modifier wins               -> modifier 0x8800000000010002
+PASS source-side needs via modifier             -> modifier 0x8800000000010002
+PASS disjoint no linear => error                -> error: no usable exchange layout for format 37 with needed usage bits 0x32769: no common DRM modifier between devices and LINEAR tiling unsupported
+PASS linear lacking usage => error              -> error: no usable exchange layout for format 37 with needed usage bits 0x16387: no common DRM modifier between devices and LINEAR tiling unsupported
+PASS importer caps empty => error               -> error: no usable exchange layout for format 37 with needed usage bits 0x32769: no common DRM modifier between devices and LINEAR tiling unsupported
+PASS exporter caps empty => error               -> error: no usable exchange layout for format 37 with needed usage bits 0x32769: no common DRM modifier between devices and LINEAR tiling unsupported
+PASS hdr format linear fallback                 -> LINEAR fallback
+PASS determinism across all non-error cases
+ALL PASS: 0 failure(s)
+
+## full cmake build (build dir: /tmp/opencode/build-t4, Release)
+[ 93%] Building CXX object lsfg-vk-layer/CMakeFiles/lsfg-vk-layer.dir/src/swapchain.cpp.o
+[ 95%] Building CXX object lsfg-vk-cli/CMakeFiles/lsfg-vk-cli.dir/src/main.cpp.o
+[ 97%] Linking CXX shared library liblsfg-vk-layer.so
+[ 97%] Built target lsfg-vk-layer
+[100%] Linking CXX executable lsfg-vk-cli
+[100%] Built target lsfg-vk-cli
+warning-count: 0

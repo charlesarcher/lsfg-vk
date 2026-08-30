@@ -1,0 +1,30 @@
+=== task-16 verification greps (2026-08-24T00:43:43-05:00) ===
+
+$ grep -ri "dual gpu is not supported\|must be the \*\*same gpu" docs/   # repo-wide stale-claim gate, MUST be empty
+exit=1 (1 = no matches = PASS)
+
+$ grep -in "render node\|Flatpak Guide" docs/Troubleshooting.md   # flatpak/both-nodes caveat
+51:- **Flatpak applications need access to both render nodes.** The sandbox must be able to see the render nodes (`/dev/dri/renderD*`) of both the game's GPU and the processing GPU, otherwise device selection or the frame exchange fails inside the container. See the [Flatpak Guide](Flatpak-Guide.md) for general Flatpak setup.
+
+$ grep -in "NVIDIA" docs/Troubleshooting.md   # NVIDIA status caveat
+49:- **Both GPUs must support the exchange extensions.** Dual-GPU mode requires `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier` on both the game's GPU and the processing GPU. If either device is missing one of them, lsfg-vk refuses to start with an error naming the device and the missing extension. On NVIDIA this mechanism is available since driver 515.43.04, but it remains unverified, as no NVIDIA test hardware was available for this project.
+
+$ grep -in "HDR" docs/Troubleshooting.md   # HDR unverified caveat
+52:- **HDR in dual-GPU mode is unverified.** The automated test harness only exercises SDR frames, so transporting HDR content between two GPUs ships untested. If you combine HDR with dual-GPU mode and run into corruption or errors, please mention this in your bug report.
+
+$ grep -in "lsfg-vk_pipeline_cache" docs/Troubleshooting.md   # per-driver-UUID cache pattern (todo 11)
+53:- **Pipeline caches are per-driver.** Compiled shaders are cached in files named `lsfg-vk_pipeline_cache_<driverUUID>.bin` inside your cache directory (`$XDG_CACHE_HOME`, falling back to `~/.cache`). GPUs sharing a driver (e.g. two AMD cards on the same Mesa install) share one cache file, while different drivers (e.g. Intel and AMD) get separate ones. The old unkeyed `lsfg-vk_pipeline_cache.bin` from previous versions is removed automatically, so there is nothing to clean up by hand.
+
+$ grep -in "processing on\|game's own device\|requires restart" docs/Troubleshooting.md   # log-line contract (todo 13)
+43:- `lsfg-vk: frame generation on the game's own device '...'` means everything runs on a single GPU (either because `gpu` is unset or set to the game's own device).
+44:- `lsfg-vk: processing on '...' (game on '...')` means dual-GPU mode is active. The first quoted value is the processing device's UUID in hexadecimal, the second is the game device's name. The line printed at startup (`lsfg-vk: processing on '<device name>' [uuid ...]`) maps names to UUIDs, so you can tell which of your cards is doing the processing.
+46:Keep in mind that changing the `gpu` option only takes effect after restarting the application; lsfg-vk logs `gpu change requires restart to take effect` if it detects a changed setting mid-session.
+
+$ grep -rin "dual.gpu mode" docs/ | head -20   # terminology consistency across docs
+docs/Configuration.md:24:- **GPU / `gpu`**: The GPU used for frame generation (the "processing GPU"). If left unset, frames are processed on the game's own GPU instead of an arbitrary first device found, which matches single-GPU behavior exactly. When set to a different GPU, lsfg-vk enters dual-GPU mode: the game keeps rendering and presenting on its own GPU, while the entire frame generation pipeline runs on the selected device. Frames are copied between both GPUs over PCIe, which costs bandwidth and adds latency:
+docs/Configuration.md:32:  Unlike on Windows, presentation always stays on the render GPU: the game's WSI swapchain is bound to its own device and surface, so generated frames must travel back over PCIe (this is the core premise of upstream issue #159). You can identify a GPU through its name (e.g. `NVIDIA GeForce RTX 3080`), uppercase-only ID (e.g. `0x10DE:0x2C02`) or PCI bus ID (e.g. `3:0.0`). Changing this option requires an application restart, because the processing GPU is fixed while the process runs. On NVIDIA, dual-GPU mode is expected to work through the standard Linux dma-buf mechanism (`VK_EXT_external_memory_dma_buf`, supported since driver 515.43.04), but it remains unverified, as no NVIDIA test hardware was available for this project.
+docs/Troubleshooting.md:40:If you configured the `gpu` option to a device other than the one your game renders on, lsfg-vk enters dual-GPU mode: the game keeps rendering and presenting on its own GPU, while the entire frame generation pipeline runs on the selected processing GPU. Frames travel between both GPUs over PCIe, which costs bandwidth and adds latency (see the [Configuration](Configuration.md) documentation for the details).
+docs/Troubleshooting.md:44:- `lsfg-vk: processing on '...' (game on '...')` means dual-GPU mode is active. The first quoted value is the processing device's UUID in hexadecimal, the second is the game device's name. The line printed at startup (`lsfg-vk: processing on '<device name>' [uuid ...]`) maps names to UUIDs, so you can tell which of your cards is doing the processing.
+docs/Troubleshooting.md:48:If games fail to start or frame generation errors out in dual-GPU mode, check the following:
+docs/Troubleshooting.md:49:- **Both GPUs must support the exchange extensions.** Dual-GPU mode requires `VK_EXT_external_memory_dma_buf` and `VK_EXT_image_drm_format_modifier` on both the game's GPU and the processing GPU. If either device is missing one of them, lsfg-vk refuses to start with an error naming the device and the missing extension. On NVIDIA this mechanism is available since driver 515.43.04, but it remains unverified, as no NVIDIA test hardware was available for this project.
+docs/Troubleshooting.md:52:- **HDR in dual-GPU mode is unverified.** The automated test harness only exercises SDR frames, so transporting HDR content between two GPUs ships untested. If you combine HDR with dual-GPU mode and run into corruption or errors, please mention this in your bug report.

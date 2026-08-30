@@ -1,0 +1,77 @@
+=== task-8 evidence: DeviceExchangeCaps query adapter (2026-08-23T22:43:35-05:00) ===
+
+--- build tail (/tmp/opencode/build-t8, target lsfg-vk-common) ---
+[100%] Built target lsfg-vk-common
+warnings/errors grep over full rebuild:
+0
+
+--- throwaway binary compile ---
+t8dump linked OK (liblsfg-vk-common.a + errors.cpp TU)
+
+--- caps dump card1/card2/card3 + intersection assertion ---
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+== card1 Intel iGPU (drm_modifier_ext=yes) ==
+  SDR RGBA8: 5 modifiers
+    mod 0x0 usage 0x1dd83
+    mod 0x100000000000001 usage 0x1dd83
+    mod 0x100000000000009 usage 0x1dd83
+    mod 0x10000000000000d usage 0x1dd83
+    mod 0x10000000000000f usage 0x1dd83
+  HDR RGBA16F: 5 modifiers
+    mod 0x0 usage 0x1dd83
+    mod 0x100000000000001 usage 0x1dd83
+    mod 0x100000000000009 usage 0x1dd83
+    mod 0x10000000000000d usage 0x1dd83
+    mod 0x10000000000000f usage 0x15d83
+== card2 AMD 9070 XT (drm_modifier_ext=yes) ==
+  SDR RGBA8: 9 modifiers
+    mod 0x200000000082305 usage 0x1dd83
+    mod 0x200000000042305 usage 0x1dd83
+    mod 0x200000000082405 usage 0x1dd83
+    mod 0x200000000082205 usage 0x1dd83
+    mod 0x200000000082105 usage 0x1dd83
+    mod 0x200000000000305 usage 0x1dd83
+    mod 0x200000000000a04 usage 0x1dd83
+    mod 0x200000000000105 usage 0x1dd83
+    mod 0x0 usage 0x1dd83
+  HDR RGBA16F: 9 modifiers
+    mod 0x200000000082305 usage 0x1dd83
+    mod 0x200000000042305 usage 0x1dd83
+    mod 0x200000000082405 usage 0x1dd83
+    mod 0x200000000082205 usage 0x1dd83
+    mod 0x200000000082105 usage 0x1dd83
+    mod 0x200000000000305 usage 0x1dd83
+    mod 0x200000000000a04 usage 0x1dd83
+    mod 0x200000000000105 usage 0x1dd83
+    mod 0x0 usage 0x1dd83
+== card3 AMD 9060 XT (drm_modifier_ext=yes) ==
+  SDR RGBA8: 9 modifiers
+    mod 0x200000000082305 usage 0x1dd83
+    mod 0x200000000042305 usage 0x1dd83
+    mod 0x200000000082405 usage 0x1dd83
+    mod 0x200000000082205 usage 0x1dd83
+    mod 0x200000000082105 usage 0x1dd83
+    mod 0x200000000000305 usage 0x1dd83
+    mod 0x200000000000a04 usage 0x1dd83
+    mod 0x200000000000105 usage 0x1dd83
+    mod 0x0 usage 0x1dd83
+  HDR RGBA16F: 9 modifiers
+    mod 0x200000000082305 usage 0x1dd83
+    mod 0x200000000042305 usage 0x1dd83
+    mod 0x200000000082405 usage 0x1dd83
+    mod 0x200000000082205 usage 0x1dd83
+    mod 0x200000000082105 usage 0x1dd83
+    mod 0x200000000000305 usage 0x1dd83
+    mod 0x200000000000a04 usage 0x1dd83
+    mod 0x200000000000105 usage 0x1dd83
+    mod 0x0 usage 0x1dd83
+[assert] Intel-vs-AMD proper-modifier intersection (SDR RGBA8): 0 entries
+[assert] Intel-vs-AMD proper-modifier intersection (HDR RGBA16F): 0 entries
+[assert] PASS: Intel/AMD share only LINEAR
+
+--- exit code: 0 ---

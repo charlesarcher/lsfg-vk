@@ -1,0 +1,40 @@
+=== task-3 issue-159-dual-gpu: SYNC_FD binary semaphores ===
+date: 2026-08-23T22:27:04-05:00
+
+--- files touched ---
+ .../include/lsfg-vk-common/vulkan/semaphore.hpp    | 23 ++++++++-
+ lsfg-vk-common/src/vulkan/semaphore.cpp            | 60 ++++++++++++++++++----
+ 2 files changed, 72 insertions(+), 11 deletions(-)
+
+--- build (isolated dir /tmp/opencode/build-t3, Release, system g++) ---
+[ 97%] Linking CXX shared library liblsfg-vk-layer.so
+[ 97%] Built target lsfg-vk-layer
+[100%] Linking CXX executable lsfg-vk-cli
+[100%] Built target lsfg-vk-cli
+build exit=0, warning count: 0 (baseline 0)
+
+--- smoke binary (/tmp/opencode/t3-smoke/smoke.cpp, throwaway, not in repo) ---
+two standalone vk::Vulkan instances pinned by deviceName substring; linked against build-t3 liblsfg-vk-common.a + libvulkan
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+device A: Intel(R) Graphics (ARL)
+device B: AMD Radeon RX 9070 XT (RADV GFX1201)
+[PASS] exportFd returned a valid fd
+[PASS] sync fd polls readable (signaled) within 5s
+[PASS] AMD wait on imported Intel-signal semaphore completed
+[PASS] Intel wait on imported AMD-signal semaphore completed
+[PASS] -1 fd path yields already-signaled semaphore (immediate wait)
+[PASS] default-constructed binary semaphore still signals/waits locally
+ALL PASS (0 failure(s))
+smoke exit=0
+
+--- notes ---
+* VK_LAYER_KHRONOS_validation NOT installed on this system; smoke ran without validation layers.
+* radv 'not a conformant implementation' warnings are driver banner noise, not errors.
+* empirical finding: vkSignalSemaphoreKHR on BINARY semaphores returns VK_ERROR_DEVICE_LOST
+  on BOTH RADV (GFX1201) and ANV (ARL), exportable or not -> host-signaling is timeline-only in practice.
+  the -1 already-signaled sentinel is therefore implemented as an empty queue submit + DeviceWaitIdle.
+* VkImportSemaphoreFdInfoKHR field order differs between vulkan header revisions (semaphore before flags
+  on this box); designated initializers must follow the LOCAL header order.

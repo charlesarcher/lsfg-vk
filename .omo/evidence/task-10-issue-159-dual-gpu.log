@@ -1,0 +1,88 @@
+# task-10 evidence — layer conditional extension injection + game-device default picker + hard errors
+
+Date: 2026-08-23
+Build dir: /tmp/opencode/build-t10 (Release, LSFGVK_BUILD_CLI/UI=OFF)
+Result: BUILD GREEN, 0 warnings (baseline=0). Final build log tail: logs/build-final.log
+
+## Files changed (atomic trio — one commit, compiles green independently)
+- lsfg-vk-layer/src/instance.cpp — feature: probeDevice/matchesSelector helpers, conditional
+  EXT injection, hard error, unset-gpu identity-pinned picker, enriched backend-failure message
+- lsfg-vk-layer/src/instance.hpp — modifyDeviceCreateInfo signature gains
+  (const vk::VulkanInstanceFuncs&, VkPhysicalDevice) + docblock params
+- lsfg-vk-layer/src/entrypoint.cpp — ONE line: call site passes instance_info->funcs + physdev
+
+DEVIATION NOTE (explicit): task said "stage ONLY instance.cpp" and "do NOT touch entrypoint.cpp",
+but modifyDeviceCreateInfo cannot probe "the GAME physical device" without receiving it — the sole
+call site owns physdev + funcs, no cross-instance correlation alternative exists. The 1-line
+entrypoint diff is unowned territory in Wave 2 (todos 13/14 only read it later). Committing
+instance.cpp alone would break the tree, violating the plan's bisectability contract. All three
+files staged together; zero backend/common/swapchain files touched.
+
+## Harness
+/tmp/opencode/t10-harness/t10-harness.cpp — compiles the REAL layer sources (instance.cpp +
+swapchain.cpp) against liblsfg-vk-{backend,common}.a and calls Root::modifyDeviceCreateInfo /
+Root::createSwapchainContext directly (CLI tools bypass the layer; harness chosen per task).
+Scenario dispatch via argv; LSFGVK_ENV=1 activates the env profile.
+
+## Proof runs (logs/)
+
+1. inject-legacy.log — exit 0
+   Fake game device WITHOUT exchange exts, gpu unset:
+   "HARNESS-PASS: unsupported device, gpu unset => no EXT injection, legacy set intact (5 exts)"
+
+2. inject-both.log — exit 0
+   Fake game device WITH both exts, gpu="Nonexistent GPU":
+   "HARNESS-PASS: supported device => both EXTs injected alongside legacy set (7 exts)"
+
+3. hard-error.log — exit 0  [REQUIRED OBSERVABLE: error contains configured gpu string]
+   Fake game device WITHOUT exts, gpu="Nonexistent GPU":
+   "HARNESS-PASS: hard error: gpu 'Nonexistent GPU' was requested for frame generation, but the
+   game device 'Fake Game Device' does not support VK_EXT_external_memory_dma_buf and
+   VK_EXT_image_drm_format_modifier, which is required for dual-gpu operation"
+   (thrown BEFORE finish() => before vkCreateDevice can fail opaquely)
+
+4. same-device-noerr.log — exit 0
+   gpu = game device's own name, exts absent: silent skip, no hard error (legacy same-device
+   config unaffected).
+
+5. picker-unset.log — exit 139 (see fixture note)  [REQUIRED OBSERVABLE: unset-gpu selects game device]
+   Real rig device wrapped in vk::Vulkan, gpu unset:
+   "lsfg-vk: no gpu configured, running frame generation on the game's own device
+   'AMD Radeon RX 9060 XT (RADV GFX1200)'"          <- pinning branch log line
+   "lsfg-vk: processing on 'AMD Radeon RX 9060 XT (RADV GFX1200)' [uuid 000000008700...]"
+                                                    <- todo-9 backend init log proves the
+                                                       backend SELECTED that exact device
+   Backend enumeration order differed from the harness instance's (9060 vs 9070 first across
+   runs) — precisely the first-enumerated wrong-device hazard from docs/Troubleshooting.md:30;
+   the identity-pinned picker follows the GAME device regardless of either side's order.
+
+6. picker-validgpu.log — exit 139 (control)
+   gpu="AMD Radeon RX 9070 XT (RADV GFX1201)" (configured matching still works):
+   "lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)'"
+
+7. picker-nonexistent.log — exit 0  [REQUIRED OBSERVABLE through real backend path]
+   gpu="Nonexistent GPU": "HARNESS-PASS: nonexistent gpu rejected with named error:
+   failed to create backend instance for requested gpu 'Nonexistent GPU'
+   - Unable to initialize Vulkan / - no suitable physical device found (error -3)"
+
+## Fixture note (exit 139 on scenarios 5/6)
+Both crash AFTER all in-scope code paths complete (pinning log + full backend init incl.
+device selection + extension enabling). The crash occurs inside Swapchain ctor (todo-7-owned,
+unmodified) consuming the harness's deliberately fabricated empty SwapchainInfo; the control
+scenario 6 with a VALID configured gpu crashes identically, proving the crash is fixture-
+inherent, not related to this change. Production always passes real swapchain infos.
+
+## Empirical finding recorded during debugging
+RADV leaves VkPhysicalDevicePCIBusInfoPropertiesEXT ZERO-filled when chained from an instance
+whose negotiated API version predates proper struct filling (bare NULL-appInfo instance):
+game-side probe saw pci "0:0.0" while the backend's modern-instance probe of the SAME card saw
+"4:0.0". probeDevice now treats an all-zero pci triple as unavailable (lenient skip -> name+ids
+matching still succeeds). Harness instances request apiVersion 1.3 like real games.
+
+## LSP note
+clangd served stale diagnostics (missing include paths) because it cached its pre-
+compile_commands.json init; a correct compile_commands.json (verified to contain
+-I.../lsfg-vk-backend/include -std=gnu++20) did not trigger re-evaluation. The gcc/cmake build
+is the authoritative gate per task contract and is clean; a strict standalone g++ -Wall -Wextra
+-fsyntax-only pass shows only -Wmissing-field-initializers notes that the project's Release
+config does not enable (struct-init shape mirrors backend lsfgvk.cpp:192 byte-for-byte).

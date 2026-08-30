@@ -1,0 +1,149 @@
+# task-7 evidence — Portable cross-device sync handshake preserving value choreography
+Date: 2026-08-23 | Branch: feat/dual-gpu | Build dir: /tmp/opencode/build-t7 (exclusive)
+
+## 1. Build gate
+
+Configure: cmake -B /tmp/opencode/build-t7 -DCMAKE_BUILD_TYPE=Release -S <tree> → exit 0.
+Full build: cmake --build /tmp/opencode/build-t7 -j 8 → exit 0, ZERO warnings
+(grep -ci warning over full log = 0). Baseline was 0 warnings; delta = 0.
+
+Build tail:
+```
+[ 88%] Building CXX object lsfg-vk-cli/CMakeFiles/lsfg-vk-cli.dir/src/tools/debug.cpp.o
+[ 90%] Building CXX object lsfg-vk-cli/CMakeFiles/lsfg-vk-cli.dir/src/tools/validate.cpp.o
+[ 93%] Building CXX object lsfg-vk-layer/CMakeFiles/lsfg-vk-layer.dir/src/swapchain.cpp.o
+[ 95%] Building CXX object lsfg-vk-cli/CMakeFiles/lsfg-vk-cli.dir/src/main.cpp.o
+[ 97%] Linking CXX shared library liblsfg-vk-layer.so
+[100%] Linking CXX executable lsfg-vk-cli
+[100%] Built target lsfg-vk-cli
+```
+Note: validation layers are NOT installed on this rig; validation-stderr assertions
+are deferred to todo 15 per plan (noted here as instructed).
+
+## 2. Same-device regression runs (zero-regression proof)
+
+debug over /tmp/opencode/t5-frames (4 DDS frames, 640x360, m=2 default):
+- pre-change baseline binary: build/lsfg-vk-cli/lsfg-vk-cli debug -d "$DLL" \
+    -g "AMD Radeon RX 9070 XT (RADV GFX1201)" -w 640 -h 360 /tmp/opencode/t5-frames
+  → exit 0
+- post-change binary: /tmp/opencode/build-t7/lsfg-vk-cli/lsfg-vk-cli <same args>
+  → exit 0
+- diff of outputs (modulo radv "not conformant" stderr lines present in BOTH):
+  IDENTICAL.
+
+benchmark -t 3 (same -d/-g):
+- baseline: exit 0, 3708 iterations, 1236.00 gen-fps
+- new     : exit 0, 3974 iterations, 1324.67 gen-fps
+- parity within rig noise (historical same-device runs: 1204–1299 gen-fps);
+  the legacy timeline path is taken by construction when UUIDs match or when
+  openContext is called without a game UUID (CLI tools pass none).
+
+## 3. Cross-device handshake mechanism smoke (real rig pairs)
+
+Standalone harness /tmp/opencode/t7-smoke.cpp linked against build-t7's
+liblsfg-vk-common.a exercising EXACTLY the primitives the handshake uses:
+
+== direction 1: AMD exports -> Intel imports ==
+  cycle 0..4: exported live fd=13 right after enqueue → import + fenced wait OK
+== direction 2: Intel exports -> AMD imports ==
+  cycle 0..4: exported live fd=13 right after enqueue → import + fenced wait OK
+== -1 sentinel: queue-signal fallback == OK
+SMOKE OK: all handshakes completed
+
+Proven empirically:
+(a) exportFd() immediately AFTER enqueueing the signal submit (no host wait)
+    yields a LIVE sync fd on both RADV GFX1201 and ANV ARL — copy transference
+    wraps the pending payload;
+(b) temporary imports into a persistent ring slot work repeatedly across cycles
+    in both cross-vendor directions;
+(c) re-signaling a ring slot after its payload was consumed by a queue wait is
+    legal across cycles (the recycling choreography is sound).
+
+## 4. Handshake-mechanism summary (who signals what; fd flow)
+
+Mode detection: backend compares instance-selected physdev deviceUUID() against
+the gameDeviceUUID in-param of openContext (layer passes vk.deviceUUID()).
+Equal/nullopt ⇒ SAME-device ⇒ imported-timeline protocol untouched. Differ ⇒
+CROSS-device ⇒ SYNC_FD binary handshakes below. Mode stored in the context;
+layer queries it via Instance::isCrossDevice(context) right after openContext.
+
+Timeline value ↔ binary edge mapping (1:1, verified single-waiter today):
+
+  VALUE (timeline)            CROSS-DEVICE EDGE (sync fd)
+  layer capture signals L     EDGE-A "frame k captured":  layer → backend
+  backend prepass waits L       layer capture-submit signals ring slot
+                                [handshakeIdx % 2], exportFd() right after
+                                enqueue, fd passed INTO scheduleFrames();
+                                backend temporarily imports it into its own
+                                ring slot and the prepass waits it.
+  backend main_i signals L+1+i  EDGE-B "frame i done": backend → layer
+  layer blit_i waits L+1+i      backend main_i signals doneSlots[i],
+                                exportFd() right after enqueue, all done fds
+                                RETURNED from scheduleFrames(); layer
+                                temporarily imports doneFds[i] into
+                                doneWaitSemaphores[i]; blit_i waits it.
+
+Internal chains unchanged: backend prepass→mains stays a LOCAL timeline
+semaphore (prepassSemaphore) in both modes; layer acquire/postCopy semaphore
+pairs stay local binaries in both modes; renderFence/cmdbufFence stay plain
+device-private fences (150 ms timeout pattern preserved; NO externalized
+fences anywhere).
+
+Recycling legality (binary semaphores must not be re-signaled while signaled):
+- layer capture ring (size 2): capture(c) WAITS slot[(c-1)%2] in the same
+  submit that signals slot[c%2] — consumes cycle c-1's leftover payload with
+  zero extra submissions; first cycle skips the recycle-wait.
+- backend done slots (size multiplier-1): prepass(c+1) waits ALL done slots of
+  cycle c alongside the capture import — consumes leftovers before mains(c+1)
+  re-signal them; first cycle skips (nothing signaled yet); never blocks since
+  cmdbufFence(c) already ordered batch c complete.
+- backend capture ring (size 2): temporary imports revert to unsignaled after
+  the prepass wait observes them, so re-import two cycles later is legal.
+
+Edge-fd timing constraint honored: every fd EXISTS before the waiter's submit
+is enqueued — layer exports capture fd BEFORE calling scheduleFrames (capture
+submit moved ahead of scheduleFrames in the cross branch only); backend
+exports done fds inside scheduleFrames BEFORE returning them to the layer.
+
+fd ownership: captureReadyFd transfers to the backend unconditionally at call
+(import consumes on success; helper closes on failure); done fds remain owned
+by the layer (import consumes each; FdJanitor closes unconsumed ones if the
+blit loop throws; backend closes partial doneFds if scheduling throws).
+Cross-mode swapchain ctor closes the unused exported timeline syncFd.
+
+-1 sentinel ("already signaled"): layer passes it through; backend emulates by
+queue-signaling the ring slot directly + DeviceWaitIdle (vkSignalSemaphoreKHR
+on binary semaphores returns DEVICE_LOST on RADV/ANV — todo-3 finding). Layer
+skips the blit wait entirely for a -1 done fd (frame already completed).
+
+Ordering/coherence: the handshakes ARE the memory-ordering mechanism for the
+dma-buf/opaque exchange images; image layout dualities untouched
+(sourceImage TRANSFER_DST_OPTIMAL game-side vs GENERAL backend-side kept).
+Pacing/present order/FIFO injection/shader chain untouched.
+
+## 5. API additions for todo 12 (all marked // NOTE(todo-12): in code)
+
+1. openContext(..., std::optional<std::array<uint8_t,16>> gameDeviceUUID = nullopt)
+   — defaulted trailing param; existing callers (debug.cpp, benchmark.cpp,
+   legacy layer shape) compile unchanged; nullopt = same-device assumption.
+2. std::vector<int> scheduleFrames(Context&, int captureReadyFd = -1)
+   — return type void→vector<int> (source-compatible; CLI tools ignore it);
+   captureReadyFd consumed by the library in all cases.
+3. [[nodiscard]] bool Instance::isCrossDevice(const Context&) const
+   — mode query for the layer; throws backend::error on unknown context.
+Deliberately NOT touched: findCacheFilePath region (todo 11, already landed),
+InstanceImpl/openContext extension logic (todo 9), pacing/present-mode walk,
+shader chains, command_buffer.cpp (existing mixed binary/timeline submit()
+variant already covers every new submit shape — no changes needed there).
+
+## 6. Known deviations (documented, behavior-preserving)
+
+- Same-device present(): host-side present-mode next_chain walk now happens
+  before scheduleFrames instead of after (pure host-side struct mutation; the
+  mutated pPresentModes are only consumed at QueuePresentKHR time). GPU submit
+  order, semaphores, values, fences identical to pre-change.
+- Same-device present(): capture blit recording now precedes scheduleFrames
+  (recording is host-side; submission order unchanged). If the 150 ms fence
+  wait then throws, the capture cmdbuf is left in recording state — equal
+  looseness to the pre-existing mid-present throw paths; no recovery path
+  reuses the buffer without swapchain recreation.

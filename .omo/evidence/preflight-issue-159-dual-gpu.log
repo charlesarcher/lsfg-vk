@@ -1,0 +1,29 @@
+== PRE-FLIGHT GATE issue-159-dual-gpu ==
+2026-08-24T03:04:00Z
+-- [1/4] DRM cards --
+card1: vendor=0x8086 device=0x7d67 OK
+card2: vendor=0x1002 device=0x7550 OK
+card3: vendor=0x1002 device=0x7590 OK
+-- [2/4] render nodes accessible --
+/dev/dri/renderD128: writable
+/dev/dri/renderD129: writable
+/dev/dri/renderD130: writable
+-- [3/4] vulkaninfo devices --
+	vendorID           = 0x1002
+	deviceID           = 0x7590
+	deviceName         = AMD Radeon RX 9060 XT (RADV GFX1200)
+	driverName         = radv
+	vendorID           = 0x1002
+	deviceID           = 0x7550
+	deviceName         = AMD Radeon RX 9070 XT (RADV GFX1201)
+	driverName         = radv
+	vendorID           = 0x8086
+	deviceID           = 0x7d67
+	deviceName         = Intel(R) Graphics (ARL)
+	driverName         = Intel open-source Mesa driver
+Intel 0x8086:0x7D67 present
+AMD 0x7550 (Navi48) present
+AMD 0x7590 (Navi44) present
+-- [4/4] Lossless.dll resolvable --
+Lossless.dll readable at: /mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll (7521280 bytes)
+== RESULT: PASS ==

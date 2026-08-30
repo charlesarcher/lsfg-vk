@@ -1,0 +1,45 @@
+=== task-13 evidence: layer negotiation wiring, descriptor production, hot-reload honesty ===
+date: 2026-08-24T00:32:37-05:00  head-before: 8e1fcd9
+
+--- BUILD (/tmp/opencode/build-t13, full tree) ---
+warning/error lines: 0
+[ 95%] Linking CXX shared library liblsfg-vk-layer.so
+[100%] Built target lsfg-vk-layer
+
+--- RUN 1: same-device CLI debug regression (backend+descriptor path) ---
+cmd: lsfg-vk-cli debug -g "AMD Radeon RX 9070 XT (RADV GFX1201)" -d <dll> /tmp/opencode/t5-frames
+  lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+  lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+  lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+  last-line: lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+
+--- RUN 2: layer harness SAME-DEVICE (unset gpu, Root::createSwapchainContext path) ---
+exit=
+  lsfg-vk: no gpu configured, running frame generation on the game's own device 'AMD Radeon RX 9070 XT (RADV GFX1201)'
+  lsfg-vk: frame generation on the game's own device 'AMD Radeon RX 9070 XT (RADV GFX1201)'
+  harness: OK
+
+--- RUN 3: layer harness CROSS-PAIR (gpu=9060 XT, game=9070 XT) ---
+  lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+  lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+  lsfg-vk: processing on 'AMD Radeon RX 9060 XT (RADV GFX1200)' [uuid 00000000870000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+  lsfg-vk: processing on '00000000870000000000000000000000' (game on 'AMD Radeon RX 9070 XT (RADV GFX1201)')
+  harness: OK
+
+--- RUN 4: layer harness HOT-RELOAD (gpu key change mid-run) ---
+  lsfg-vk: frame generation on the game's own device 'AMD Radeon RX 9070 XT (RADV GFX1201)'
+  lsfg-vk: gpu change requires restart to take effect
+  harness: OK
+
+--- exit codes (captured from the live runs above) ---
+run1 cli debug same-device: EXIT=0
+run2 harness same-device:   SAME_EXIT=0
+run3 harness cross-pair:    CROSS_EXIT=0  (full cross-device context creation incl.
+                            negotiation, LINEAR dma-buf export/import, SYNC_FD pools)
+run4 harness hot-reload:    RELOAD_EXIT=0
+
+--- harness provenance ---
+source: /tmp/opencode/t13-harness.cxx (throwaway, not committed)
+links: lsfg-vk-layer/src/{instance,swapchain}.cpp + liblsfg-vk-{backend,common}.a
+scenarios driven via LSFGVK_CONFIG file profiles + LSFGVK_PROFILE=t13 override;
+cross scenario = gpu "AMD Radeon RX 9060 XT (RADV GFX1200)" vs game 9070 XT.

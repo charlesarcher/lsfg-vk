@@ -1,0 +1,66 @@
+# task-5-issue-159-dual-gpu evidence — 2026-08-23T22:16:33-05:00
+branch=feat/dual-gpu head=55a43ac
+
+== BUILD (/tmp/opencode/build-t5, Release) ==
+NOTE: first verification build (22:13) was fully green exit 0 / 0 warnings.
+During evidence capture, lsfg-vk-common/image.cpp was mid-edit by a concurrent
+worker (todo 2) -> two transient full-build failures in FOREIGN files.
+Per brief: waited + rebuilt; own TUs proven clean via targeted object builds
+(make lsfg-vk-cli/CMakeFiles/lsfg-vk-cli.dir/src/tools/debug.cpp.o src/main.cpp.o -> exit 0, no warnings).
+Final full rebuild after foreign edit settled:
+  cmake --build /tmp/opencode/build-t5 -j32 -> exit 0, warnings=0
+  [100%] Built target lsfg-vk-cli
+
+== A/B SAME-DEVICE RUN (4 frames, 640x360, m=2) ==
+baseline: /home/archerc/code/lsfg-vk/build/lsfg-vk-cli/lsfg-vk-cli debug -d $DLL -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' <frames>
+new     : /tmp/opencode/build-t5/... debug -d $DLL -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' --render-gpu 'AMD Radeon RX 9070 XT (RADV GFX1201)' <frames>
+baseline_exit=0 new_exit=0
+stdout diff: IDENTICAL
+stderr diff: IDENTICAL
+(stderr = radv non-conformant warning only, present in both)
+
+== NEGATIVE PATH: unknown --render-gpu ==
+error: failed to find specified GPU: Nonexistent GPU
+exit=1 (named selector error fires against the RENDER gpu while -g was valid => exporter selector consumes render_gpu)
+
+== REGRESSION: new binary with --render-gpu omitted ==
+exit=0
+
+== RUNNER DRY-LIST ==
+== lsfg-vk dual-GPU matrix (dry list, nothing executed) ==
+dll:      /mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll
+cli bin:  /home/archerc/code/lsfg-vk/build/lsfg-vk-cli
+out root: /home/archerc/code/lsfg-vk/.omo/evidence/task-15-issue-159-dual-gpu
+
+pair: navi48-to-navi48
+  renderer/exporter (--render-gpu): AMD Radeon RX 9070 XT (RADV GFX1201)
+  processor (-g):                   AMD Radeon RX 9070 XT (RADV GFX1201)
+  log dir:                          /home/archerc/code/lsfg-vk/.omo/evidence/task-15-issue-159-dual-gpu/navi48-to-navi48
+  planned command:
+    "/home/archerc/code/lsfg-vk/build/lsfg-vk-cli" debug -d "$LSFGVK_DLL_PATH" \
+        -g "AMD Radeon RX 9070 XT (RADV GFX1201)" --render-gpu "AMD Radeon RX 9070 XT (RADV GFX1201)" -w 640 -h 360 <frames-dir>
+
+pair: intel-to-navi48
+  renderer/exporter (--render-gpu): Intel(R) Graphics (ARL)
+  processor (-g):                   AMD Radeon RX 9070 XT (RADV GFX1201)
+  log dir:                          /home/archerc/code/lsfg-vk/.omo/evidence/task-15-issue-159-dual-gpu/intel-to-navi48
+  planned command:
+    "/home/archerc/code/lsfg-vk/build/lsfg-vk-cli" debug -d "$LSFGVK_DLL_PATH" \
+        -g "AMD Radeon RX 9070 XT (RADV GFX1201)" --render-gpu "Intel(R) Graphics (ARL)" -w 640 -h 360 <frames-dir>
+
+pair: navi48-to-intel
+  renderer/exporter (--render-gpu): AMD Radeon RX 9070 XT (RADV GFX1201)
+  processor (-g):                   Intel(R) Graphics (ARL)
+  log dir:                          /home/archerc/code/lsfg-vk/.omo/evidence/task-15-issue-159-dual-gpu/navi48-to-intel
+  planned command:
+    "/home/archerc/code/lsfg-vk/build/lsfg-vk-cli" debug -d "$LSFGVK_DLL_PATH" \
+        -g "Intel(R) Graphics (ARL)" --render-gpu "AMD Radeon RX 9070 XT (RADV GFX1201)" -w 640 -h 360 <frames-dir>
+
+dry_exit=0
+live mode: exits 1 with 'not implemented yet (plan todo 15)'
+bash -n: clean; shellcheck: NOT INSTALLED on this machine (skipped)
+
+== NOTES ==
+- VK_LAYER_KHRONOS_validation NOT installed on this rig -> validation-stderr assertion deferred to todo 15 (noted per task brief).
+- Rig deviceNames carry RADV suffixes: 'AMD Radeon RX 9070 XT (RADV GFX1201)', 'AMD Radeon RX 9060 XT (RADV GFX1200)', 'Intel(R) Graphics (ARL)'; selectors use exact string equality.
+- opts.render_gpu.value_or(opts.gpu) as literally written does not compile (optional<string>::value_or needs string-convertible arg); implemented semantic equivalent ternary-of-optionals.

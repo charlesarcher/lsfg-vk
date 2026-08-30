@@ -1,0 +1,95 @@
+================================================================================
+task-17 issue-159 dual-gpu: cross-device E2E blockers (deadlock + format) fixed
+================================================================================
+Scope: BLOCKER-1 scheduleFramesCross/layer recycle-wait deadlock on SYNC_FD-
+exported semaphores (RADV GFX1200/GFX1201); BLOCKER-2 modifier-0 mapped to
+plain VK_IMAGE_TILING_LINEAR rejected by RADV for exchange usages; LATENT TRAP
+CommandBuffer::submit back()-on-empty-vector. Same-device paths untouched.
+
+[1] PROBE A - OLD PATTERN (wait-after-export) HANGS RADV
+    command: timeout 10 stdbuf -o0 /tmp/opencode/syncfd-export-probe
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+device: AMD Radeon RX 9060 XT (RADV GFX1200)
+step1: sema signaled via empty submit
+step2: exported sync fd=4
+step3: poll=1 revents=1 (POLLIN=1)
+    -> rc=124 (HANG confirmed): signal -> exportFd(SYNC_FD) -> poll POLLIN ->
+       wait source = infinite hang inside vkQueueSubmit on RADV GFX1200.
+
+[2] PROBE B - NEW PATTERN (fresh-per-cycle sems, no post-export local waits)
+    100 cycles per device per destruction timing; capture edge alternates
+    temp-import-fd and host-signal(-1) paths; strict 1:1 waiter property.
+part B RESULT: OK 100/100 cycles (deferred, AMD Radeon RX 9070 XT (RADV GFX1201))
+part B RESULT: OK 100/100 cycles (immediate, AMD Radeon RX 9070 XT (RADV GFX1201))
+part B RESULT: OK 100/100 cycles (deferred, AMD Radeon RX 9060 XT (RADV GFX1200))
+part B RESULT: OK 100/100 cycles (immediate, AMD Radeon RX 9060 XT (RADV GFX1200))
+
+[3] PROBE B UNDER VK_LAYER_KHRONOS_validation - DESTRUCTION TIMING DECISION
+part B RESULT: OK 100/100 cycles (deferred, AMD Radeon RX 9070 XT (RADV GFX1201))
+    validation errors (deferred): 0
+part B RESULT: OK 100/100 cycles (immediate, AMD Radeon RX 9070 XT (RADV GFX1201))
+    validation errors (immediate): 21
+Validation Error: [ VUID-vkDestroySemaphore-semaphore-05149 ] | MessageID = 0x93e24db1
+The Vulkan spec states: All submitted batches that refer to semaphore must have completed execution (https://docs.vulkan.org/spec/latest/chapters/synchronization.html#VUID-vkDestroySemaphore-semaphore-05149)
+    DECISION: brief's literal "destroy immediately after export" trips VUID-
+    vkDestroySemaphore-semaphore-05149 under validation (would fail the zero-
+    validation-error gate). DEVIATION (sanctioned by brief's escape clause):
+    fresh-per-cycle creation kept, destruction DEFERRED one cycle behind the
+    cmdbufFence/renderFence gates which prove the referencing batches done.
+
+[4] PROBE C - MODIFIER-0 VIA DRM-MODIFIER PATH, ALL ORDERED RIG PAIRS
+    create+bind+export on A, import+bind+layout-query on B; usages =
+    exchange source {TRANSFER_DST|SAMPLED} and dest {STORAGE|SAMPLED|TRANSFER_SRC}
+    FINDING: vkGetImageSubresourceLayout on DRM-modifier images REQUIRES
+    VK_IMAGE_ASPECT_MEMORY_PLANE_0_BIT_EXT on ANV (COLOR_BIT returns zeros;
+    RADV tolerates both). image.cpp queryRowPitch updated accordingly.
+    18/18 pairs OK at pitch 2560 (640*4), incl. ANV<->RADV both directions.
+
+[5] BUILD (integrated tree, /tmp/opencode/build-t17, Release)
+    baseline: rc=0 warnings=0 | post-change: rc=0 warnings=0
+[ 97%] Built target lsfg-vk-cli
+[100%] Linking CXX shared library liblsfg-vk-layer.so
+[100%] Built target lsfg-vk-layer
+
+[6] SAME-DEVICE REGRESSION (Navi48, -w 640 -h 360 -m 2, validation ON)
+    debug:   baseline rc=0 waits=8 vuid=0 | post rc=0 waits=8 vuid=0
+    stdout/stderr diff (modulo radv not-conformant noise): BYTE-IDENTICAL
+    benchmark -t 3 legacy flags: baseline 1223.00 gen-fps -> post 1202.33 gen-fps (noise)
+    benchmark 640x360 m=2:       baseline 1780.67 gen-fps -> post 1961.67 gen-fps (noise)
+
+[7] FULL MATRIX LIVE (scripts/run-matrix.sh unchanged; runner output = evidence)
+   exit=0 waits=8/8 -> PASS
+== pair 'invalid-renderer': --render-gpu 'LSFGVK-Matrix-Bogus-GPU' -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' (expect=invalid)
+   exit=1 waits=0/8 -> PASS
+
+== matrix summary ==
+  pair                          result
+  navi48-to-navi48             PASS
+  intel-to-navi48              PASS
+  navi48-to-intel              PASS
+  invalid-renderer             PASS
+
+matrix RESULT: PASS (all pairs green)
+
+[8] PER-PAIR VALIDATION GREP (Validation Error|VUID)
+    navi48-to-navi48: 0 hits
+    intel-to-navi48: 0 hits
+    navi48-to-intel: 0 hits
+    invalid-renderer: 0 hits
+
+[9] CROSS-PAIR MODE PROOF (grep gates from the runner)
+lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk: processing on '00000000040000000000000000000000' (game on 'Intel(R) Graphics (ARL)')
+lsfg-vk: processing on 'Intel(R) Graphics (ARL)' [uuid 8680677d060000000002000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk: processing on '8680677d060000000002000000000000' (game on 'AMD Radeon RX 9070 XT (RADV GFX1201)')
+
+[10] FILES CHANGED
+ M .omo/plans/issue-159-dual-gpu.md
+ M lsfg-vk-backend/include/lsfg-vk-backend/lsfgvk.hpp
+ M lsfg-vk-backend/src/lsfgvk.cpp
+ M lsfg-vk-common/include/lsfg-vk-common/vulkan/image.hpp
+ M lsfg-vk-common/src/vulkan/command_buffer.cpp
+ M lsfg-vk-common/src/vulkan/image.cpp
+ M lsfg-vk-layer/src/swapchain.cpp
+ M lsfg-vk-layer/src/swapchain.hpp

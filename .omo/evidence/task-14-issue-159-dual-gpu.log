@@ -1,0 +1,58 @@
+# task-14 verification log — build + per-context matrix + regression
+generated: 2026-08-24T01:10:16-05:00  branch: feat/dual-gpu  head: cfad975
+
+===============================================================
+[1] BUILD: cmake --build /tmp/opencode/build-t14 (isolated dir)
+    final result: EXIT=0 WARN=0 ERR=0
+    (one transient foreign failure in lsfg-vk-cli/debug.cpp from the
+     concurrent todo-15 worker; waited ~50s, rebuilt once -> green)
+[ 90%] Building CXX object lsfg-vk-cli/CMakeFiles/lsfg-vk-cli.dir/src/tools/debug.cpp.o
+[ 93%] Linking CXX executable lsfg-vk-cli
+[100%] Built target lsfg-vk-cli
+
+===============================================================
+[2] PER-CONTEXT MATRIX — harness /tmp/opencode/t14-harness/matrix.cpp
+    scenario BAA (cross-first): exit 0, both branches share ONE backend
+---- matrix_fixed BAA stdout:
+CONTEXT_B created (expect processing-on log above)
+CONTEXT_A1 created (expect same-device log above)
+CONTEXT_A2 created (expect same-device log above)
+MATRIX_OK: BAA order, both branches live on one shared backend
+---- matrix_fixed BAA stderr (radv notices filtered):
+lsfg-vk: using profile with name '(environment)' (identified via override)
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk: processing on '00000000040000000000000000000000' (game on 'AMD Radeon RX 9060 XT (RADV GFX1200)')
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: frame generation on the game's own device 'AMD Radeon RX 9070 XT (RADV GFX1201)'
+lsfg-vk: frame generation on the game's own device 'AMD Radeon RX 9070 XT (RADV GFX1201)'
+
+    scenario ABA (same-first): exit 1 = DOCUMENTED gate-ordering limitation
+---- matrix_fixed ABA stdout:
+CONTEXT_A1 created (expect same-device log above)
+---- matrix_fixed ABA stderr (radv notices filtered):
+lsfg-vk: using profile with name '(environment)' (identified via override)
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk: frame generation on the game's own device 'AMD Radeon RX 9070 XT (RADV GFX1201)'
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: processing on '00000000040000000000000000000000' (game on 'AMD Radeon RX 9060 XT (RADV GFX1200)')
+t14-harness: FAILED: failed to create swapchain context
+- dma-buf exchange required (exporter uuid 00000000870000000000000000000000, selected uuid 00000000040000000000000000000000) but the instance was created without the dma-buf extensions; reconstruct backend::Instance with enableDmaBufExtensions=true
+
+===============================================================
+[3] SAME-DEVICE DEBUG REGRESSION (VK_LAYER_KHRONOS_validation)
+    cmd: lsfg-vk-cli debug -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' -d <Lossless.dll> -w 640 -h 360 /tmp/opencode/t5-frames
+    EXIT=0; validation stderr clean (only radv conformance notices)
+---- stdout tail:
+lsfg-vk-debug: wait ok 1
+lsfg-vk-debug: wait ok 2
+lsfg-vk-debug: wait ok 3
+lsfg-vk-debug: wait ok 4
+---- stderr (radv notices filtered):
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+lsfg-vk: frame generation on the game's own device 'AMD Radeon RX 9070 XT (RADV GFX1201)'

@@ -1,0 +1,52 @@
+# task-14 fd-scan proof — induced mid-negotiation throw, /proc/self/fd accounting
+# harness: /tmp/opencode/t14-harness/fdscan.cpp
+#   PHASE A = 3x Swapchain ctor against a gate-OFF backend with a DIFFERENT
+#             game device uuid -> openContext hard-errors inside
+#             validateExchangeDescriptors AFTER all exchange fds were exported,
+#             duplicated and the timeline syncFd created (the flagged window).
+#   PHASE B = control: successful same-device context open+close roundtrip x2.
+# scenario geometry: multiplier=2 -> 2 source + 1 dest exchange fds.
+#
+# fd ledger for PHASE A per attempt:
+#   layer creates: 3 exchange originals + 3 desc dups + syncFd original
+#                  (+1 syncFd dup in fixed builds only)
+#   prefix (HEAD): syncFd original + 3 desc dups leak  => steady +4/attempt
+#   fixed  (t14):  syncFd original janitor-closed; cross-device hands the
+#                  ORIGINAL to openContext (backend provably never consumes
+#                  it); only the 3 desc dups leak (documented T13 residual)
+#                                                     => steady +3/attempt
+
+===== PREFIX (git HEAD a4af910, pre-fix) =====
+PHASE_A baseline=6
+PHASE_A attempt=1 fds=12 delta=6      # +2 one-time error-path init, then +4
+PHASE_A attempt=2 fds=16 delta=10     # +4/attempt steady-state leak
+PHASE_A attempt=3 fds=20 delta=14     # +4/attempt steady-state leak
+PHASE_B baseline=21
+PHASE_B r1 alive fds=22 delta=1
+PHASE_B r1 closed fds=22 delta=1      # +1 one-time process residual (see below)
+PHASE_B r2 alive fds=19 delta=1       # (rerun with 2 rounds)
+PHASE_B r2 closed fds=19 delta=1      # NOT per-context: one-time only
+
+===== FIXED (t14 worktree) =====
+PHASE_A baseline=6
+PHASE_A attempt=1 fds=11 delta=5      # +2 one-time error-path init, then +3
+PHASE_A attempt=2 fds=14 delta=8      # +3/attempt steady-state (desc dups only)
+PHASE_A attempt=3 fds=17 delta=11     # +3/attempt steady-state (desc dups only)
+PHASE_B baseline=18
+PHASE_B r1 alive fds=19 delta=1
+PHASE_B r1 closed fds=19 delta=1
+PHASE_B r2 alive fds=19 delta=1       # one-time residual confirmed non-growing
+PHASE_B r2 closed fds=19 delta=1
+
+# VERDICT
+# - flagged syncFd window: FIXED. prefix leaked the syncFd ORIGINAL on every
+#   openContext pre-import failure (+4/attempt); fixed leaks zero sync fds
+#   (+3/attempt, -1 per attempt vs prefix, exactly the flagged fd).
+# - remaining +3/attempt = handed descriptor DUPLICATES on early openContext
+#   failure: documented-pre-existing T13 residual (frozen backend contract
+#   leaves unconsumed descriptor fds caller-owned; closing them from the layer
+#   risks double-closing driver-consumed fd numbers). Bounded: multiplier+1
+#   once per failed context creation.
+# - PHASE_B success path returns to baseline modulo a ONE-TIME +1 process
+#   residual present IDENTICALLY in prefix and fixed builds (first-success
+#   driver/iostream allocation; round 2 proves it does not grow per context).

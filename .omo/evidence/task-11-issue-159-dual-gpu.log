@@ -1,0 +1,42 @@
+# task-11 evidence — Pipeline-cache keying by driver UUID (issue-159-dual-gpu)
+Date: 2026-08-23 · Build dir: /tmp/opencode/build-t11 (Release) · Baseline warnings: 0 → new warnings: 0
+
+## Change
+`lsfg-vk-backend/src/lsfgvk.cpp` only:
+- `findCacheFilePath(std::array<uint8_t,16> driverUuid)` (:196-224): filename
+  `lsfg-vk_pipeline_cache_<32 lowercase hex chars>.bin`; XDG_CACHE_HOME → $HOME/.cache → /tmp
+  chain preserved; best-effort prune of legacy `lsfg-vk_pipeline_cache.bin` in the resolved
+  directory via `std::filesystem::remove(path, ec)` (ENOENT/any error silently ignored).
+- `createVulkanInstance` wiring: selector wrapper queries VkPhysicalDeviceIDProperties.driverUUID
+  of the SELECTED device and assigns the path into an lvalue `std::optional<path>` passed to the
+  vk::Vulkan ctor. Safe because vk::Vulkan initializes phys_dev (selector runs) before
+  pipelineCache/cachefile members ([class.base.init] declaration-order guarantee). vulkan.cpp
+  untouched; cache creation/validation logic untouched.
+
+## Build tail (exit=0, grep -ci warning = 0)
+[ 97%] Built target lsfg-vk-layer
+[100%] Linking CXX executable lsfg-vk-cli
+[100%] Built target lsfg-vk-cli
+
+## Behavioral proof (isolated XDG_CACHE_HOME dirs, lsfg-vk-cli benchmark -t 2, all exit 0)
+1. AMD RX 9070 XT (RADV GFX1201) → t11-cache-a:
+   lsfg-vk_pipeline_cache_414d442d4d4553412d44525600000000.bin   ("AMD-MESA-DRV" ASCII + 00x4)
+2. Intel(R) Graphics (ARL) → t11-cache-b:
+   lsfg-vk_pipeline_cache_186bb135fb15df24d2242d934ac847ae.bin   (DISTINCT file ⇒ two drivers ⇒ two caches)
+3. dummy legacy `lsfg-vk_pipeline_cache.bin` placed in t11-cache-a + AMD rerun:
+   before: keyed file + legacy file present → after: ONLY keyed file remains (legacy pruned);
+   same keyed name as run 1 ⇒ AMD↔AMD sessions share ONE cache.
+4b. Second AMD card RX 9060 XT (RADV GFX1200) into t11-cache-a: still exactly ONE keyed file
+   (same driver UUID ⇒ legitimately shared cache — corrected acceptance criterion verified).
+4c. Fallback legs:
+   - XDG_CACHE_HOME=/tmp/opencode/t11-ro (chmod 500): exit 0, no crash, nothing written there
+     (XDG honored when set, cache I/O best-effort — identical to pre-change behavior).
+   - XDG unset, HOME=/tmp/opencode/t11-home: /tmp/opencode/t11-home/.cache/lsfg-vk_pipeline_cache_414d...bin ✓
+   - XDG unset + HOME unset: /tmp/lsfg-vk_pipeline_cache_414d...bin ✓ (cleaned up after proof)
+
+Benchmark sanity: AMD 9070 XT run reported fps (generated): 1299.50fps (in family of ~1255 baseline).
+
+## Constraints honored
+- No edits outside lsfgvk.cpp findCacheFilePath region + its immediate call-site wiring in
+  createVulkanInstance (buffer zone; todo 7 :551-627 / todo 9 InstanceImpl untouched).
+- vulkan.cpp createPipelineCache/persistPipelineCache logic byte-identical.

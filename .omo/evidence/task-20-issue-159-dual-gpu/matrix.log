@@ -1,0 +1,25 @@
+== lsfg-vk dual-GPU matrix (live) ==
+dll:      /mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll
+cli bin:  /home/archerc/code/lsfg-vk/build/lsfg-vk-cli/lsfg-vk-cli
+out root: /home/archerc/code/lsfg-vk/.omo/evidence/task-20-issue-159-dual-gpu
+frames:   8 x 640x360, multiplier 2 -> 8 waits/pair
+
+== pair 'navi48-to-navi48': --render-gpu 'AMD Radeon RX 9070 XT (RADV GFX1201)' -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' (expect=same)
+   exit=0 waits=8/8 -> PASS
+== pair 'intel-to-navi48': --render-gpu 'Intel(R) Graphics (ARL)' -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' (expect=cross)
+   cross-gate OK: processing uuid 00000000.. == 'AMD Radeon RX 9070 XT (RADV GFX1201)' != game 'Intel(R) Graphics (ARL)'
+   exit=0 waits=8/8 -> PASS
+== pair 'navi48-to-intel': --render-gpu 'AMD Radeon RX 9070 XT (RADV GFX1201)' -g 'Intel(R) Graphics (ARL)' (expect=cross)
+   cross-gate OK: processing uuid 8680677d.. == 'Intel(R) Graphics (ARL)' != game 'AMD Radeon RX 9070 XT (RADV GFX1201)'
+   exit=0 waits=8/8 -> PASS
+== pair 'invalid-renderer': --render-gpu 'LSFGVK-Matrix-Bogus-GPU' -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' (expect=invalid)
+   exit=1 waits=0/8 -> PASS
+
+== matrix summary ==
+  pair                          result
+  navi48-to-navi48             PASS
+  intel-to-navi48              PASS
+  navi48-to-intel              PASS
+  invalid-renderer             PASS
+
+matrix RESULT: PASS (all pairs green)

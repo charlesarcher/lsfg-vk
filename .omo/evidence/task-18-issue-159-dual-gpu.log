@@ -1,0 +1,78 @@
+# task-18 (F2 fd-discipline fixes) evidence — 2026-08-24T02:52:09-05:00 — branch feat/dual-gpu
+
+## diff of the two hunks (git diff -w)
+diff --git a/lsfg-vk-backend/src/lsfgvk.cpp b/lsfg-vk-backend/src/lsfgvk.cpp
+index 52575a8..f413418 100644
+--- a/lsfg-vk-backend/src/lsfgvk.cpp
++++ b/lsfg-vk-backend/src/lsfgvk.cpp
+@@ -908,12 +908,20 @@ std::vector<int> Context::scheduleFrames(int captureReadyFd) {
+ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
+     // fresh capture-completion semaphore for THIS cycle. consuming the fd
+     // up front keeps the "consumed regardless of success" contract even if
+-    // the fence gate below throws; the semaphore itself is safe to destroy
+-    // on that path since nothing was submitted against it yet.
++    // semaphore creation or the fence gate below throws; on the creation
++    // path nothing was submitted against it yet, so closing the caller's
++    // fd is the only cleanup owed.
+     // an fd of -1 means the capture already completed; per spec that behaves
+     // like an already-signaled sync fd, emulated by queue-signaling directly
+     // (host signaling of binary semaphores is unsupported).
+-    auto captureSem = createSyncFdSemaphore(this->ctx.vk);
++    auto captureSem = [&]() {
++        try {
++            return createSyncFdSemaphore(this->ctx.vk);
++        } catch (...) {
++            if (captureReadyFd >= 0) close(captureReadyFd);
++            throw;
++        }
++    }();
+     if (captureReadyFd >= 0) {
+         importSyncFdSemaphore(this->ctx.vk, captureSem.handle(), captureReadyFd);
+     } else {
+diff --git a/lsfg-vk-layer/src/swapchain.cpp b/lsfg-vk-layer/src/swapchain.cpp
+index da79edc..805665b 100644
+--- a/lsfg-vk-layer/src/swapchain.cpp
++++ b/lsfg-vk-layer/src/swapchain.cpp
+@@ -545,6 +545,11 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
+ 
+         cmdbuf.end(vk);
+         if (this->crossDevice) {
++            // ownership transfers unconditionally into importSyncFd
++            // (consumes on success, closes on failure), so the janitor must
++            // stop tracking before the transfer happens
++            janitor.consumed = i + 1;
++
+             // wait for this generated frame via its sync fd; an fd of -1
+             // means the frame already completed, so the wait is skipped
+             if (doneFds.at(i) >= 0) {
+@@ -553,10 +558,6 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
+                 waitSemaphores.push_back(this->doneWaitSemaphores.at(i).handle());
+             }
+ 
+-            // the fd is consumed by the import (or was -1), so the janitor
+-            // must stop tracking it before anything can throw again
+-            janitor.consumed = i + 1;
+-
+             cmdbuf.submit(vk,
+                 waitSemaphores, VK_NULL_HANDLE, 0,
+                 signalSemaphores, VK_NULL_HANDLE, 0,
+
+## build tail (/tmp/opencode/build-f2fix, Release)
+[ 95%] Building CXX object lsfg-vk-cli/CMakeFiles/lsfg-vk-cli.dir/src/main.cpp.o
+[ 97%] Linking CXX executable lsfg-vk-cli
+[ 97%] Built target lsfg-vk-cli
+[100%] Linking CXX shared library liblsfg-vk-layer.so
+[100%] Built target lsfg-vk-layer
+warnings/errors in build log: 1
+
+## same-device debug (-w 640 -h 360, validation layers): exit 0, waits=8, val-errors=0
+
+## matrix summary (LSFGVK_MATRIX_OUT=.omo/evidence/f2fix)
+== matrix summary ==
+  pair                          result
+  navi48-to-navi48             PASS
+  intel-to-navi48              PASS
+  navi48-to-intel              PASS
+  invalid-renderer             PASS
+
+matrix RESULT: PASS (all pairs green)

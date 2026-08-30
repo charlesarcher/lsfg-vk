@@ -1,0 +1,36 @@
+# task-2-issue-159-dual-gpu.log — DMA-BUF export/import + modifier/LINEAR-aware images in vk::Image
+
+## Build (/tmp/opencode/build-t2, Release)
+$ cmake -B /tmp/opencode/build-t2 -S . -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/opencode/build-t2 -j20
+[100%] Built target lsfg-vk-layer  (also: lsfg-vk-common, lsfg-vk-backend, lsfg-vk-cli)
+grep -iE "warning|error" over full build output: NO MATCHES (baseline=0 warnings, zero new)
+
+## Legacy smoke (OPAQUE_FD optimal-tiled path intact)
+$ /tmp/opencode/build-t2/lsfg-vk-cli/lsfg-vk-cli benchmark \
+    -g "AMD Radeon RX 9070 XT (RADV GFX1201)" \
+    -d "/mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll"
+exit code: 0
+benchmark results (ran for 10 seconds):
+  iterations:       12047
+  generated frames: 12047
+  total frames:     24095
+  fps (generated):  1204.70fps
+  fps (total):      2409.50fps
+(note: CLI takes the dll via -d/--dll or home-dir search; LSFGVK_DLL_PATH is only honored by the
+layer config path when LSFGVK_ENV=1 — env var alone does not affect the CLI tools)
+
+## Notes
+- Validation layers NOT installed on this rig; VK_LAYER_KHRONOS_validation assertions skipped.
+- clangd/LSP reports false pp_file_not_found errors on image.cpp because compile_commands.json is
+  only exported for Debug builds (CMakeLists.txt:22); authoritative compiler build is green.
+- vkGetImageSubresourceLayout chosen over vkGetImageSubresourceLayout2: both exchange formats are
+  single-plane color formats, no pNext metadata needed, core-1.0 availability (Layout2 would need
+  VK_KHR_maintenance5/Vulkan 1.4).
+- Import memory-type selection: vkGetMemoryFdPropertiesKHR(DMA_BUF).memoryTypeBits ∩
+  reqs.memoryTypeBits, device-local preferred within intersection, any-bit fallback; plain
+  findMemoryTypeIndex retained ONLY for own allocations and the legacy OPAQUE_FD import.
+- fd hygiene: imported fd close()d on GetMemoryFdPropertiesKHR failure, empty-intersection, and
+  vkAllocateMemory failure (ownership NOT transferred); on success driver owns it. Exported fds
+  from exportDmaBuf()/legacy exportFd out-param are caller-owned.
+- git diff -w verified: only intended hunks across the four owned files; semaphore/exchange/
+  CMakeLists changes in tree belong to concurrent todos 3/4 and are NOT staged by this commit.

@@ -1,0 +1,17 @@
+=== task-1 issue-159-dual-gpu evidence 2026-08-23T22:12:30-05:00 ===
+--- build tail (cmake --build /tmp/opencode/build-t1 -j20) ---
+[ 97%] Linking CXX shared library liblsfg-vk-layer.so
+[100%] Linking CXX executable lsfg-vk-cli
+[100%] Built target lsfg-vk-layer
+[100%] Built target lsfg-vk-cli
+warning count: 0
+(validation layers NOT installed on this rig - runtime layer assertions skipped)
+--- t1-uuidtest run ---
+card2 (9070 XT): deviceUUID=00-00-00-00-04-00-00-00-00-00-00-00-00-00-00-00- driverUUID=41-4d-44-2d-4d-45-53-41-2d-44-52-56-00-00-00-00-
+card3 (9060 XT): deviceUUID=00-00-00-00-87-00-00-00-00-00-00-00-00-00-00-00- driverUUID=41-4d-44-2d-4d-45-53-41-2d-44-52-56-00-00-00-00-
+card2: dmaBuf=1 drmModifier=1 syncFdSem=1 syncFdFence=1
+card3: dmaBuf=1 drmModifier=1 syncFdSem=1 syncFdFence=1
+card2 raw: semFeatures=0x3 semExportFromImported=0x11 fenceFeatures=0x3 fenceExportFromImported=0x9
+card3 raw: semFeatures=0x3 semExportFromImported=0x11 fenceFeatures=0x3 fenceExportFromImported=0x9
+PASS: device UUIDs distinct
+TEST_EXIT=0

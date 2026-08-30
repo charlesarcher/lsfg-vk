@@ -1,0 +1,25 @@
+=== task-9 evidence: backend conditional dma-buf extensions + selected-device accessors (2026-08-23T23:26:23-05:00) ===
+
+--- BUILD (own dir /tmp/opencode/build-t9, Release) ---
+[ 97%] Linking CXX shared library liblsfg-vk-layer.so
+[ 97%] Built target lsfg-vk-layer
+[100%] Linking CXX executable lsfg-vk-cli
+[100%] Built target lsfg-vk-cli
+warnings/errors: 0 (baseline=0)
+
+--- DEFAULT-OFF RUN: lsfg-vk-cli debug over 4 frames, -g 'AMD Radeon RX 9070 XT (RADV GFX1201)' (exit=0) ---
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+exit code was: 0 stdout lines
+ASSERTION default-off ext list == legacy set {VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore}: PASS (line above shows exactly these three, no dma-buf/drm-modifier exts)
+
+--- GATED-ON HARNESS (/tmp/opencode/t9-harness.cpp linked vs liblsfg-vk-common.a), AMD device ---
+/tmp/opencode/t9-harness.err:lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+/tmp/opencode/t9-harness.err:lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+/tmp/opencode/t9-harness.out:gate-off uuid=00000000870000000000000000000000 dmaBuf=1 drmModifier=1
+/tmp/opencode/t9-harness.out:gate-on uuid=00000000870000000000000000000000 dmaBuf=1 drmModifier=1
+ASSERTION gate-on appends VK_EXT_external_memory_dma_buf + VK_EXT_image_drm_format_modifier after legacy three: PASS
+ASSERTION gate-on uuid == gate-off uuid (same selected device): PASS
+
+--- PUBLIC API SURFACE compile-only static_assert check (t9-api-check): OK ---

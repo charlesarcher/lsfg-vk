@@ -1,0 +1,31 @@
+# task-12 evidence — backend ingestion of exchange descriptors (2026-08-24T05:09Z)
+
+## Build (/tmp/opencode/build-t12, gcc 16.2.1, default flags)
+[ 97%] Built target lsfg-vk-cli
+[100%] Linking CXX shared library liblsfg-vk-layer.so
+[100%] Built target lsfg-vk-layer
+warnings: 0
+
+## API compile proof (both descriptor kinds + legacy shapes + UI 3-arg ctor)
+PASS
+
+## Same-device regression: debug over t5-frames (plain)
+exit=0
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: processing on 'AMD Radeon RX 9060 XT (RADV GFX1200)' [uuid 00000000870000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+
+## Equal -g/--render-gpu debug run (gate OFF)
+2
+legacy-ext-only instance lines above; exit 0
+
+## Benchmark (3s)
+  generated frames: 7110
+  total frames:     14221
+  fps (generated):  2370.00fps
+  fps (total):      4740.33fps
+
+## Gated cross-pair init (-g 9060 --render-gpu 9070): gate flips ON, clean guard error
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore
+lsfg-vk: enabling device extensions: VK_KHR_external_memory_fd VK_KHR_external_semaphore_fd VK_KHR_timeline_semaphore VK_EXT_external_memory_dma_buf VK_EXT_image_drm_format_modifier
+lsfg-vk: processing on 'AMD Radeon RX 9060 XT (RADV GFX1200)' [uuid 00000000870000000000000000000000], dma-buf: yes, drm-modifier-images: yes
+error: debug tool cannot run cross-device yet: -g and --render-gpu must select the same device
