@@ -1,0 +1,30 @@
+=== mid-run engine capture 20:15:00 2026-08-29 ===
+--- available busy% sysfs attrs ---
+  card1: 
+  card2: gpu_busy_percent mem_busy_percent vcn_busy_percent 
+  card3: gpu_busy_percent mem_busy_percent vcn_busy_percent 
+--- baseline gpu_busy_percent (idle) ---
+  card1: n/a
+  card2: n/a
+  card3: 4
+--- gpu_busy_percent DURING run (4 samples, 1s apart) ---
+  sample 1 (20:15:07):
+    card1: n/a
+    card2: 13
+    card3: 13
+  sample 2 (20:15:08):
+    card1: n/a
+    card2: 15
+    card3: 16
+  sample 3 (20:15:09):
+    card1: n/a
+    card2: 15
+    card3: 16
+  sample 4 (20:15:10):
+    card1: n/a
+    card2: 16
+    card3: 16
+--- gem_names on 9060 XT (card3 = 0000:87:00.0, the doubler) DURING run ---
+  name     size handles refcount
+--- app clean-shutdown banner count: 1 ---
+--- app stream line: lsfg-vk-app: stream from 'AMD Radeon RX 9070 XT (RADV GFX1201)' 500x500 VkFormat(44) ---

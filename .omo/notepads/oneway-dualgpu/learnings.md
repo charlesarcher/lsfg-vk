@@ -401,3 +401,75 @@ docs(measure): rfc 550 one-way reply draft
 - Verdict: `.omo/evidence/oneway/_final-f1.md`
 - Baseline logs: `.omo/evidence/oneway/baseline-twoway-debug.log`, `.omo/evidence/oneway/baseline-twoway-vkcube.log`
 - Task 11 reference: `.omo/evidence/oneway/t11-matrix/report.md`
+
+---
+
+## 2026-08-29 Demo: frame-doubling proof + two app fixes
+
+### Objective
+End-to-end demo of one-way frame doubling and an answer to "how are you proving
+the frames were doubled by the lossless scaling algo" (user reported ghosting
+and artifacting).
+
+### Demo runs (evidence: `.omo/evidence/oneway/demo-2026-08-29/`)
+- **runA-old** (pre-fix binaries): two spectacle stills 4 s apart, pixel-diffed →
+  **two distinct ~300×300 animating regions** (game window + old 500×500
+  overlay) = the reported **ghosting**. Cube color (70, 77, 69), green-leaning,
+  R−B ≈ 0 = the reported **artifacting** (hardcoded R8G8B8A8 swapchain vs the
+  native B8G8R8A8 X visual).
+- **runB-new** (fixed build, 45 s): **2,144 `[gen x 1 + real]` cycles**;
+  per-second stats **57 fps game / 114 fps presented → ratio 2.0092** over 36
+  samples; presented − game = 57.7 fps generated; **clean SIGINT exit in 54 ms**;
+  mid-run doubler-card (`card3` = 9060 XT) `gpu_busy_percent` 4 % → 13–16 %;
+  cube color (67, 80, 82) matches the standalone-vkcube ground truth (60, 77, 79)
+  → native-format fix verified.
+- **runC-wayland** (current build, 30 s soak): **stall reproduced** — 1 cycle
+  then blocked in `AcquireNextImageKHR`; while blocked in the Vulkan call the
+  SIGINT handler cannot flip the stop flag the loop polls, so `kill -INT` is a
+  no-op there (TERM/KILL needed). Known issue #1 stands; workaround is
+  `--session x11`.
+- **ref-vkcube-standalone**: ground-truth vkcube (no layer) for the color check.
+- `analyze.py` → `analysis.md`: offline-reproducible proof (ratio, engine,
+  visual, color, shutdown) over the committed evidence.
+
+### App fixes (shipped as `fix(app)`)
+1. **SIGINT mid-stream was a no-op.** `onSigInt` only wrote the self-pipe;
+   `g_stop` was never set, and the present loop (which owns the thread once a
+   game connects) polls only `conn.fd()` — so a stream that was running could
+   not be stopped (old binary needed SIGTERM). Fix: handler now sets
+   `g_stop`; the loop's 200 ms poll → ≤200 ms reaction (measured 54 ms).
+2. **Per-second stats were stranded in the idle branch.** The stats block only
+   ran when `poll()` timed out (no frame pending), so it never printed during a
+   live stream, and its `slots 2/2, queued 0` was hardcoded. Fix: `maybeStats`
+   runs from both branches and reports the *measured* game fps (FRAME count)
+   and presented fps (`presentedFrames` = `destCount + 1` per cycle) — the
+   ratio is the observable multiplier and the core of the proof.
+
+### Tooling learnings (this rig)
+- X-side capture is dead (KWin-under-Wayland X server is content-less:
+  x11grab/Xlib GetImage return empty). **`spectacle -b -n` works headless** for
+  real 2560×1440 stills at ~0.23 s/shot (≈4.3 fps) — fine for stills and timed
+  bursts, too slow for a 240 Hz frame-by-frame discriminator.
+- KWin `org.kde.KWin.ScreenShot2.CaptureScreen` exists but rejects non-authorized
+  callers; `ext_screencopy_manager_v1` global not exposed; portal ScreenCast is
+  interactive-gated → **no high-fps screen capture exists here**. The
+  cadence-ratio proof (app stats) + mid-run engine busy% are the primary
+  evidence instead.
+- amdgpu `gem_names` (debugfs) is empty even mid-run on this kernel/driver;
+  `gpu_busy_percent` (sysfs) is the usable engine-ownership signal. The
+  `amdgpu_ring_*` debugfs files are binary ring state — pre/post byte diffs are
+  an activity trace, not counters.
+- DRM card → PCI: `card1` = `00:02.0` (Intel ARL), `card2` = `04:00.0`
+  (9070 XT), `card3` = `87:00.0` (9060 XT).
+- `VkFormat(44)` = B8G8R8A8_UNORM — the negotiated one-way exchange format
+  (matches the X visual → no channel swap).
+- dbus-next (python3.14): only async `MessageBus(bus_type=...,
+  negotiate_unix_fd=True)`; `bus.call(msg)` (no `send_request`);
+  `add_message_handler(handler)` takes one callable; KWin fd-passing works,
+  authorization is the blocker.
+
+### Status
+- Committed: `fix(app)` (SIGINT + live stats), guide refresh with the verified
+  demo record + proof methodology, and the 2026-08-29 demo evidence.
+- Open: Wayland app-backend stall (known issue #1); finite-timeout
+  `AcquireNextImageKHR` + commit pacing are the likely fixes.

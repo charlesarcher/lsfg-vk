@@ -1,0 +1,1 @@
+shutdown: app SIGINT at 19:57:07, exited cleanly (no TERM/KILL fallback)

@@ -1,0 +1,11 @@
+lsfg-vk: using profile with name 'vkcube-oneway' (identified via executable)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+Selected GPU 1: AMD Radeon RX 9070 XT (RADV GFX1201), type: DiscreteGpu, apiVersion: 4211042 (1.4.354), driverVersion: 109060097 (26.2.1) 
+lsfg-vk: external presentation active (game on 'AMD Radeon RX 9070 XT (RADV GFX1201)', app on socket)
+lsfg-vk: external stream error: lsfg-vk: external stream error: no free staging slots within 500 ms (app stalled)
+lsfg-vk: something went wrong during lsfg-vk swapchain presentation:
+- lsfg-vk: external stream error: no free staging slots within 500 ms (app stalled)
+lsfg-vk: external stream error: lsfg-vk: external stream error: no free staging slots within 500 ms (app stalled)
+lsfg-vk: something went wrong during lsfg-vk swapchain presentation:
+- lsfg-vk: external stream error: no free staging slots within 500 ms (app stalled)
