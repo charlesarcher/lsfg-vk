@@ -473,3 +473,59 @@ and artifacting).
   demo record + proof methodology, and the 2026-08-29 demo evidence.
 - Open: Wayland app-backend stall (known issue #1); finite-timeout
   `AcquireNextImageKHR` + commit pacing are the likely fixes.
+
+---
+
+## 2026-08-29 Wayland backend stall — fixed
+
+### Symptom
+`--session wayland`: 1 `[gen x 1 + real]` cycle then silent stall; SIGINT no-op
+(needed SIGKILL); layer side: `no free staging slots within 500 ms (app
+stalled)`. (Repro: `.omo/evidence/oneway/demo-2026-08-29/runD-debug/`.)
+
+### Root cause (gdb 17.2 + strace + ss, sudo attach — yama blocks unprivileged
+ptrace on this box)
+Main thread backtrace while stalled:
+`processEvents → wl_display_dispatch → wl_display_dispatch_queue_timeout →
+ppoll([{fd=10, events=POLLIN}], 1, NULL, NULL)` — an INFINITE ppoll on the
+Wayland socket, which showed Recv-Q 0. Two compounding defects:
+1. **`processEvents` used the blocking `wl_display_dispatch` (default queue)
+   after a poll.** The wl_buffer release listeners live on RADV's OWN event
+   queue (RADV creates its own queue for its WSI objects). When the bytes poll
+   signalled carried only RADV-queue events, `wl_display_read_events` consumed
+   them, the default-queue dispatch found nothing, and `wl_display_dispatch`
+   looped into a blocking ppoll on the now-empty socket — permanent deadlock.
+2. **Three `AcquireNextImageKHR(UINT64_MAX)`** in the present loop: even with a
+   safe pump, an infinite block inside RADV makes the stop flag (SIGINT) and
+   resize checks unreachable.
+
+### Fix (`fix(app)`)
+- `backend_wayland.cpp` processEvents: after the poll, drain with
+  `do wl_display_dispatch_pending while (r > 0)` — non-blocking, routes every
+  read byte to its own queue. processEvents(0) strictly non-blocking,
+  processEvents(N) bounded by N ms.
+- `presentation.cpp`: `acquireImage` helper — `AcquireNextImageKHR` with a
+  200 ms timeout; on VK_TIMEOUT: `processWsiEvents(0)` + stop check + retry;
+  throws on hard errors, returns false on stop. Replaces all three UINT64_MAX
+  sites; stop mid-cycle breaks the present loop cleanly.
+
+### Verification
+- Wayland 60 s soak: **9,088 cycles** (vs F1 target ≥3,828; Task 11 was 4,503),
+  `149 fps game / 300 fps presented` → ratio 2.005, 0 app errors, SIGINT exit
+  56 ms, `shutting down` banner. DBG run confirmed the window is honored by
+  KWin: `toplevel configure 2560x1440 states=[2]` (fullscreen), compositor
+  frame callbacks observed (`wl_surface frame callback #N`), stills show the
+  fullscreen scaled cube (motion 64%×66%, color (65,81,83) ≈ ground truth).
+- X11 regression 30 s: 1,744 cycles, ratio 2.010, 0 errors, SIGINT 53 ms —
+  unchanged.
+- Game-side errors at shutdown are the documented `Connection reset by peer`
+  burst only; zero mid-stream errors.
+
+### Learning
+- Wayland + Vulkan: the client's default event queue is NOT where the driver's
+  WSI events land (RADV uses its own queue for wl_buffer releases). Any
+  blocking default-queue dispatch after a poll is a deadlock hazard whenever
+  foreign-queue bytes arrive; drain with `dispatch_pending` loops instead.
+- `poll(fd, 1, 0)` is non-blocking (0 ms); `ppoll(fd, ..., NULL, NULL)` is
+  infinite — the timeout conventions differ (and libwayland's blocking
+  dispatch internally uses the NULL-timeout ppoll).

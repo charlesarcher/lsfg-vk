@@ -1,0 +1,13 @@
+lsfg-vk: using profile with name 'vkcube-oneway' (identified via executable)
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+WARNING: radv is not a conformant Vulkan implementation, testing use only.
+Selected GPU 1: AMD Radeon RX 9070 XT (RADV GFX1201), type: DiscreteGpu, apiVersion: 4211042 (1.4.354), driverVersion: 109060097 (26.2.1) 
+lsfg-vk: external presentation active (game on 'AMD Radeon RX 9070 XT (RADV GFX1201)', app on socket)
+lsfg-vk: external stream error: send() on ipc socket failed: Broken pipe
+lsfg-vk: something went wrong during lsfg-vk swapchain presentation:
+- lsfg-vk: external stream error: send FRAME failed: send() on ipc socket failed: Broken pipe
+- send() on ipc socket failed: Broken pipe
+lsfg-vk: external stream error: poll() on ipc socket failed: Connection reset by peer
+lsfg-vk: something went wrong during lsfg-vk swapchain presentation:
+- lsfg-vk: external stream error: poll() on ipc socket failed: Connection reset by peer
+- poll() on ipc socket failed: Connection reset by peer
