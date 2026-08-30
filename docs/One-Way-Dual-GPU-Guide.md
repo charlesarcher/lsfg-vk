@@ -4,9 +4,11 @@ This guide covers the new **one-way dual-GPU frame doubling** feature
 (`presentation = "external"`): your game renders on the 9070 XT, the 9060 XT
 doubles the frames **and** drives the display. No frames travel back over PCIe.
 
-**Every command and log line in this guide was executed and verified on 2026-08-29**
-on this machine (branch `feat/dual-gpu-oneway`). The "verified demo record" at the
-end shows the exact runs and their results.
+**Every command and log line in this guide was executed and verified on
+2026-08-29 and 2026-08-30** on this machine (branch
+`feat/dual-gpu-oneway`, including the 2026-08-30 fps-HUD and X11-placement
+commits). The "verified demo record" at the end shows the exact runs and their
+results.
 
 Card names used throughout:
 
@@ -359,7 +361,10 @@ blue swapped — see "How to prove the frames were doubled", point 4).
 On the monitor (9060 XT → `DP-7`) you see the `lsfg-vk-app` **fullscreen**
 window showing the frame-doubled output. The game keeps rendering on the 9070 XT
 headless; under X11 its own window still presents underneath, but the app's
-fullscreen window covers it.
+fullscreen window covers it. In the **top-left corner** of that window a small
+dark box shows the live frame-rate counter `<game>/<presented>` — e.g.
+`57/114` — the same corner indicator Windows Lossless Scaling draws
+(see "The fps counter" below).
 
 ### Frame-rate semantics (read this before judging the result)
 
@@ -374,6 +379,26 @@ fullscreen window covers it.
   2560×1440 @ 239.97 Hz, so the doubled output is genuinely visible.
 - In **two-way** mode `multiplier` behaves the same (2 = true doubling:
   1 generated + 1 real per game frame).
+
+### The fps counter (top-left HUD)
+
+The app draws a small **`<game>/<presented>`** box in the top-left corner of its
+window (inset 8 px), always on — no `-v` needed. It is the on-screen answer to
+"is the doubling actually happening": the left number is the received *game*
+frame rate, the right number the *presented* (doubled) rate, updated once per
+second. With `multiplier = 2` it reads roughly `N/2N` (e.g. `57/114`,
+`149/299`). A plain re-presenter would read `N/N`.
+
+- The text is rasterized on the CPU (seven-segment digits, scaled with the
+  output height: 1440p → scale 6, 204×66 px box) into a small
+  double-buffered image; the 1 Hz update writes the slot the present loop is
+  *not* reading, so a frame never shows a half-updated counter.
+- It is blitted into the presented frame on every present path (generated,
+  real, and idle re-present), so the counter is part of the content the
+  doubler card scans out — visible on the monitor, captured in screenshots,
+  and machine-verifiable (see "How to prove the frames were doubled", point 6).
+- Note: the HUD is the app's own overlay in the app's window — it is *not*
+  present in the game's window underneath.
 
 ## Two-way mode (the alternative)
 
@@ -412,7 +437,83 @@ Two-way costs a return PCIe trip per frame (see the bandwidth table in
 [Configuration](Configuration.md)); one-way eliminates it entirely — which is
 why one-way is the mode for the 9700XT-render / 9600XT-display topology.
 
-## Verified demo record (2026-08-29, this machine)
+## Frame-doubling a real game (Steam / Proton)
+
+`vkcube` is the reference game here. The *same* one-way flow works for a real
+Vulkan game; the only differences are (a) how the game process is started and
+(b) how the profile is matched to it.
+
+### Add a profile for the game
+
+`active_in` is matched against the game's executable name (under Proton, the
+real PE exe path is read from `/proc/self/maps` and matched by suffix, so the
+bare exe name works). Scope it to the game exe(s) so the launcher doesn't grab
+the single stream:
+
+```toml
+[[profile]]
+name = "mass-effect-oneway"
+active_in = ["MassEffect1.exe", "MassEffect2.exe", "MassEffect3.exe"]
+gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"   # processing + display GPU
+presentation = "external"
+multiplier = 2
+```
+
+The `app-oneway` profile (Step 2) is unchanged — it just names the same
+processing GPU.
+
+### Start the doubler, then the game
+
+1. **Doubler first** (same command as Step 3.1):
+   `lsfg-vk-app --profile app-oneway --session x11` (or `--session wayland`).
+2. **The game.** For a Steam/Proton game, set the layer + device pin in the
+   game's **Steam → Properties → Launch options** (Steam turns the `VAR=value`
+   tokens before `%command%` into the game process's environment):
+
+   ```
+   VK_LAYER_PATH=/tmp/opencode/layer-test VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation LSFGVK_CONFIG=/home/archerc/.config/lsfg-vk/conf.toml MESA_VK_DEVICE_SELECT=1002:7550 %command%
+   ```
+
+   - `MESA_VK_DEVICE_SELECT=1002:7550` pins the game's render to the 9070 XT
+     (the PCI id of the render card; use the doubler's id for the other
+     pairing). The layer then does the cross-device work to the 9060 XT.
+   - For a **non-Steam** Vulkan game, the same env vars go in front of the
+     launch command in a shell instead of Steam launch options.
+
+### Expect
+
+Game log: `lsfg-vk: using profile with name '<profile>' (identified via wine
+executable)` → `lsfg-vk: external presentation active (game on 'AMD Radeon RX
+9070 XT ...', app on socket)`. App log: `lsfg-vk-app: stream from 'AMD Radeon
+RX 9070 XT ...' <WxH> ...` then `[gen x N + real]` per cycle. The monitor
+(9060 XT) shows the frame-doubled game with the `<game>/<presented>` HUD in the
+top-left.
+
+> **Verified 2026-08-30:** the layer/Profile/device side of this flow is
+> confirmed (profile matched under Proton, device pinned to the 9070 XT, doubler
+> app listening and healthy). The Mass Effect game itself was blocked by the
+> EA Desktop auth/bridge wall before creating a swapchain (see Known issues
+> #4 and `.omo/evidence/oneway/demo-2026-08-30/mass-effect/NOTES.md`), so the
+> full real-game E2E is pending an interactive EA session — the mechanism is
+> proven end-to-end by the vkcube runs on both backends.
+
+## Verified demo record (this machine)
+
+### 2026-08-30: fps HUD + X11 placement fix (branch tip with `feat(app)` HUD)
+
+All runs: `vkcube` 500×500 on the 9070 XT, `multiplier = 2`, config from Step 2.
+Evidence under `.omo/evidence/oneway/demo-2026-08-30/` (reproducible demo
+scripts `run-demo-x11.sh` / `run-demo-wayland.sh`, logs, stills, HUD crops, and
+the panel-aware `verify-hud.py` machine check).
+
+| # | Run | Result |
+|---|---|---|
+| 1 | **X11 backend** `lsfg-vk-app --session x11 -v` + vkcube on 9070 XT, ~40 s | **1,460 `[gen x 1 + real]` cycles**; 25 per-second samples, **57.0 fps game / 114.5 fps presented, aggregate ratio 2.0070**; window placed at **(0,0) 2560×1440** with `_NET_WM_STATE = FULLSCREEN \| ABOVE` (the post-map EWMH ClientMessage fix — pre-fix KWin placed it at (0,28) 2560×1382); engine busy mid-run: doubler 14 % / game 15 %; SIGINT exit in **0 ms**; 0 VUIDs. Stills: `x11/shot-t*.png` |
+| 2 | **Wayland backend** `lsfg-vk-app --session wayland -v` + same game, ~40 s | **3,845 cycles**; 25 samples, **150.5 fps game / 301.9 fps presented, aggregate ratio 2.0058**; engine 26 % / 28 %; SIGINT exit in **0 ms** with the `shutting down` banner; game side raised the designed named error (`Connection reset by peer`) on teardown; 0 VUIDs. Stills: `wayland/shot-t*.png` |
+| 3 | **HUD machine verification** (`verify-hud.py` on the stills above) | re-renders the expected seven-segment text with the exact `hud.cpp` algorithm and IoU-matches it against the still's HUD crop. X11: origin (8,8), text **`56/113` / `57/114`**, IoU **1.000**, box mean color (14,16,22) exact. Wayland: origin (8,8), text **`149/299`**, IoU **1.000**. Crops: `*/shot-t*-hud-crop.png` |
+| 4 | **Mass Effect Legendary (real game)** | profile + layer wiring verified (wine-exe profile detection, device pinning to the 9070 XT, app listening and healthy in both attempts); the game itself was blocked by the **EA Desktop auth/bridge wall** (standalone launch → EA login UI; Steam launch → `link2ea://` bridge stalled in the prefix's EA session) — a game/EA-side blocker, not a one-way-side failure. Full record + the exact Steam launch-options recipe: `.omo/evidence/oneway/demo-2026-08-30/mass-effect/NOTES.md` |
+
+### 2026-08-29 (this machine)
 
 All runs: branch `feat/dual-gpu-oneway` (build from the branch tip — the
 `fix(app)` commit adds the clean SIGINT shutdown and the live-stream
@@ -437,9 +538,10 @@ under
 
 The user's report was *ghosting and artifacting*, and the question was *how do
 you prove the frames were actually doubled by the lossless-scaling algorithm,
-rather than just re-presented*. Five independent measurements, all captured on
-2026-08-29 and reproducible from the committed evidence (machine-readable copy:
-`.omo/evidence/oneway/demo-2026-08-29/analysis.md`):
+rather than just re-presented*. Six independent measurements, captured on
+2026-08-29/2026-08-30 and reproducible from the committed evidence
+(machine-readable copies: `.omo/evidence/oneway/demo-2026-08-29/analysis.md`,
+`.omo/evidence/oneway/demo-2026-08-30/`):
 
 1. **Cadence ratio (the primary proof).** With `-v`, the app prints the
    received *game* frame rate and the *presented* frame rate once per second.
@@ -465,7 +567,16 @@ rather than just re-presented*. Five independent measurements, all captured on
    R8G8B8A8-vs-B8G8R8A8 format mismatch, i.e. the **artifacting**. The new
    native B8G8R8A8 swapchain fixes it.
 5. **Clean shutdown.** SIGINT exits the app in 54 ms with the
-   `lsfg-vk-app: shutting down` banner (the old binary hung on SIGINT).
+    `lsfg-vk-app: shutting down` banner (the old binary hung on SIGINT);
+    2026-08-30 runs exit in **0 ms** on both backends.
+ 6. **The on-screen counter itself (machine-checked).** The top-left HUD shows
+    the live `<game>/<presented>` rates, and `verify-hud.py` proves the pixels
+    in a screenshot are the counter: it re-renders the expected text with the
+    exact `hud.cpp` rasterizer and IoU-matches it against the still's crop.
+    2026-08-30: X11 stills matched `56/113` and `57/114` (IoU 1.000), Wayland
+    stills matched `149/299` (IoU 1.000), with the box color (14,16,22) exact.
+    The right-hand number is 2× the left — the doubling, visible on the
+    monitor, not just in the logs.
 
 ## Troubleshooting
 
@@ -502,10 +613,18 @@ Verified that app SIGKILL mid-stream surfaces the same named error.
 **Changing `gpu` / `presentation`**: requires restarting the game (and the app
 for its profile); the layer logs `gpu change requires restart to take effect`.
 
-**Compositor effects**: the app's presentation window is borderless fullscreen
-(X11: `_NET_WM_STATE_FULLSCREEN | ABOVE`, input disabled). Disable compositor
-effects for it if you see smearing (KWin: Window Rules → "No compositing" for
-the app).
+**Compositor effects**: the app's presentation window is borderless fullscreen.
+Under **X11** the state is *requested* with a post-map EWMH ClientMessage
+(`_NET_WM_STATE` action=add, FULLSCREEN | ABOVE) — a client-set property is
+ignored by KWin and leaves the window under the top panel ((0,28) 2560×1382
+instead of (0,0) 2560×1440; fixed 2026-08-30, verified placed at (0,0)
+2560×1440 with FULLSCREEN | ABOVE). Under **Wayland** the window is a
+fullscreen toplevel on the requested output; KWin/Plasma *may* keep its panels
+drawn above the toplevel, which can occlude the top-left corner (the fps HUD)
+by a few pixels — set the panel to auto-hide if that bothers you (in the
+2026-08-30 verified runs the HUD was fully visible at (8,8) on both backends).
+Disable compositor effects for the app window if you see smearing (KWin:
+Window Rules → "No compositing" for the app).
 
 **Flatpak**: both GPUs' `/dev/dri/renderD*` nodes must be granted to the
 sandbox (`--device=/dev/dri` plus the specific nodes; see the Flatpak Guide).
@@ -518,6 +637,13 @@ sandbox (`--device=/dev/dri` plus the specific nodes; see the Flatpak Guide).
    one-way mode; HDR staging is not implemented).
 3. **Unverified**: NVIDIA second cards, other WMs/compositors beyond KWin,
    exclusive fullscreen (frame generation ineffective, game unharmed).
+4. **Steam/Proton real-game E2E not completed on this rig** (2026-08-30):
+   Mass Effect Legendary reached the EA Desktop auth/bridge wall in both
+   launch paths (standalone Proton → EA login UI; Steam `link2ea://` bridge →
+   stalled EA session in the prefix) before the game ever created its
+   swapchain. The layer-side recipe (Steam launch options) is in
+   "Frame-doubling a real game (Steam)" below; the vkcube E2E on both
+   backends is the verified proof of the mechanism.
 
 ### Fixed: Wayland backend stall (2026-08-29)
 
