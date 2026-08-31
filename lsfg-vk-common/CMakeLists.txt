@@ -15,6 +15,7 @@ set(COMMON_SOURCES
     "src/vulkan/semaphore.cpp"
     "src/vulkan/shader.cpp"
     "src/vulkan/timeline_semaphore.cpp"
+    "src/vulkan/timestamps.cpp"
     "src/vulkan/vulkan.cpp")
 
 add_library(lsfg-vk-common STATIC ${COMMON_SOURCES})

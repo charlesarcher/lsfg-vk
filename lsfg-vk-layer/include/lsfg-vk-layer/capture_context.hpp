@@ -9,6 +9,7 @@
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
+#include "lsfg-vk-common/vulkan/timestamps.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <array>
@@ -23,15 +24,17 @@ namespace lsfgvk::layer {
     struct SwapchainInfo;
 
     /// capture context for external presentation (one-way dual-GPU).
-    /// owns two exportable staging images on the game device, a capture
-    /// command buffer, per-slot sync-fd semaphores and the IPC stream to
-    /// the companion app. blits the presented image into the current
-    /// staging slot, exports the completion sync-fd over the socket, then
-    /// forwards the original present waiting on that same semaphore.
+    /// imports the two app-owned staging images (the app creates them in its
+    /// own local VRAM and hands the dma-buf fds over the socket), owns a
+    /// capture command buffer, per-slot sync-fd semaphores and the IPC stream
+    /// to the companion app. blits the presented image into the current
+    /// staging slot (a sequential A→B PCIe write), exports the completion
+    /// sync-fd over the socket, then forwards the original present waiting on
+    /// a separate semaphore.
     class CaptureContext {
     public:
-        /// create a capture context: IPC handshake (2 s deadline), staging
-        /// image creation at negotiated layout, export + handoff, semaphore ring.
+        /// create a capture context: IPC handshake (2 s deadline), import of the
+        /// app's two staging images at the negotiated layout, semaphore ring.
         /// @param vk vulkan wrapper for the game device (layer's wrapper)
         /// @param profile active game profile (must have presentation == External)
         /// @param info swapchain image metadata (extent/format/images)
@@ -68,12 +71,14 @@ namespace lsfgvk::layer {
         std::string gameDeviceName;
 
         // vulkan objects (created on the game device)
-        std::vector<vk::Image> stagingImages;
-        std::vector<vk::Semaphore> captureSemaphores;
+        std::vector<vk::Image> stagingImages; // imported from the app's dma-buf exports, TRANSFER_DST only
+        std::vector<vk::Semaphore> captureSemaphores; // recreated per cycle in present(), behind the fence gate
         std::vector<vk::Semaphore> presentSemaphores;
         ls::lazy<vk::CommandBuffer> captureCommandBuffer;
         ls::lazy<vk::Fence> captureFence;
         bool fenceSubmitted{false};
+        // GPU timestamp instrumentation of the capture blit (LSFGVK_TIMING=1)
+        vk::TimingRing timingRing;
 
         // IPC stream (exactly 2 slots, maps to backend's two sources)
         std::optional<ls::ipc::Connection> ipcConn;

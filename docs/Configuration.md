@@ -25,11 +25,12 @@ Next is a list of all available **profile** configuration options:
 - **Presentation / `presentation`**: Controls where generated frames are presented. **`game`** (default) — the layer presents generated frames back into the game's own swapchain on the game GPU (two-way mode). **`external`** — the layer hands frames to a separate `lsfg-vk-app` process running on the processing GPU, which presents them on its own swapchain (one-way mode). External mode requires `gpu` to be set (the processing GPU must be explicit). When `presentation = external`, the game GPU never imports frames back; all presentation happens on the processing GPU.
 - **Output / `output`**: Connector name for the external presentation swapchain (only used when `presentation = external`). Matches the DRM connector name exactly (e.g. `HDMI-A-3`, `DP-1`). If omitted, the primary/active output is selected automatically. Per-backend semantics: **Wayland** — matches the `xdg_output` logical name (e.g. `HDMI-A-3`); **X11** — matches the RandR output name (e.g. `HDMI-A-3`). An invalid name produces a named error listing available outputs.
 
-  | Scenario | Approx. PCIe traffic | Link requirement |
+  | Scenario | Measured PCIe traffic | Link requirement |
   | --- | --- | --- |
-  | 1440p SDR, 60 fps, multiplier 2 | ~1.8 GB/s | Any modern PCIe link suffices |
-  | 1440p SDR, 240 fps, multiplier 4 | ~14 GB/s | Requires a x8-class link or better |
+  | 1440p SDR, 60 fps, multiplier 2 | ~1.9 GB/s (copybench) | Any modern PCIe link suffices |
+  | 1440p SDR, 240 fps, multiplier 4 | ~7.6 GB/s (copybench) | Requires a x8-class link or better |
   | Added latency (Windows community measurements) | n/a | ~3-5 ms |
+  | Added latency (measured on this rig) | n/a | 0.8–9.4 ms (see analysis.md) |
 
   A step-by-step walkthrough with tested examples is available in the
   [Dual-GPU Setup Guide](Dual-GPU-Guide.md).

@@ -126,6 +126,40 @@ a real swapchain through the layer:
 | RX 9060 XT | RX 9070 XT | verified (CLI + live swapchain) |
 | any | itself | verified (legacy path, unchanged) |
 
+## Measured performance on this rig
+
+All measurements from the development rig (Intel Arrow Lake iGPU + RX 9070 XT + RX 9060 XT, Mesa 26.2.1, PCIe 5.0 x16). Full analysis in [measurements/analysis.md](../measurements/analysis.md).
+
+### Latency overhead (cross-device vs same-device)
+
+| Game GPU → Proc GPU | Resolution | Format | Mult | Delta (ms) |
+|---|---|---|---|---:|
+| Intel → 9060XT | 1440p | SDR | 2 | 8.3 |
+| Intel → 9070XT | 1440p | SDR | 2 | 8.3 |
+| 9070XT → 9060XT | 1440p | SDR | 2 | 2.2 |
+| 9060XT → 9070XT | 1440p | SDR | 2 | 7.9 |
+| 9060XT → Intel | 1440p | SDR | 2 | 0.8 |
+| 9070XT → Intel | 1440p | SDR | 2 | 0.8 |
+
+### Bandwidth utilization (copybench, PCIe 5.0 x16 ceiling = 63 GB/s)
+
+| Pair | Resolution | Format | Achieved | Utilization |
+|---|---|---|---:|---:|
+| 9060XT ↔ 9070XT | 1440p | SDR | 1.9–6.7 GB/s | 3–11% |
+| 9060XT ↔ 9070XT | 1440p | HDR | 3.2–11.3 GB/s | 5–18% |
+| AMD → Intel | 1440p | SDR | 17.8 GB/s | N/A (system mem) |
+| Intel → AMD | 1440p | SDR | 1.8 GB/s | N/A (system mem) |
+
+### Serialization headroom (1440p SDR)
+
+| GPU | 60→120 Hz (8.33 ms) | 240 Hz (4.17 ms) |
+|---|---|---|
+| RX 9060 XT | 3.22 ms (61% headroom) ✅ | 2.40 ms (42% headroom) ✅ |
+| RX 9070 XT | 1.14 ms (86% headroom) ✅ | 0.84 ms (80% headroom) ✅ |
+| Intel iGPU | 147 ms (misses) ❌ | 125 ms (misses) ❌ |
+
+> **Note:** Cross-device adds 1–10 ms copy overhead (see latency table). AMD↔AMD pairs may exceed budget at 240 Hz when cross-device. Intel iGPU cannot meet budget even same-device.
+
 ## When it fails
 
 Failures are loud and name your configuration. A `gpu` entry nothing

@@ -10,6 +10,7 @@
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
+#include "lsfg-vk-common/vulkan/timestamps.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <cstdint>
@@ -89,6 +90,9 @@ namespace lsfgvk::layer {
         ls::owned_ptr<ls::R<backend::Context>> ctx;
         size_t idx{1};
         size_t fidx{0}; // real frame index
+
+        // GPU timestamp instrumentation (enabled via LSFGVK_TIMING=1)
+        vk::TimingRing timingRing;
 
         ls::GameConf profile;
         SwapchainInfo info;

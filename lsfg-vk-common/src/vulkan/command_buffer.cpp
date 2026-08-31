@@ -197,6 +197,27 @@ void CommandBuffer::copyBufferToImage(const vk::Vulkan& vk,
     );
 }
 
+void CommandBuffer::writeTimestamp(const vk::Vulkan& vk, VkQueryPool pool, uint32_t query) const {
+    vk.df().CmdWriteTimestamp(*this->commandBuffer,
+        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, query);
+}
+
+void CommandBuffer::resetQueryPool(const vk::Vulkan& vk, VkQueryPool pool,
+        uint32_t firstQuery, uint32_t queryCount) const {
+    vk.df().CmdResetQueryPool(*this->commandBuffer, pool, firstQuery, queryCount);
+}
+
+bool CommandBuffer::getQueryPoolResults(const vk::Vulkan& vk, VkQueryPool pool,
+        uint32_t firstQuery, uint32_t queryCount,
+        uint64_t* data, bool wait) const {
+    const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT | (wait ? VK_QUERY_RESULT_WAIT_BIT : 0);
+    auto res = vk.df().GetQueryPoolResults(vk.dev(), pool, firstQuery, queryCount,
+        queryCount * sizeof(uint64_t), data, sizeof(uint64_t), flags);
+    if (res == VK_NOT_READY) return false;
+    if (res != VK_SUCCESS) throw ls::vulkan_error(res, "vkGetQueryPoolResults() failed");
+    return true;
+}
+
 void CommandBuffer::end(const vk::Vulkan& vk) const {
     auto res = vk.df().EndCommandBuffer(*this->commandBuffer);
     if (res != VK_SUCCESS)

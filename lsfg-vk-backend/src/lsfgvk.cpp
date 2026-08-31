@@ -14,6 +14,7 @@
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
+#include "lsfg-vk-common/vulkan/timestamps.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "shaderchains/alpha0.hpp"
 #include "shaderchains/alpha1.hpp"
@@ -165,6 +166,9 @@ namespace lsfgvk::backend {
 
         std::vector<vk::CommandBuffer> cmdbufs;
         vk::Fence cmdbufFence;
+
+        // GPU timestamp instrumentation (enabled via LSFGVK_TIMING=1)
+        vk::TimingRing timingRing;
 
         Ctx ctx;
 
@@ -693,6 +697,7 @@ ContextImpl::ContextImpl(const InstanceImpl& instance,
         crossDevice(exporterDeviceUUID != instance.getVulkan().deviceUUID()),
         cmdbufs(createCommandBuffers(instance.getVulkan(), dests.size() + 1)),
         cmdbufFence(instance.getVulkan()),
+        timingRing(instance.getVulkan(), "backend", 64),
         ctx(createCtx(instance, extent, hdr, flow, perf, dests.size())),
         mipmaps(ctx, sourceImages),
         alpha0{
@@ -872,17 +877,35 @@ std::vector<int> Context::scheduleFrames(int captureReadyFd) {
         throw backend::error("Timeout waiting for previous frame to complete");
     this->cmdbufFence.reset(this->ctx.vk);
 
+    // reset timing ring for this frame (N-32 readback happens before reset)
+    if (this->timingRing.enabled() && this->fidx >= 32) {
+        auto timing = this->timingRing.readFrame(this->fidx - 32);
+        if (timing) {
+            this->timingRing.writeCsvRow(*timing);
+        }
+    }
+
     // schedule pre-pass
     const auto& cmdbuf = this->cmdbufs.at(0);
     cmdbuf.begin(ctx.vk);
 
+    // Reset query pool for this frame
+    this->timingRing.resetFrame(cmdbuf.handle(), this->fidx);
+
+    // Timestamp: CopyIn (source ready barrier -> after mipmaps)
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyInStart, true);
     this->mipmaps.render(ctx.vk, cmdbuf, this->fidx);
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyInEnd, false);
+
+    // Timestamp: Flow (mipmaps + alpha/beta/gamma/delta chains)
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::MipmapsStart, true);
     for (size_t i = 0; i < 7; ++i) {
         this->alpha0.at(6 - i).render(ctx.vk, cmdbuf);
         this->alpha1.at(6 - i).render(ctx.vk, cmdbuf, this->fidx);
     }
     this->beta0.render(ctx.vk, cmdbuf, this->fidx);
     this->beta1.render(ctx.vk, cmdbuf);
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::AlphaBetaGammaDeltaEnd, false);
 
     cmdbuf.end(ctx.vk);
     cmdbuf.submit(this->ctx.vk,
@@ -899,6 +922,8 @@ std::vector<int> Context::scheduleFrames(int captureReadyFd) {
         const auto& cmdbuf = this->cmdbufs.at(i + 1);
         cmdbuf.begin(ctx.vk);
 
+        // Timestamp: Generate (gamma/delta chains + generate)
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GenerateStart, true);
         const auto& pass = this->passes.at(i);
         for (size_t j = 0; j < 7; j++) {
             pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
@@ -909,6 +934,11 @@ std::vector<int> Context::scheduleFrames(int captureReadyFd) {
             pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
         }
         pass.generate->render(ctx.vk, cmdbuf, this->fidx);
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GenerateEnd, false);
+
+        // Timestamp: CopyOut (dest write)
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyOutStart, true);
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyOutEnd, false);
 
         cmdbuf.end(ctx.vk);
         cmdbuf.submit(this->ctx.vk,
@@ -972,6 +1002,14 @@ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
         this->captureWait = std::move(captureSem);
         this->cmdbufFence.reset(this->ctx.vk);
 
+        // reset timing ring for this frame (N-32 readback happens before reset)
+        if (this->timingRing.enabled() && this->fidx >= 32) {
+            auto timing = this->timingRing.readFrame(this->fidx - 32);
+            if (timing) {
+                this->timingRing.writeCsvRow(*timing);
+            }
+        }
+
         // the pre-pass waits ONLY this cycle's capture semaphore: cross-cycle
         // ordering comes from the fences (cmdbufFence here, the layer's
         // renderFence on the game device), never from re-waiting exported
@@ -983,13 +1021,23 @@ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
         const auto& cmdbuf = this->cmdbufs.at(0);
         cmdbuf.begin(ctx.vk);
 
+        // Reset query pool for this frame
+        this->timingRing.resetFrame(cmdbuf.handle(), this->fidx);
+
+        // Timestamp: CopyIn (source ready barrier -> after mipmaps)
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyInStart, true);
         this->mipmaps.render(ctx.vk, cmdbuf, this->fidx);
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyInEnd, false);
+
+        // Timestamp: Flow (mipmaps + alpha/beta/gamma/delta chains)
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::MipmapsStart, true);
         for (size_t i = 0; i < 7; ++i) {
             this->alpha0.at(6 - i).render(ctx.vk, cmdbuf);
             this->alpha1.at(6 - i).render(ctx.vk, cmdbuf, this->fidx);
         }
         this->beta0.render(ctx.vk, cmdbuf, this->fidx);
         this->beta1.render(ctx.vk, cmdbuf);
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::AlphaBetaGammaDeltaEnd, false);
 
         cmdbuf.end(ctx.vk);
         cmdbuf.submit(this->ctx.vk,
@@ -1004,6 +1052,8 @@ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
             const auto& cmdbuf = this->cmdbufs.at(i + 1);
             cmdbuf.begin(ctx.vk);
 
+            // Timestamp: Generate (gamma/delta chains + generate)
+            this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GenerateStart, true);
             const auto& pass = this->passes.at(i);
             for (size_t j = 0; j < 7; j++) {
                 pass.gamma0.at(j).render(ctx.vk, cmdbuf, this->fidx);
@@ -1014,6 +1064,11 @@ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
                 pass.delta1.at(j - 4).render(ctx.vk, cmdbuf);
             }
             pass.generate->render(ctx.vk, cmdbuf, this->fidx);
+            this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GenerateEnd, false);
+
+            // Timestamp: CopyOut (dest write)
+            this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyOutStart, true);
+            this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::CopyOutEnd, false);
 
             // fresh done semaphore per generated frame per cycle: signaled by
             // exactly this submit and never waited on locally afterwards

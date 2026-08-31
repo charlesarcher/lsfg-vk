@@ -24,6 +24,17 @@
 using namespace lsfgvk::layer;
 
 namespace {
+    // TEMP DEBUG (Session 2, E7): per-present wall-clock breakdown of the
+    // game-thread present hook. gated by LSFGVK_LAYER_DBG=1; remove with the
+    // debug journal when the perf diagnosis is done.
+    [[maybe_unused]] const bool layerDbg{ std::getenv("LSFGVK_LAYER_DBG") != nullptr };
+    using SteadyClock = std::chrono::steady_clock;
+    [[maybe_unused]] auto g_layerDbgT0 = SteadyClock::now();
+    [[maybe_unused]] long long layerDbgMs(SteadyClock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            SteadyClock::now() - from).count();
+    }
+
     VkImageMemoryBarrier barrierHelper(VkImage handle,
             VkAccessFlags srcAccessMask,
             VkAccessFlags dstAccessMask,
@@ -52,7 +63,8 @@ namespace {
 CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         SwapchainInfo info, const std::string& gameDeviceName)
         : profile(std::move(profile)), info(std::move(info)),
-          gameDeviceName(gameDeviceName), vkPtr(&vk) {
+          gameDeviceName(gameDeviceName), vkPtr(&vk),
+          timingRing(vk, "layer-capture") {
     // only constructed for External presentation; caller guards this
     if (this->profile.presentation != ls::Presentation::External)
         throw ls::error("CaptureContext created for non-external presentation");
@@ -148,7 +160,13 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         throw;
     }
 
-    // --- create 2 exportable staging images on A at negotiated layout ------
+    // --- receive 2 staging-image handoffs from the app ----------------------
+    // the app owns the staging images (created in its OWN local VRAM on the
+    // processing device, exported as dma-buf). importing them TRANSFER_DST-only
+    // flips the PCIe traffic direction: the capture blit now WRITES each frame
+    // A→B as a sequential DMA transfer (~0.5-1.5 ms at 1440p) instead of the
+    // app re-reading A's VRAM as latency-bound texture samples (~13 ms).
+    // the layout must match the app's creation layout (NEGOTIATED carries it).
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     const VkExtent2D extent = this->info.extent;
 
@@ -166,28 +184,32 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     try {
         this->stagingImages.reserve(2);
         for (int i = 0; i < 2; ++i) {
+            auto msg = this->ipcConn->receive(std::chrono::milliseconds(2000));
+            if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
+                std::cerr << "lsfg-vk: external stream error: peer refused: " << err->message << "\n";
+                throw ls::error("lsfg-vk: external stream error: peer refused at STAGING: " + err->message);
+            }
+            if (!std::holds_alternative<ls::ipc::Staging>(msg)) {
+                const auto got = ls::ipc::typeOf(msg);
+                throw ls::error(std::string("lsfg-vk: external stream error: expected STAGING, got ")
+                    + ls::ipc::nameOf(got));
+            }
+            const int fd = this->ipcConn->takeReceivedFd();
+            if (fd < 0)
+                throw ls::error("lsfg-vk: external stream error: STAGING arrived without its fd");
+            // import consumes the fd on success; on failure the image closes it
             this->stagingImages.emplace_back(vk, extent, format,
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                std::nullopt, std::nullopt, layout);
+                fd /*importFd*/, std::nullopt /*exportFd*/, layout);
         }
-    } catch (const std::exception& e) {
-        throw ls::error("lsfg-vk: failed to create staging images", e);
-    }
-
-    // export + hand off (one SCM_RIGHTS fd per STAGING message)
-    try {
-        for (auto& img : this->stagingImages) {
-            const auto exp = img.exportDmaBuf(vk);
-            // the allocationSize/rowPitch from export should match negotiated,
-            // but we trust the negotiation; no hard check here
-            (void)exp.allocationSize;
-            this->ipcConn->attachFd(exp.fd);
-            this->ipcConn->send(ls::ipc::Staging{});
-            // attachFd ownership transferred to kernel; send closed our copy
-        }
-    } catch (const std::exception& e) {
+    } catch (const ls::ipc::socket_error& e) {
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
-        throw ls::error("lsfg-vk: external stream error: failed to export staging images", e);
+        throw ls::error("lsfg-vk: external stream error: STAGING deadline or socket failure", e);
+    } catch (const ls::error& e) {
+        if (std::string(e.what()).find("external stream error") != std::string::npos)
+            throw;
+        std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
+        throw ls::error(std::string("lsfg-vk: external stream error: ") + e.what(), e);
     }
 
     // wait for READY (2 s deadline as well)
@@ -331,6 +353,23 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         throw;
     }
 
+    // TEMP DEBUG (E7): wall-clock entry
+    const SteadyClock::time_point dbgEnter = layerDbg ? SteadyClock::now()
+                                                      : SteadyClock::time_point{};
+    auto dbgMs = [&dbgEnter]() { return layerDbgMs(dbgEnter); };
+    auto dbgLog = [&dbgMs, this](const char* phase) {
+        if (layerDbg)
+            std::cerr << "lsfg-vk-layer: [dbg] present: " << phase
+                      << " (fidx " << this->fidx << ") t+" << dbgMs() << " ms\n";
+    };
+    dbgLog("enter (post-drain)");
+
+    // read back capture-blit timing for frame fidx-4 (GPU has finished it)
+    if (this->timingRing.enabled() && this->fidx >= 4) {
+        if (auto timing = this->timingRing.readFrame(this->fidx - 4))
+            this->timingRing.writeCsvRow(*timing);
+    }
+
     size_t slot = 0;
     try {
         slot = this->selectFreeSlot();
@@ -338,13 +377,13 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
         throw;
     }
+    dbgLog("slot selected");
 
     if (imageIdx >= this->info.images.size())
         throw ls::error("swapchain image index out of range");
 
     const VkImage srcImage = this->info.images.at(imageIdx);
     const vk::Image& dstImage = this->stagingImages.at(slot);
-    const vk::Semaphore& sigSem = this->captureSemaphores.at(slot);
     const vk::Semaphore& presentSem = this->presentSemaphores.at(slot);
 
     // bounded fence wait for previous capture work before reusing command buffer
@@ -355,11 +394,25 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         this->captureFence->reset(vk);
         this->fenceSubmitted = false;
     }
+    dbgLog("prev-blit fence cleared");
+
+    // FRESH capture semaphore per cycle, replacing the previous one now that
+    // the fence gate proves its signal completed. re-signaling an already
+    // signaled binary semaphore is undefined, and its exported sync fd would
+    // read as signaled immediately - letting the app's pre-pass sample the
+    // staging image before this cycle's blit completes (ghosting under load).
+    // first present uses the ctor-created, never-signaled semaphores.
+    this->captureSemaphores.at(slot) = vk::Semaphore(vk, std::nullopt,
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+    const vk::Semaphore& sigSem = this->captureSemaphores.at(slot);
 
     // record blit info.images[imageIdx] -> staging[slot] waiting on game's
     // present wait-semaphores, signal slot's capture semaphore
     const auto& cmdbuf = *this->captureCommandBuffer;
     cmdbuf.begin(vk);
+    // capture blit GPU timing (GameCopyIn = swapchain -> staging A->B write)
+    this->timingRing.resetFrame(cmdbuf.handle(), this->fidx);
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInStart, true);
     cmdbuf.blitImage(vk,
         {
             barrierHelper(srcImage,
@@ -386,6 +439,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             ),
         }
     );
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInEnd, false);
     cmdbuf.end(vk);
 
     // submit the capture blit waiting on the game's present wait-semaphores
@@ -419,6 +473,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
         throw ls::error(std::string("lsfg-vk: external stream error: capture submit failed: ") + e.what(), e);
     }
+    dbgLog("blit submitted");
 
     // export sync-fd immediately after enqueue (copy transference)
     int syncFd = -1;
@@ -443,6 +498,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         throw ls::error(std::string("lsfg-vk: external stream error: send FRAME failed: ") + e.what(), e);
     }
 
+    dbgLog("FRAME sent");
     // mark slot busy until RELEASE
     this->slotFree.at(slot) = false;
     this->fidx++;
@@ -465,6 +521,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     auto res = vk.df().QueuePresentKHR(queue, &presentInfo);
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+    dbgLog("forwarded present returned (TOTAL)");
 
     return res;
 }

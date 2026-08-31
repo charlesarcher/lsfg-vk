@@ -248,6 +248,13 @@ namespace {
         return func;
     }
 
+    template<typename T>
+    T dpa_optional(const VulkanInstanceFuncs& funcs, VkDevice device, const char* name) {
+        T func = reinterpret_cast<T>(
+            funcs.GetDeviceProcAddr(device, name));
+        return func; // may be nullptr
+    }
+
     /// query the name of a physical device
     std::string queryDeviceName(const VulkanInstanceFuncs& fi, VkPhysicalDevice physdev) {
         VkPhysicalDeviceProperties2 props{
@@ -503,12 +510,17 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .BeginCommandBuffer = dpa<PFN_vkBeginCommandBuffer>(f, d, "vkBeginCommandBuffer"),
         .EndCommandBuffer = dpa<PFN_vkEndCommandBuffer>(f, d, "vkEndCommandBuffer"),
         .CmdPipelineBarrier = dpa<PFN_vkCmdPipelineBarrier>(f, d, "vkCmdPipelineBarrier"),
+        .CmdPipelineBarrier2 = dpa_optional<PFN_vkCmdPipelineBarrier2>(f, d, "vkCmdPipelineBarrier2"),
         .CmdBlitImage = dpa<PFN_vkCmdBlitImage>(f, d, "vkCmdBlitImage"),
         .CmdClearColorImage = dpa<PFN_vkCmdClearColorImage>(f, d, "vkCmdClearColorImage"),
         .CmdBindPipeline = dpa<PFN_vkCmdBindPipeline>(f, d, "vkCmdBindPipeline"),
         .CmdBindDescriptorSets = dpa<PFN_vkCmdBindDescriptorSets>(f, d, "vkCmdBindDescriptorSets"),
         .CmdDispatch = dpa<PFN_vkCmdDispatch>(f, d, "vkCmdDispatch"),
         .CmdCopyBufferToImage = dpa<PFN_vkCmdCopyBufferToImage>(f, d, "vkCmdCopyBufferToImage"),
+        .CmdCopyImage = dpa<PFN_vkCmdCopyImage>(f, d, "vkCmdCopyImage"),
+        .CmdCopyImage2 = dpa_optional<PFN_vkCmdCopyImage2>(f, d, "vkCmdCopyImage2"),
+        .CmdWriteTimestamp = dpa<PFN_vkCmdWriteTimestamp>(f, d, "vkCmdWriteTimestamp"),
+        .CmdResetQueryPool = dpa<PFN_vkCmdResetQueryPool>(f, d, "vkCmdResetQueryPool"),
         .QueueSubmit = dpa<PFN_vkQueueSubmit>(f, d, "vkQueueSubmit"),
         .AllocateDescriptorSets = dpa<PFN_vkAllocateDescriptorSets>(f, d,
             "vkAllocateDescriptorSets"),
@@ -544,6 +556,9 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .DestroyPipeline = dpa<PFN_vkDestroyPipeline>(f, d, "vkDestroyPipeline"),
         .GetImageSubresourceLayout = dpa<PFN_vkGetImageSubresourceLayout>(f, d,
             "vkGetImageSubresourceLayout"),
+        .CreateQueryPool = dpa<PFN_vkCreateQueryPool>(f, d, "vkCreateQueryPool"),
+        .DestroyQueryPool = dpa<PFN_vkDestroyQueryPool>(f, d, "vkDestroyQueryPool"),
+        .GetQueryPoolResults = dpa<PFN_vkGetQueryPoolResults>(f, d, "vkGetQueryPoolResults"),
 
         .SignalSemaphoreKHR = dpa<PFN_vkSignalSemaphoreKHR>(f, d, "vkSignalSemaphoreKHR"),
         .WaitSemaphoresKHR = dpa<PFN_vkWaitSemaphoresKHR>(f, d, "vkWaitSemaphoresKHR"),

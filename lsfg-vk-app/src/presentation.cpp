@@ -498,7 +498,8 @@ if (dbgEnabled())
             throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
         fence.reset(vk);
 
-        dbg("present: FRAME received, scheduleFrames start (fidx %zu)", fidx);
+        dbg("present: FRAME received (slot %u), scheduleFrames start (fidx %zu)",
+            frame->stagingIdx, fidx);
         std::vector<int> doneFds;
         try {
             doneFds = backend.scheduleFrames(*state.context, captureFd);
@@ -519,15 +520,20 @@ if (dbgEnabled())
             throw ls::error("backend returned " + std::to_string(doneFds.size())
                 + " done fds, expected " + std::to_string(destCount));
 
+        // wall-clock start of the present phase (blits + 2 presents + RELEASE)
+        const auto presentT0 = Clock::now();
         const VkExtent2D imgExtent{ w, h };
 
         // --- generated presents: one per destination image -----------------
         for (size_t i = 0; i < destCount; ++i) {
             // acquire a swapchain image (wait: acquireSem is always unsignaled).
             dbg("present: acquire gen %zu/%zu (fidx %zu)", i, destCount, fidx);
+            const auto acqT0 = Clock::now();
             uint32_t idx{};
             if (!acquireImage(idx))
                 break;
+            dbg("present: acquire gen BLOCKED %lld ms (fidx %zu)",
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - acqT0).count(), fidx);
             const VkImage dstImage = swapImages.at(idx);
 
             // wait for this generated frame via its sync fd.
@@ -577,6 +583,8 @@ if (dbgEnabled())
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
+            dbg("present: gen-present done, present-phase %lld ms (fidx %zu)",
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - presentT0).count(), fidx);
         }
         // a stop mid-generation loop must exit the present loop, not just the
         // per-destination for loop above.
@@ -586,9 +594,12 @@ if (dbgEnabled())
         // --- ONE real frame: blit the latest captured game frame -----------
         {
             dbg("present: acquire real (fidx %zu)", fidx);
+            const auto acqT1 = Clock::now();
             uint32_t idx{};
             if (!acquireImage(idx))
                 break;
+            dbg("present: acquire real BLOCKED %lld ms (fidx %zu)",
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - acqT1).count(), fidx);
             const VkImage dstImage = swapImages.at(idx);
 
             auto& srcImage = state.sourceImages.at(frame->stagingIdx);
@@ -634,6 +645,8 @@ if (dbgEnabled())
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
+            dbg("present: real-present done, present-phase TOTAL %lld ms (fidx %zu)",
+                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - presentT0).count(), fidx);
         }
 
         if (verboseEnabled())

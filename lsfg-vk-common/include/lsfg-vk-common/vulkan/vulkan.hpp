@@ -75,12 +75,17 @@ namespace vk {
         PFN_vkBeginCommandBuffer BeginCommandBuffer;
         PFN_vkEndCommandBuffer EndCommandBuffer;
         PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+        PFN_vkCmdPipelineBarrier2 CmdPipelineBarrier2;
         PFN_vkCmdBlitImage CmdBlitImage;
         PFN_vkCmdClearColorImage CmdClearColorImage;
         PFN_vkCmdBindPipeline CmdBindPipeline;
         PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
         PFN_vkCmdDispatch CmdDispatch;
         PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+        PFN_vkCmdCopyImage CmdCopyImage;
+        PFN_vkCmdCopyImage2 CmdCopyImage2;
+        PFN_vkCmdWriteTimestamp CmdWriteTimestamp;
+        PFN_vkCmdResetQueryPool CmdResetQueryPool;
         PFN_vkQueueSubmit QueueSubmit;
         PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
         PFN_vkFreeDescriptorSets FreeDescriptorSets;
@@ -111,6 +116,9 @@ namespace vk {
         PFN_vkCreateComputePipelines CreateComputePipelines;
         PFN_vkDestroyPipeline DestroyPipeline;
         PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
+        PFN_vkCreateQueryPool CreateQueryPool;
+        PFN_vkDestroyQueryPool DestroyQueryPool;
+        PFN_vkGetQueryPoolResults GetQueryPoolResults;
 
         // extension functions
         PFN_vkSignalSemaphoreKHR SignalSemaphoreKHR;
@@ -223,6 +231,10 @@ namespace vk {
         /// get the compute queue
         /// @return the compute queue handle
         [[nodiscard]] const auto& queue() const { return this->computeQueue; }
+
+        /// get the compute queue family index
+        /// @return the queue family index
+        [[nodiscard]] uint32_t queueFamilyIndex() const { return this->queueFamilyIdx; }
 
         /// check if fp16 is supported
         /// @return true if fp16 is supported

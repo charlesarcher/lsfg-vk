@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
@@ -116,6 +117,12 @@ TimingRing::TimingRing(const vk::Vulkan& vk, const std::string& side, size_t rin
             csv << "frame_idx,side,t_copyin_ns,t_flow_ns,t_generate_ns,t_copyout_ns,t_total_ns,t_gameside_in_ns,t_gameside_out_ns\n";
         }
     }
+
+    if (std::getenv("LSFGVK_TIMING_DBG")) {
+        std::fprintf(stderr, "[timing] %s: period=%g ns/unit validBitsMask=0x%llx\n",
+            side_.c_str(), timestampPeriod_,
+            static_cast<unsigned long long>(timestampValidBitsMask_));
+    }
 }
 
 TimingRing::~TimingRing() = default;
@@ -123,7 +130,12 @@ TimingRing::~TimingRing() = default;
 void TimingRing::writeTimestamp(VkCommandBuffer cmdbuf, Stage stage, bool isStart) const {
     if (!enabled_) return;
 
-    const uint32_t baseQuery = static_cast<uint32_t>(stage) * 2 + (isStart ? 0 : 1);
+    // per-frame query offset so each frame's timestamps live in its own ring
+    // slot (set by resetFrame, which is always issued once per frame before its
+    // writes); a fixed stage offset would let every frame overwrite the same
+    // queries and readback would never be coherent.
+    const uint32_t baseQuery = currentFrameSlot_ * queriesPerFrame_
+        + static_cast<uint32_t>(stage) * 2 + (isStart ? 0 : 1);
     vk_->df().CmdWriteTimestamp(cmdbuf,
         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
         *pool_, baseQuery);
@@ -132,84 +144,71 @@ void TimingRing::writeTimestamp(VkCommandBuffer cmdbuf, Stage stage, bool isStar
 void TimingRing::resetFrame(VkCommandBuffer cmdbuf, uint64_t frameIdx) const {
     if (!enabled_) return;
 
-    const uint32_t firstQuery = static_cast<uint32_t>(frameIdx % ringDepth_) * queriesPerFrame_;
+    currentFrameSlot_ = static_cast<uint32_t>(frameIdx % ringDepth_);
+    const uint32_t firstQuery = currentFrameSlot_ * queriesPerFrame_;
     vk_->df().CmdResetQueryPool(cmdbuf, *pool_, firstQuery, queriesPerFrame_);
 }
 
 std::optional<TimingRing::FrameTiming> TimingRing::readFrame(uint64_t frameIdx) {
     if (!enabled_) return std::nullopt;
 
-    const uint32_t firstQuery = static_cast<uint32_t>(frameIdx % ringDepth_) * queriesPerFrame_;
-
-    // Read all queries for this frame - non-blocking to avoid hangs on some hardware/drivers
+    const uint32_t baseQuery = static_cast<uint32_t>(frameIdx % ringDepth_) * queriesPerFrame_;
     const VkQueryResultFlags flags = VK_QUERY_RESULT_64_BIT;
-    auto res = vk_->df().GetQueryPoolResults(
-        vk_->dev(), *pool_, firstQuery, queriesPerFrame_,
-        readbackBuffer_.size() * sizeof(uint64_t),
-        readbackBuffer_.data(), sizeof(uint64_t), flags);
 
-    if (res == VK_NOT_READY) {
-        return std::nullopt;
-    }
-    if (res != VK_SUCCESS) {
-        throw ls::vulkan_error(res, "vkGetQueryPoolResults() failed");
-    }
-
-    // Apply valid bits mask and convert to nanoseconds
-    auto toNs = [this](uint64_t raw) -> uint64_t {
-        return static_cast<uint64_t>((raw & timestampValidBitsMask_) * timestampPeriod_);
+    // Each metric spans a start timestamp (written at stage S, query S*2+0) and
+    // an end timestamp (written at stage E, query E*2+1) - non-contiguous, so
+    // read the two queries separately. A whole-frame range read would stay
+    // VK_NOT_READY whenever any query in the span was never issued (the backend
+    // timestamps only 8 of the 28, the layer only the game-side stages).
+    // non-blocking (no WAIT bit) to avoid hangs on some hardware/drivers.
+    // return the masked RAW timestamp (unscaled); scaling is done on the
+    // start/end difference, not on the huge absolute values, because a float
+    // period applied to ~1e14-magnitude absolutes loses all low-order bits.
+    auto readQuery = [this, baseQuery, flags](uint32_t query) -> std::optional<uint64_t> {
+        uint64_t raw{};
+        auto res = vk_->df().GetQueryPoolResults(
+            vk_->dev(), *pool_, baseQuery + query, 1,
+            sizeof(raw), &raw, sizeof(uint64_t), flags);
+        if (res == VK_NOT_READY) return std::nullopt;
+        if (res != VK_SUCCESS) throw ls::vulkan_error(res, "vkGetQueryPoolResults() failed");
+        static thread_local int dbgCount = 0;
+        if (std::getenv("LSFGVK_TIMING_DBG") && dbgCount < 12) {
+            std::fprintf(stderr, "[timing] readQuery idx=%u res=%d raw=%llu\n",
+                baseQuery + query, res, static_cast<unsigned long long>(raw & timestampValidBitsMask_));
+            dbgCount++;
+        }
+        return raw & timestampValidBitsMask_;
+    };
+    // metric = (end - start) scaled to ns; subtract in the raw integer domain
+    // first so the small delta is not lost to float precision on the absolutes.
+    auto metric = [&, this](Stage startStage, Stage endStage) -> uint64_t {
+        const auto s = readQuery(static_cast<uint32_t>(startStage) * 2);
+        const auto e = readQuery(static_cast<uint32_t>(endStage) * 2 + 1);
+        if (!s || !e || *e <= *s) return 0;
+        return static_cast<uint64_t>((static_cast<double>(*e) - static_cast<double>(*s)) * timestampPeriod_);
     };
 
     FrameTiming timing{};
     timing.frameIdx = frameIdx;
 
-    // Backend stages (processing device)
-    // CopyIn: stage 0-1
-    if (queriesPerFrame_ > static_cast<uint32_t>(Stage::CopyInEnd) * 2 + 1) {
-        uint64_t copyInStart = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::CopyInStart) * 2]);
-        uint64_t copyInEnd = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::CopyInEnd) * 2]);
-        if (copyInEnd > copyInStart) timing.tCopyInNs = copyInEnd - copyInStart;
-    }
+    timing.tCopyInNs = metric(Stage::CopyInStart, Stage::CopyInEnd);
+    timing.tFlowNs = metric(Stage::MipmapsStart, Stage::AlphaBetaGammaDeltaEnd);
+    timing.tGenerateNs = metric(Stage::GenerateStart, Stage::GenerateEnd);
+    timing.tCopyOutNs = metric(Stage::CopyOutStart, Stage::CopyOutEnd);
+    timing.tGameSideInNs = metric(Stage::GameCopyInStart, Stage::GameCopyInEnd);
+    timing.tGameSideOutNs = metric(Stage::GameCopyOutStart, Stage::GameCopyOutEnd);
 
-    // Flow (mipmaps + alpha/beta/gamma/delta): stages 2-5
-    if (queriesPerFrame_ > static_cast<uint32_t>(Stage::AlphaBetaGammaDeltaEnd) * 2 + 1) {
-        uint64_t flowStart = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::MipmapsStart) * 2]);
-        uint64_t flowEnd = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::AlphaBetaGammaDeltaEnd) * 2]);
-        if (flowEnd > flowStart) timing.tFlowNs = flowEnd - flowStart;
-    }
-
-    // Generate: stages 6-7
-    if (queriesPerFrame_ > static_cast<uint32_t>(Stage::GenerateEnd) * 2 + 1) {
-        uint64_t genStart = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::GenerateStart) * 2]);
-        uint64_t genEnd = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::GenerateEnd) * 2]);
-        if (genEnd > genStart) timing.tGenerateNs = genEnd - genStart;
-    }
-
-    // CopyOut: stages 8-9
-    if (queriesPerFrame_ > static_cast<uint32_t>(Stage::CopyOutEnd) * 2 + 1) {
-        uint64_t copyOutStart = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::CopyOutStart) * 2]);
-        uint64_t copyOutEnd = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::CopyOutEnd) * 2]);
-        if (copyOutEnd > copyOutStart) timing.tCopyOutNs = copyOutEnd - copyOutStart;
-    }
-
-    // Game side (layer device) stages
-    // Game CopyIn: stages 10-11
-    if (queriesPerFrame_ > static_cast<uint32_t>(Stage::GameCopyInEnd) * 2 + 1) {
-        uint64_t gameInStart = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::GameCopyInStart) * 2]);
-        uint64_t gameInEnd = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::GameCopyInEnd) * 2]);
-        if (gameInEnd > gameInStart) timing.tGameSideInNs = gameInEnd - gameInStart;
-    }
-
-    // Game CopyOut: stages 12-13
-    if (queriesPerFrame_ > static_cast<uint32_t>(Stage::GameCopyOutEnd) * 2 + 1) {
-        uint64_t gameOutStart = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::GameCopyOutStart) * 2]);
-        uint64_t gameOutEnd = toNs(readbackBuffer_[static_cast<uint32_t>(Stage::GameCopyOutEnd) * 2]);
-        if (gameOutEnd > gameOutStart) timing.tGameSideOutNs = gameOutEnd - gameOutStart;
-    }
-
-    // Total = sum of all backend stages
     timing.tTotalNs = timing.tCopyInNs + timing.tFlowNs + timing.tGenerateNs + timing.tCopyOutNs;
 
+    if (std::getenv("LSFGVK_TIMING_DBG") && (frameIdx % 64) < 4) {
+        std::fprintf(stderr, "[timing] frame %llu: copyIn=%llu flow=%llu gen=%llu copyOut=%llu total=%llu\n",
+            static_cast<unsigned long long>(frameIdx),
+            static_cast<unsigned long long>(timing.tCopyInNs),
+            static_cast<unsigned long long>(timing.tFlowNs),
+            static_cast<unsigned long long>(timing.tGenerateNs),
+            static_cast<unsigned long long>(timing.tCopyOutNs),
+            static_cast<unsigned long long>(timing.tTotalNs));
+    }
     return timing;
 }
 

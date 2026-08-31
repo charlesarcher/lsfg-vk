@@ -13,6 +13,7 @@ namespace lsfgvk::cli::benchmark {
         bool allow_fp16{false};
         int width{1920};
         int height{1080};
+        bool hdr{false};
 
         float flow{1.0F};
         int multiplier{2};
@@ -20,6 +21,7 @@ namespace lsfgvk::cli::benchmark {
         std::optional<std::string> gpu;
 
         int duration{10};
+        std::optional<std::string> timing_csv;
     };
 
     /// run the "benchmark" command

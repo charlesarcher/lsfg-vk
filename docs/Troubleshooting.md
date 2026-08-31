@@ -212,6 +212,8 @@ A step-by-step setup guide with tested examples lives in the [Dual-GPU Setup Gui
 
 If you configured the `gpu` option to a device other than the one your game renders on, lsfg-vk enters dual-GPU mode: the game keeps rendering and presenting on its own GPU, while the entire frame generation pipeline runs on the selected processing GPU. Frames travel between both GPUs over PCIe, which costs bandwidth and adds latency (see the [Configuration](Configuration.md) documentation for the details).
 
+Measured latency overhead on the development rig (PCIe 5.0 x16): 0.8–9.4 ms depending on GPU pair and resolution (see [Dual-GPU Guide](Dual-GPU-Guide.md#measured-performance-on-this-rig) for full table). Bandwidth utilization is 1–18% of PCIe 5.0 x16 ceiling (63 GB/s) for AMD↔AMD pairs.
+
 You can verify which device ended up doing what in the log output:
 - `lsfg-vk: frame generation on the game's own device '...'` means everything runs on a single GPU (either because `gpu` is unset or set to the game's own device).
 - `lsfg-vk: processing on '...' (game on '...')` means dual-GPU mode is active. The first quoted value is the processing device's UUID in hexadecimal, the second is the game device's name. The line printed at startup (`lsfg-vk: processing on '<device name>' [uuid ...]`) maps names to UUIDs, so you can tell which of your cards is doing the processing.

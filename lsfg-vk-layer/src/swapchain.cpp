@@ -9,6 +9,7 @@
 #include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
+#include "lsfg-vk-common/vulkan/timestamps.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
@@ -143,7 +144,8 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
             ls::GameConf profile, SwapchainInfo info,
             const std::string& gameDeviceName) :
         instance(backend),
-        profile(std::move(profile)), info(std::move(info)) {
+        profile(std::move(profile)), info(std::move(info)),
+        timingRing(vk, "layer") {
     const VkExtent2D extent = this->info.extent;
     const bool hdr = this->info.format > 57;
     const VkFormat format = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
@@ -346,6 +348,7 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     for (const int fd : exportedFds) close(fd);
 
     this->crossDevice = backend.isCrossDevice(this->ctx.get());
+
     if (this->crossDevice) {
         try {
             // import-only ring for observing done fds; capture semaphores are
@@ -385,6 +388,14 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 
     std::vector<int> doneFds{};
 
+    // Read back timing for frame N-4 (host readback while GPU works on N)
+    if (this->timingRing.enabled() && this->fidx >= 4) {
+        auto timing = this->timingRing.readFrame(this->fidx - 4);
+        if (timing) {
+            this->timingRing.writeCsvRow(*timing);
+        }
+    }
+
     // update present mode when not using pacing
     if (this->profile.pacing == ls::Pacing::None) {
 #pragma clang diagnostic push
@@ -406,6 +417,12 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     // record the capture blit (shared by both sync modes)
     const auto& cmdbuf = *this->renderCommandBuffer;
     cmdbuf.begin(vk);
+
+    // Reset query pool for this frame
+    this->timingRing.resetFrame(cmdbuf.handle(), this->fidx);
+
+    // Timestamp: Game CopyIn (swapchain -> source dma-buf)
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInStart, true);
 
     cmdbuf.blitImage(vk,
         {
@@ -433,6 +450,8 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             ),
         }
     );
+
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInEnd, false);
 
     if (this->crossDevice) {
         // cross-device order: retire the previous frame first, then capture
@@ -512,6 +531,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         auto& cmdbuf = pass.commandBuffer;
         cmdbuf.begin(vk);
 
+        // Timestamp: Game CopyOut (dest dma-buf -> swapchain)
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyOutStart, true);
+
         cmdbuf.blitImage(vk,
             {
                 barrierHelper(destinationImage.handle(),
@@ -538,6 +560,8 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
                 ),
             }
         );
+
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyOutEnd, false);
 
         std::vector<VkSemaphore> waitSemaphores{ pass.acquireSemaphore.handle() };
         if (i) { // non-first pass

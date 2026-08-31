@@ -75,6 +75,32 @@ namespace vk {
         void copyBufferToImage(const vk::Vulkan& vk,
             const vk::Buffer& buffer, const vk::Image& image) const;
 
+        /// write a timestamp query
+        /// @param vk the vulkan instance
+        /// @param pool the query pool
+        /// @param query the query index
+        void writeTimestamp(const vk::Vulkan& vk, VkQueryPool pool, uint32_t query) const;
+
+        /// reset a query pool range
+        /// @param vk the vulkan instance
+        /// @param pool the query pool
+        /// @param firstQuery first query to reset
+        /// @param queryCount number of queries to reset
+        void resetQueryPool(const vk::Vulkan& vk, VkQueryPool pool,
+            uint32_t firstQuery, uint32_t queryCount) const;
+
+        /// get query pool results
+        /// @param vk the vulkan instance
+        /// @param pool the query pool
+        /// @param firstQuery first query to read
+        /// @param queryCount number of queries to read
+        /// @param data output buffer (must be large enough for queryCount * 8 bytes)
+        /// @param wait whether to wait for results
+        /// @return true if results are available, false if not ready (only when wait=false)
+        bool getQueryPoolResults(const vk::Vulkan& vk, VkQueryPool pool,
+            uint32_t firstQuery, uint32_t queryCount,
+            uint64_t* data, bool wait = true) const;
+
         /// end recording commands
         /// @param vk the vulkan instance
         /// @throws ls::vulkan_error on failure
@@ -102,9 +128,12 @@ namespace vk {
         /// @throws ls::vulkan_error on failure
         void submit(const vk::Vulkan& vk) const;
 
-        /// get the raw VkCommandBuffer handle
+/// get the raw VkCommandBuffer handle
         /// @return the VkCommandBuffer handle
         [[nodiscard]] VkCommandBuffer raw() const { return *commandBuffer; }
+
+        /// get the underlying command buffer handle (alias of raw())
+        [[nodiscard]] VkCommandBuffer handle() const { return *commandBuffer; }
     private:
         ls::owned_ptr<VkCommandBuffer> commandBuffer;
     };

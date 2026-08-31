@@ -72,7 +72,10 @@ namespace ls::ipc {
         uint32_t height;
     };
 
-    /// A→C reply describing the layout staging images must be created with
+    /// A→C reply describing the layout the APP's staging images use. the app
+    /// creates the staging images on its own (processing) device with this
+    /// layout and hands the dma-buf fds off below; the layer must import them
+    /// with the same layout
     struct Negotiated {
         /// DRM modifier the staging images must use
         uint64_t modifier;
@@ -94,8 +97,11 @@ namespace ls::ipc {
     /// generic failure code for ErrorMsg
     inline constexpr uint32_t ERROR_GENERIC = 0;
 
-    /// C→A staging-image handoff; carries exactly one fd via SCM_RIGHTS.
-    /// one message per fd, sent twice during handshake (ring depth is 2)
+    /// A→C staging-image handoff; carries exactly one fd via SCM_RIGHTS.
+    /// the APP owns the staging images (created on its processing device,
+    /// local VRAM) and exports them as dma-buf; the layer imports each fd
+    /// TRANSFER_DST-only and writes captured frames A→B over PCIe. one
+    /// message per fd, sent twice during handshake (ring depth is 2)
     struct Staging { };
 
     /// A→C acknowledgement; the stream is live after this point

@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #include <iostream>
 #include <optional>
 #include <poll.h>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -93,10 +95,92 @@ namespace {
         const vk::TimelineSemaphore sema{vk, 0};
         cmdbuf.submit(vk); // synchronous: fences internally
     }
+
+    // compute percentile from sorted values
+    double percentile(const std::vector<uint64_t>& values, double p) {
+        if (values.empty()) return 0.0;
+        size_t idx = static_cast<size_t>(std::ceil(p / 100.0 * static_cast<double>(values.size()))) - 1;
+        idx = std::min(idx, values.size() - 1);
+        return static_cast<double>(values[idx]);
+    }
+
+    // read timing CSV and compute per-stage percentiles
+    void printTimingSummary(const std::string& csvPath) {
+        std::ifstream file(csvPath);
+        if (!file.is_open()) {
+            std::cerr << "warning: could not open timing CSV for summary: " << csvPath << "\n";
+            return;
+        }
+
+        std::string line;
+        // skip header
+        std::getline(file, line);
+
+        std::vector<uint64_t> copyIn, flow, generate, copyOut, total, gameIn, gameOut;
+
+        while (std::getline(file, line)) {
+            std::stringstream ss(line);
+            std::string field;
+            std::vector<std::string> fields;
+
+            while (std::getline(ss, field, ',')) {
+                fields.push_back(field);
+            }
+
+            if (fields.size() < 9) continue;
+
+            try {
+                copyIn.push_back(std::stoull(fields[2]));
+                flow.push_back(std::stoull(fields[3]));
+                generate.push_back(std::stoull(fields[4]));
+                copyOut.push_back(std::stoull(fields[5]));
+                total.push_back(std::stoull(fields[6]));
+                gameIn.push_back(std::stoull(fields[7]));
+                gameOut.push_back(std::stoull(fields[8]));
+            } catch (...) {
+                continue;
+            }
+        }
+
+        auto sortVec = [](std::vector<uint64_t>& v) {
+            std::sort(v.begin(), v.end());
+        };
+        sortVec(copyIn);
+        sortVec(flow);
+        sortVec(generate);
+        sortVec(copyOut);
+        sortVec(total);
+        sortVec(gameIn);
+        sortVec(gameOut);
+
+        auto printStage = [](const char* name, const std::vector<uint64_t>& v) {
+            if (v.empty()) return;
+            double p50 = percentile(v, 50.0);
+            double p95 = percentile(v, 95.0);
+            std::cerr << "  " << std::left << std::setw(16) << name
+                      << "p50: " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << (p50 / 1e6) << " ms"
+                      << "  p95: " << std::setw(10) << (p95 / 1e6) << " ms\n";
+        };
+
+        std::cerr << "\ntiming summary (percentiles in ms):\n";
+        printStage("copy_in:", copyIn);
+        printStage("flow:", flow);
+        printStage("generate:", generate);
+        printStage("copy_out:", copyOut);
+        printStage("total:", total);
+        printStage("game_copy_in:", gameIn);
+        printStage("game_copy_out:", gameOut);
+    }
 }
 
 int debug::run(const Options& opts) {
     try {
+        // Set timing environment variables if requested
+        if (opts.timing_csv.has_value()) {
+            ::setenv("LSFGVK_TIMING", "1", 1);
+            ::setenv("LSFGVK_TIMING_CSV", opts.timing_csv->c_str(), 1);
+        }
+
         // parse options
         if (opts.flow < 0.25F || opts.flow > 1.0F)
             throw ls::error("flow scale must be between 0.25 and 1.0");
@@ -108,6 +192,7 @@ int debug::run(const Options& opts) {
             static_cast<uint32_t>(opts.width),
             static_cast<uint32_t>(opts.height)
         };
+        const VkFormat format = opts.hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
         if (!std::filesystem::exists(opts.path))
             throw ls::error("debug path does not exist: " + opts.path.string());
         std::vector<std::filesystem::path> paths{};
@@ -200,14 +285,14 @@ int debug::run(const Options& opts) {
                 | VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT
                 | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT
                 | VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT;
-            const auto gameCaps = vk.exchangeCaps(VK_FORMAT_R8G8B8A8_UNORM);
+            const auto gameCaps = vk.exchangeCaps(format);
             const vk::DeviceExchangeCaps processingCaps{
-                { VK_FORMAT_R8G8B8A8_UNORM,
+                { format,
                     {{ vk::EXCHANGE_MODIFIER_LINEAR, usageNeeds }} }
             };
             const auto layout = vk::negotiateExchangeLayout(
                 gameCaps, processingCaps,
-                VK_FORMAT_R8G8B8A8_UNORM, usageNeeds);
+                format, usageNeeds);
             if (layout.kind() != vk::ExchangeLayoutKind::LinearFallback)
                 throw ls::error("debug tool's dual-gpu transport supports"
                     " linear exchange layouts only");
@@ -227,11 +312,11 @@ int debug::run(const Options& opts) {
         // creation time; in cross-device mode the allocation-time exports are
         // closed unused below, the descriptor fds are exported separately
         const vk::Image frame_0{vk,
-            extent, VK_FORMAT_R8G8B8A8_UNORM,
+            extent, format,
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             std::nullopt, &srcfds.first, exchangeLayout};
         const vk::Image frame_1{vk,
-            extent, VK_FORMAT_R8G8B8A8_UNORM,
+            extent, format,
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             std::nullopt, &srcfds.second, exchangeLayout};
 
@@ -240,7 +325,7 @@ int debug::run(const Options& opts) {
         for (int i = 0; i < (opts.multiplier - 1); i++) {
             int fd{};
             destimgs.emplace_back(vk,
-                extent, VK_FORMAT_R8G8B8A8_UNORM,
+                extent, format,
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 std::nullopt,
                 &fd,
@@ -274,32 +359,32 @@ int debug::run(const Options& opts) {
                 const auto exp = img->exportDmaBuf(vk);
                 srcDescs.push_back({ exp.fd, exp.allocationSize,
                     exp.rowPitch, negotiatedModifier,
-                    VK_FORMAT_R8G8B8A8_UNORM, extent });
+                    format, extent });
             }
             for (const auto& img : destimgs) {
                 const auto exp = img.exportDmaBuf(vk);
                 destDescs.push_back({ exp.fd, exp.allocationSize,
                     exp.rowPitch, negotiatedModifier,
-                    VK_FORMAT_R8G8B8A8_UNORM, extent });
+                    format, extent });
             }
         } else {
             srcDescs.push_back({ srcfds.first, 0, 0,
                 lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
-                VK_FORMAT_R8G8B8A8_UNORM, extent });
+                format, extent });
             srcDescs.push_back({ srcfds.second, 0, 0,
                 lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
-                VK_FORMAT_R8G8B8A8_UNORM, extent });
+                format, extent });
             for (const int fd : destfds)
                 destDescs.push_back({ fd, 0, 0,
                     lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
-                    VK_FORMAT_R8G8B8A8_UNORM, extent });
+                    format, extent });
         }
 
         lsfgvk::backend::Context& lsfgvk_ctx = lsfgvk.openContext(
             srcDescs, destDescs, vk.deviceUUID(),
             negotiatedModifier,
             syncfd, extent.width, extent.height,
-            false, 1.0F / opts.flow, opts.performance_mode
+            opts.hdr, 1.0F / opts.flow, opts.performance_mode
         );
 
         // mirror the layer's dual-gpu mode log lines (todo-13 contract) so
@@ -359,6 +444,12 @@ int debug::run(const Options& opts) {
 
         // deinitialize lsfg-vk
         lsfgvk.closeContext(lsfgvk_ctx);
+
+        // print timing summary if CSV was requested
+        if (opts.timing_csv.has_value()) {
+            printTimingSummary(*opts.timing_csv);
+        }
+
         return EXIT_SUCCESS;
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

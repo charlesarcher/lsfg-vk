@@ -112,8 +112,9 @@ namespace vk {
         float timestampPeriod_{1.0f}; // nanoseconds per timestamp unit
         ls::owned_ptr<VkQueryPool> pool_;
         std::optional<std::string> csvPath_;
-        mutable std::vector<uint64_t> readbackBuffer_; // reused buffer for vkGetQueryPoolResults
-        const vk::Vulkan* vk_{nullptr}; // reference to Vulkan instance for device functions
+mutable std::vector<uint64_t> readbackBuffer_; // reused buffer for vkGetQueryPoolResults
+    mutable uint32_t currentFrameSlot_{0}; // ring slot set by resetFrame, used by writeTimestamp
+    const vk::Vulkan* vk_{nullptr}; // reference to Vulkan instance for device functions
     };
 
     /// RAII helper for writing a timestamp pair (start + end) around a region

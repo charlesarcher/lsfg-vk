@@ -117,18 +117,6 @@ namespace {
     }
 }
 
-StreamState::~StreamState() {
-    for (int& fd : this->stagingFds)
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
-        }
-    if (dbgEnabled())
-        std::fprintf(stderr, "lsfg-vk-app: [dbg] dtor: staging fds closed, member destructors next (context/images) (t+%lld ms)\n",
-        (long long)std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - g_dbgT0).count());
-}
-
 namespace ls::ipc {
 void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& stop,
     const vk::Vulkan& vk, lsfgvk::backend::Instance& backend, const ls::GameConf& conf,
@@ -157,8 +145,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
               << hello->width << "x" << hello->height << " "
               << formatName(hello->vkFormat) << "\n";
 
-    // 2. NEGOTIATED: the staging images the layer hands off are ALWAYS
-    //    R8G8B8A8_UNORM (capture_context.cpp:151), 4 Bpp. negotiate the exchange
+    // 2. NEGOTIATED: the staging images (created below, step 3) are ALWAYS
+    //    R8G8B8A8_UNORM, 4 Bpp. negotiate the exchange
     //    layout from the app device's TRUE caps and reply with the negotiated
     //    modifier + 256-byte-aligned pitch + allocation size.
     const VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM;
@@ -191,43 +179,44 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     const VkImageUsageFlags imgUsage =
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
-    // 3. two STAGING messages: import the dma-buf fds into B-local source
-    //    images. the received fd is consumed by the import; we dup() it once so
-    //    one copy is imported (image lives in the app) and one copy is handed to
-    //    the backend as the source descriptor fd (the backend imports the dup;
-    //    the kernel duplicated the fd on receive, no re-export roundtrip).
+    // 3. two STAGING messages: create the staging images LOCALLY on B at the
+    //    negotiated layout, self-export each as dma-buf, and hand the fds to
+    //    the layer (one SCM_RIGHTS fd per STAGING message). the layer imports
+    //    them TRANSFER_DST-only, so its capture blit writes each frame A→B
+    //    over PCIe as a sequential DMA transfer while the LSSC chain runs on
+    //    B-local sources. the app keeps the images as sourceImages (real
+    //    frame blits) and hands the backend a dup of the same exports as the
+    //    source descriptor fds (the backend imports the dup; the kernel
+    //    duplicated the fd on send, no re-export roundtrip).
     std::vector<vk::ExchangeDescriptor> sourceDescs;
     std::vector<int> handedSourceFds;
     for (size_t i = 0; i < 2; ++i) {
-        auto stagingMsg = recvStop(conn, stop);
-        if (!stagingMsg)
-            return;
-        if (!std::holds_alternative<Staging>(*stagingMsg))
-            throw ls::error(std::string("expected STAGING, got ")
-                + nameOf(typeOf(*stagingMsg)));
-        const int received = conn.takeReceivedFd();
-        if (received < 0)
-            throw ls::error("STAGING arrived without its fd");
-        const int dupForDescriptor = ::dup(received);
+        state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt, imgUsage,
+            std::nullopt /*importFd*/, std::nullopt /*exportFd*/, layout);
+        auto exp = state.sourceImages.at(i).mut().exportDmaBuf(vk);
+        const int dupForDescriptor = ::dup(exp.fd);
         if (dupForDescriptor < 0) {
-            ::close(received);
+            ::close(exp.fd);
             throw ls::error("dup() failed for staging descriptor fd");
         }
-        // import consumes the received fd on success (closed by the image); on
-        // failure the image closes it for us.
-        state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt, imgUsage,
-            received /*importFd*/, std::nullopt /*exportFd*/, layout);
+        try {
+            conn.attachFd(exp.fd);
+            conn.send(Staging{});
+            // attachFd ownership transferred to kernel; send closed our copy
+        } catch (const std::exception& e) {
+            ::close(dupForDescriptor);
+            throw e;
+        }
         handedSourceFds.push_back(dupForDescriptor);
         sourceDescs.push_back({
             .fd = dupForDescriptor,
-            .allocationSize = static_cast<VkDeviceSize>(rowPitch) * h,
-            .rowPitch = rowPitch,
+            .allocationSize = exp.allocationSize,
+            .rowPitch = exp.rowPitch,
             .modifier = neg.modifier,
             .format = fmt,
             .extent = VkExtent2D{ w, h }
         });
     }
-    state.stagingCount = 2;
 
     // 4. create (multiplier-1) B-local destination images natively, self-export
     //    each, and hand the backend a dup of the export fd as the destination
@@ -267,6 +256,13 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     //    (lsfgvk.hpp:103-105: false => R8G8B8A8_UNORM, true => RGBA16F). the
     //    backend infers the format from hdr, so a wrong hdr would reject the
     //    source descriptors' format. syncFd is ignored on the cross-device path.
+    // exporterDeviceUUID must be the GAME's uuid, not this device's: the
+    // backend uses it only to select the cross-device (sync-fd) handshake
+    // path, the only external-presentation path that works on this RADV -
+    // the same-device timeline-semaphore path fails at import with
+    // VK_ERROR_IMPORT_NOT_ALLOWED. the source images being B-local does not
+    // change which handshake path is needed: the capture-completion fd still
+    // crosses from the game device every cycle.
     //    on any throw before a successful import, close the handed dups (the
     //    backend has consumed none yet).
     try {
