@@ -661,9 +661,14 @@ if (dbgEnabled())
         ++fidx;
         maybeStats(Clock::now());
 
-        // stop on a window resize/close (processEvents returns true for both);
-        // teardown happens via the guard on return.
-        if (wsi->processEvents(16))
+        // stop on a window resize/close (processEvents returns true for both).
+        // Non-blocking (0): the wl queue is pumped non-blockingly before every
+        // acquire/present (processWsiEvents(0)), so releases/configures are
+        // handled there. A blocking poll (was 16 ms) slept up to 16 ms per
+        // cycle when the queue was empty - and when the compositor is stalling
+        // (empty queue) it stretched every cycle, amplifying the stall.
+        // Resize/close detection lands at most one cycle later; teardown unchanged.
+        if (wsi->processEvents(0))
             break;
     }
 
