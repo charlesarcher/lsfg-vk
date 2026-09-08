@@ -21,12 +21,14 @@ using namespace vk;
 
 namespace {
     /// create a command buffer
-    ls::owned_ptr<VkCommandBuffer> createCommandBuffer(const vk::Vulkan& vk) {
+    ls::owned_ptr<VkCommandBuffer> createCommandBuffer(const vk::Vulkan& vk,
+            VkCommandPool pool) {
         VkCommandBuffer handle{};
 
+        VkCommandPool cmdPool = pool != VK_NULL_HANDLE ? pool : vk.cmdpool();
         const VkCommandBufferAllocateInfo commandBufferInfo{
             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool = vk.cmdpool(),
+            .commandPool = cmdPool,
             .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
             .commandBufferCount = 1
         };
@@ -43,7 +45,7 @@ namespace {
 
         return ls::owned_ptr<VkCommandBuffer>(
             new VkCommandBuffer(handle),
-            [dev = vk.dev(), pool = vk.cmdpool(), defunc = vk.df().FreeCommandBuffers](
+            [dev = vk.dev(), pool = cmdPool, defunc = vk.df().FreeCommandBuffers](
                 VkCommandBuffer& commandBufferModule
             ) {
                 defunc(dev, pool, 1, &commandBufferModule);
@@ -52,8 +54,8 @@ namespace {
     }
 }
 
-CommandBuffer::CommandBuffer(const vk::Vulkan& vk)
-        : commandBuffer(createCommandBuffer(vk)) {}
+CommandBuffer::CommandBuffer(const vk::Vulkan& vk, VkCommandPool pool)
+        : commandBuffer(createCommandBuffer(vk, pool)) {}
 
 void CommandBuffer::begin(const vk::Vulkan& vk) const {
     const VkCommandBufferBeginInfo beginInfo = {
@@ -100,6 +102,54 @@ void CommandBuffer::dispatch(const vk::Vulkan& vk,
         0, VK_NULL_HANDLE
     );
     vk.df().CmdDispatch(*this->commandBuffer, x, y, z);
+}
+
+void CommandBuffer::copyImage(const vk::Vulkan& vk,
+        const std::vector<vk::Barrier>& preBarriers,
+        std::pair<VkImage, VkImage> images, VkExtent2D extent,
+        const std::vector<vk::Barrier>& postBarriers,
+        VkExtent2D srcExtent) const {
+    if (srcExtent.width == 0 || srcExtent.height == 0)
+        srcExtent = extent; // 1:1 copy
+
+    vk.df().CmdPipelineBarrier(*this->commandBuffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0,
+        0, VK_NULL_HANDLE,
+        0, VK_NULL_HANDLE,
+        static_cast<uint32_t>(preBarriers.size()), preBarriers.data()
+    );
+
+    const VkImageCopy region{
+        .srcSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .layerCount = 1
+        },
+        .srcOffset = { 0, 0, 0 },
+        .dstSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .layerCount = 1
+        },
+        .dstOffset = { 0, 0, 0 },
+        .extent = {
+            static_cast<uint32_t>(srcExtent.width),
+            static_cast<uint32_t>(srcExtent.height),
+            1
+        }
+    };
+    vk.df().CmdCopyImage(*this->commandBuffer,
+        images.first, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        images.second, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1, &region
+    );
+
+    vk.df().CmdPipelineBarrier(*this->commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        0,
+        0, VK_NULL_HANDLE,
+        0, VK_NULL_HANDLE,
+        static_cast<uint32_t>(postBarriers.size()), postBarriers.data()
+    );
 }
 
 void CommandBuffer::blitImage(const vk::Vulkan& vk,
@@ -229,7 +279,7 @@ void CommandBuffer::submit(const vk::Vulkan& vk,
         VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
         std::vector<VkSemaphore> signalSemaphores,
         VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
-        VkFence fence) const {
+        VkFence fence, VkQueue queue) const {
     // create arrays of semaphores and values
     bool hasTimeline = false;
     if (waitTimelineSemaphore) {
@@ -294,7 +344,8 @@ void CommandBuffer::submit(const vk::Vulkan& vk,
         };
     }
     
-    auto res = vk.df().QueueSubmit(vk.queue(), 1, &submitInfo, fence);
+    VkQueue submitQueue = queue != VK_NULL_HANDLE ? queue : vk.queue();
+    auto res = vk.df().QueueSubmit(submitQueue, 1, &submitInfo, fence);
     if (res != VK_SUCCESS)
         throw ls::vulkan_error(res, "vkQueueSubmit() failed");
 }

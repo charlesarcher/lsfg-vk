@@ -26,21 +26,35 @@
 
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
+#include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
+#include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
-#include <cstdarg>
 #include <chrono>
+#include <condition_variable>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
+#include <deque>
+#include <exception>
 #include <iostream>
+#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <poll.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <cerrno>
+#include <xf86drm.h>
 #include <vulkan/vulkan_core.h>
 
 namespace ls::presentation {
@@ -50,6 +64,11 @@ namespace {
 const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
 bool dbgEnabled() {
     return std::getenv("LSFGVK_APP_DBG") != nullptr;
+}
+using Clock = std::chrono::steady_clock;
+using Usec = std::chrono::microseconds;
+static inline long long elapsedUs(Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration_cast<Usec>(b - a).count();
 }
 void dbg(const char* fmt, ...) {
     if (!dbgEnabled())
@@ -89,6 +108,33 @@ void dbg(const char* fmt, ...) {
         return b;
     }
 
+    /// 9060 Vulkan rejects 9070 dma-bufs (GetMemoryFdPropertiesKHR
+    /// INVALID_EXTERNAL_HANDLE). Re-export through the 9060 DRM node so
+    /// Vulkan sees a local GEM handle.
+    int primeReexportOn9060(int foreignFd) {
+        static int drmFd = -2;
+        if (drmFd == -2) {
+            drmFd = ::open("/dev/dri/renderD130", O_RDWR | O_CLOEXEC);
+            dbg("prime open renderD130 fd=%d errno=%d", drmFd, drmFd < 0 ? errno : 0);
+        }
+        if (drmFd < 0 || foreignFd < 0)
+            return -1;
+        uint32_t handle = 0;
+        if (drmPrimeFDToHandle(drmFd, foreignFd, &handle) != 0) {
+            dbg("prime FDToHandle errno=%d fd=%d", errno, foreignFd);
+            return -1;
+        }
+        int localFd = -1;
+        if (drmPrimeHandleToFD(drmFd, handle, O_CLOEXEC | O_RDWR, &localFd) != 0) {
+            dbg("prime HandleToFD errno=%d handle=%u", errno, handle);
+            (void)drmCloseBufferHandle(drmFd, handle);
+            return -1;
+        }
+        (void)drmCloseBufferHandle(drmFd, handle);
+        dbg("prime reexport foreign=%d -> local=%d handle=%u", foreignFd, localFd, handle);
+        return localFd;
+    }
+
     /// import a sync fd into a binary semaphore as a temporary payload. on
     /// success the fd is consumed by the implementation, on failure it is closed
     /// before throwing (exact body of the layer's swapchain.cpp:57-73 importSyncFd).
@@ -118,6 +164,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const vk::Vulkan& vk, lsfgvk::backend::Instance& backend,
         const ls::GameConf& conf, std::string_view session,
         const std::atomic<bool>& stop) {
+    // One overlay connection per process. A second concurrent wl_display
+    // (swapchain recreate / FS) gets an empty registry and the isolated
+    // game has no scanout → black screen, audio still running.
+    static std::mutex presentMu;
+    std::lock_guard<std::mutex> presentLock(presentMu);
+
     const uint32_t w = state.width, h = state.height;
 
     // --- surface backend + window/surface on the transport vk ----------------
@@ -200,9 +252,36 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             compositingAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
     }
 
-    // --- create a FIFO color-attachment swapchain ----------------------------
-    // minImageCount >= 3: each frame presents (destCount generated + 1 real)
-    // images, so we keep at least 3 to avoid FIFO backpressure collapsing.
+    // Overlay present must not be FIFO-paced at compositor-throttled ~20 Hz.
+    // MAILBOX (else IMMEDIATE) matches Windows LS: the 9060 presents as fast
+    // as GEN+REAL are ready, toward 240 Hz. FIFO stays the fallback.
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+    const char* modeName = "MAILBOX";
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes =
+        vk.fi().GetPhysicalDeviceSurfacePresentModesKHR;
+    if (getModes) {
+        uint32_t n = 0;
+        getModes(vk.physdev(), surface, &n, nullptr);
+        std::vector<VkPresentModeKHR> modes(n);
+        if (n > 0)
+            getModes(vk.physdev(), surface, &n, modes.data());
+        auto has = [&](VkPresentModeKHR m) {
+            return std::find(modes.begin(), modes.end(), m) != modes.end();
+        };
+        dbg("surface present modes (%u):%s%s%s%s",
+            n,
+            has(VK_PRESENT_MODE_FIFO_KHR) ? " FIFO" : "",
+            has(VK_PRESENT_MODE_FIFO_RELAXED_KHR) ? " FIFO_RELAXED" : "",
+            has(VK_PRESENT_MODE_MAILBOX_KHR) ? " MAILBOX" : "",
+            has(VK_PRESENT_MODE_IMMEDIATE_KHR) ? " IMMEDIATE" : "");
+        if (has(VK_PRESENT_MODE_MAILBOX_KHR)) {
+            presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+            modeName = "MAILBOX";
+        } else if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+            presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            modeName = "IMMEDIATE";
+        }
+    }
     const uint32_t minImages = caps.minImageCount < 2 ? 3 : caps.minImageCount;
 
     VkSwapchainCreateInfoKHR ci{};
@@ -218,18 +297,22 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     ci.pQueueFamilyIndices = nullptr;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = compositingAlpha;
-    ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    ci.presentMode = presentMode;
     ci.clipped = VK_TRUE;
     ci.oldSwapchain = VK_NULL_HANDLE;
 
-if (dbgEnabled())
-        std::fprintf(stderr, "lsfg-vk-app: [dbg] swapchain extent %ux%u fmt=%u (stream %ux%u)\n",
-                     extent.width, extent.height, ci.imageFormat, w, h);
-
     VkSwapchainKHR swapchain{VK_NULL_HANDLE};
-    const auto createRes = vk.df().CreateSwapchainKHR(vk.dev(), &ci, VK_NULL_HANDLE, &swapchain);
+    auto createRes = vk.df().CreateSwapchainKHR(vk.dev(), &ci, VK_NULL_HANDLE, &swapchain);
+    if (createRes != VK_SUCCESS && presentMode != VK_PRESENT_MODE_FIFO_KHR) {
+        ci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        modeName = "FIFO-fallback";
+        createRes = vk.df().CreateSwapchainKHR(vk.dev(), &ci, VK_NULL_HANDLE, &swapchain);
+    }
     if (createRes != VK_SUCCESS)
         throw ls::vulkan_error(createRes, "CreateSwapchainKHR failed");
+
+    dbg("swapchain extent %ux%u fmt=%u mode=%s minImages=%u (stream %ux%u)",
+        extent.width, extent.height, ci.imageFormat, modeName, minImages, w, h);
 
     uint32_t imageCount{};
     if (vk.df().GetSwapchainImagesKHR(vk.dev(), swapchain, &imageCount, nullptr) != VK_SUCCESS)
@@ -239,25 +322,24 @@ if (dbgEnabled())
             != VK_SUCCESS)
         throw ls::vulkan_error("failed to enumerate swapchain images");
 
-    // --- per-frame work objects, pooled for the loop's lifetime --------------
-    // acquireSem is never signaled, so it is always unsignaled and safe to reuse
-    // for every AcquireNextImageKHR; the signal-semaphore ring holds one entry
-    // per present (destCount generated + 1 real) and is consumed by present().
-    vk::CommandBuffer cmdbuf{vk};
-    vk::Semaphore acquireSem{vk};
-    vk::Fence fence{vk};
-    std::vector<vk::Semaphore> doneWaitSem;                 // one per destination
-    for (const auto& dst : state.destinationImages)
-        doneWaitSem.emplace_back(vk, std::nullopt,
-            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+    // --- shared size: destination count used by the two-thread split below ----
+    // per-frame work objects (command buffer, acquire/signal/done semaphores,
+    // fences) are created inside the INPUT and OUTPUT thread scopes in the
+    // Stage 2/3 block further down.
     const size_t destCount = state.destinationImages.size();
-    const size_t presentCount = destCount + 1;
-    std::vector<vk::Semaphore> signalSem;   // one present per entry, non-copyable
-    signalSem.reserve(presentCount);
-    for (size_t i = 0; i < presentCount; ++i)
-        signalSem.emplace_back(vk);
 
-    // --- FPS HUD: the "<game>/<presented>" box in the top-left window corner.
+    // --- early-release snapshot path -----------------------------------------
+    // The staging source is read by BOTH the gen (backend) and the real
+    // present. Releasing the slot only after the display-paced real present
+    // throttles the game's selectFreeSlot to the present cadence (the input
+    // lag). Instead, snapshot the source into a private per-slot image right
+    // after scheduleFrames (~2ms, gated on the capture sync fd), release the
+    // slot once that read is done, and have the real present blit the snapshot
+    // (private, never recaptured by the layer) instead of the live source.
+    vk::Semaphore snapshotSem{vk, std::nullopt,
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+
+    // --- FPS HUD: the "<game>/<presented>" box in the top-right window corner.
     //     created after the swapchain so its format and scale match the
     //     display; torn down with the loop's other locals on return.
     ls::hud::Hud hud{ vk, extent.height, ci.imageFormat };
@@ -282,73 +364,114 @@ if (dbgEnabled())
     };
     SwapchainGuard guard{ &vk, swapchain, wsi.get() };
 
-    // --- pacing / backpressure / stall policy state ---------------------------
-    using Clock = std::chrono::steady_clock;
-    Clock::time_point lastFrameTime = Clock::now();
-    Clock::time_point statsLastTime = Clock::now();
-    uint64_t frameCount = 0;
-    uint64_t presentedFrames = 0;
-    bool idleLogged = false;
-    uint32_t lastFrameStagingIdx = 0;
-    const auto idleThreshold = std::chrono::seconds(5);
-    const auto statsInterval = std::chrono::seconds(1);
+    // =========================================================================
+    // Stage 2/3: split frame-PRODUCE (INPUT) from display-PRESENT (OUTPUT) onto
+    // two threads so a game frame is never blocked on the app's display cadence
+    // (FIFO/vblank backpressure), which was the ~31 ms selectFreeSlot stall.
+    //
+    //   INPUT : receive FRAME -> dup capture fd -> scheduleFrames -> snapshot
+    //           copy -> wait snapshotSem (non-blocking poll) -> poll last doneFd -> send Release
+    //           -> enqueue {doneFds, stagingIdx}. Owns the socket. Never touches
+    //           WSI. NEVER waits on the OUTPUT (no display cadence coupling).
+    //   OUTPUT: the swapchain present path. Per dequeued frame a [GEN]+[REAL]
+    //           phase machine, one present per vblank (FIFO acquire paces it),
+    //           drop-oldest/present-newest inbox, HOLD-LAST real when idle.
+    //           Owns all WSI.
+    //   Cross-thread: a bounded SPSC inbox (mutex+condvar+deque of depth 3-4),
+    //   a shared submit mutex (VkQueue is externally synchronized — ALL queue
+    //   submissions, including the backend's scheduleFrames submits, run under
+    //   it, which orders dest[i] reads before the next write on the same queue
+    //   and prevents concurrent vkQueueSubmit), and atomic frame/present
+    //   counters. Signal sems are a fixed pool indexed by a rolling present
+    //   counter (>= the FIFO in-flight depth), so reuse is always safe.
+    //   De-coupling note: the INPUT must not wait on any fence the OUTPUT
+    //   signals, or its Release rate (== the game's unblock rate) collapses to
+    //   the output's present cadence (GEN+REAL = 2 vblanks/frame -> 30 fps at
+    //   60 Hz), re-throttling the game. The fixed destinationImages ring gives
+    //   the output "the newest generated content" (inherent), which at the 120 Hz
+    //   target (matched 60 fps input/output) is exactly the per-frame gen.
+    // =========================================================================
 
-    // per-second stats: the presented/game ratio is the observable multiplier
-    // (logged when verbose) and feeds the top-left HUD (always). frameCount
-    // counts received game frames; presentedFrames counts swapchain presents
-    // ((destCount + 1) per cycle). must run from both loop branches.
-    auto maybeStats = [&](Clock::time_point now) {
-        if (now - statsLastTime < statsInterval)
-            return;
-        const double dt = std::chrono::duration<double>(now - statsLastTime).count();
-        const uint32_t gameFps = static_cast<uint32_t>(frameCount / dt);
-        const uint32_t presentedFps = static_cast<uint32_t>(presentedFrames / dt);
-        if (verboseEnabled())
-            std::cerr << "lsfg-vk-app: " << gameFps << " fps game, "
-                      << presentedFps << " fps presented\n";
-        hud.update(std::to_string(gameFps) + "/" + std::to_string(presentedFps));
-        frameCount = 0;
-        presentedFrames = 0;
-        statsLastTime = now;
+    // --- shared cross-thread state -------------------------------------------
+    std::atomic<bool> failed{ false };
+    std::exception_ptr inputError, outputError;
+
+    // bounded SPSC inbox: INPUT pushes each fully-produced frame; OUTPUT pops
+    // the newest (dropping older un-shown frames and closing their done fds).
+    struct PendingFrame {
+        std::vector<int> doneFds;   // one per destination (already produced)
+        int snapFd{ -1 };           // sync_fd semaphore for the snapshot copy; -1 if no snapshot
+        uint32_t stagingIdx{ 0 };
     };
-
-    // Helper to process Wayland events before blocking Vulkan calls.
-    // On Wayland, the compositor requires the client to process events
-    // (frame callbacks, configure) before AcquireNextImageKHR/QueuePresentKHR
-    // can make progress. X11 backend's processEvents is a no-op when there's
-    // nothing to do, so this is safe for both backends.
-    auto processWsiEvents = [&](int timeout_ms = 0) {
-        wsi->processEvents(timeout_ms);
-    };
-
-    // Acquire a swapchain image, pumping WSI events while waiting. the
-    // timeout must stay finite on Wayland: the compositor frees an image via
-    // a wl_buffer release event that only reaches RADV through a display
-    // dispatch, so an infinite block (UINT64_MAX) with no pump deadlocks the
-    // stream - and the stop flag (SIGINT) - until the process is killed.
-    // on timeout: pump events (which may deliver the release), re-check stop,
-    // retry. throws on hard errors; returns false if stop was requested.
-    constexpr uint64_t acquireTimeoutNs = 200ULL * 1000 * 1000; // 200 ms
-    auto acquireImage = [&](uint32_t& outIdx) -> bool {
-        for (;;) {
-            const auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
-                acquireTimeoutNs, acquireSem.handle(), VK_NULL_HANDLE, &outIdx);
-            if (res != VK_TIMEOUT) {
-                if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
-                    throw ls::vulkan_error(res, "AcquireNextImageKHR failed");
-                return true;
-            }
-            processWsiEvents(0);
-            if (stop.load(std::memory_order_relaxed))
-                return false;
+    struct Inbox {
+        std::mutex m;
+        std::condition_variable cv;
+        std::deque<PendingFrame> q;
+        // Blocking variant: waits on the cv until a frame arrives or the
+        // timeout expires (timeout serves WSI event pumping only; frame
+        // arrival wakes instantly - zero poll latency). Returns nullopt on
+        // timeout.
+        std::optional<PendingFrame> takeNewestWait(unsigned timeoutMs) {
+            std::unique_lock<std::mutex> lk(m);
+            cv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                [this] { return !q.empty(); });
+            if (q.empty())
+                return std::nullopt;
+            return takeNewestLocked();
         }
+        std::optional<PendingFrame> takeNewest() {
+            std::lock_guard<std::mutex> lk(m);
+            if (q.empty())
+                return std::nullopt;
+            return takeNewestLocked();
+        }
+        std::optional<PendingFrame> takeNewestLocked() {
+            if (q.empty())
+                return std::nullopt;
+            PendingFrame newest = std::move(q.back());
+            q.pop_back();
+            for (auto& f : q) {
+                for (int d : f.doneFds)
+                    if (d >= 0)
+                        ::close(d);
+                if (f.snapFd >= 0)
+                    ::close(f.snapFd);
+            }
+            q.clear();
+            return PendingFrame{ std::move(newest) };
+        }
+        void push(PendingFrame f) {
+            {
+                std::lock_guard<std::mutex> lk(m);
+                q.push_back(std::move(f));
+            }
+            cv.notify_one();
+        }
+    } inbox;
+
+    // VkQueue must be externally synchronized across the two submit threads.
+    // ALL submissions run under this lock, including the backend's
+    // scheduleFrames submits, so dest[i] reads/writes on the same queue are
+    // strictly ordered and never submitted concurrently from two threads.
+    std::mutex submitMtx;
+    std::atomic<uint64_t> frameCount{ 0 };
+    std::atomic<uint64_t> presentedFrames{ 0 };
+    using Clock = std::chrono::steady_clock;
+    using Usec = std::chrono::microseconds;
+
+    // WSI events must be pumped before blocking Vulkan calls (Wayland release /
+    // configure events only reach RADV through display dispatch). output-only.
+    auto processWsiEvents = [&](int timeoutMs = 0) {
+        wsi->processEvents(timeoutMs);
     };
 
-    // blit the HUD box into the top-left of a just-filled swapchain image.
-    // call right after the content blit (dstImage in TRANSFER_DST_OPTIMAL,
-    // write access in flight); it leaves dstImage in the same layout so the
-    // existing post barrier still transitions it to PRESENT_SRC.
-    auto drawHud = [&](VkImage dstImage) {
+    const VkExtent2D imgExtent{ w, h };
+
+    // blit the HUD box into the top-right of a just-filled swapchain image.
+    // records into @cb (the caller owns the submit); @dstImage must be in
+    // TRANSFER_DST_OPTIMAL with in-flight write access, and is left in that same
+    // layout so the caller's post barrier transitions it to PRESENT_SRC.
+    auto drawHud = [&](vk::CommandBuffer& cb, VkImage dstImage) {
         const VkImage hudImage = hud.image().handle();
         const VkImageMemoryBarrier hudBarrier = makeBlitBarrier(hudImage,
             hud.lastAccess(), VK_IMAGE_LAYOUT_GENERAL,
@@ -357,11 +480,16 @@ if (dbgEnabled())
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         const VkImageMemoryBarrier barriers[2] = { hudBarrier, dstBarrier };
-        vk.df().CmdPipelineBarrier(cmdbuf.raw(),
+        vk.df().CmdPipelineBarrier(cb.raw(),
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
             0, nullptr, 0, nullptr, 2, barriers);
-        const VkOffset2D o = ls::hud::Hud::ORIGIN;
         const VkExtent2D b = hud.box();
+        // top-right corner: ORIGIN is the inset from the right and top edges
+        const VkOffset2D o{
+            static_cast<int32_t>(extent.width) - static_cast<int32_t>(b.width)
+                - ls::hud::Hud::ORIGIN.x,
+            ls::hud::Hud::ORIGIN.y,
+        };
         const VkImageBlit blit{
             .srcSubresource = {
                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -380,234 +508,123 @@ if (dbgEnabled())
                 { static_cast<int32_t>(o.x + b.width), static_cast<int32_t>(o.y + b.height), 1 }
             }
         };
-        vk.df().CmdBlitImage(cmdbuf.raw(), hudImage, VK_IMAGE_LAYOUT_GENERAL,
+        vk.df().CmdBlitImage(cb.raw(), hudImage, VK_IMAGE_LAYOUT_GENERAL,
             dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
             VK_FILTER_NEAREST);
         hud.markRead();
     };
 
-    // --- the present loop ----------------------------------------------------
-    size_t fidx{ 0 };
-    while (!stop.load(std::memory_order_relaxed)) {
-        // poll the socket first so a pending FRAME is read without a blocking
-        // receive, and we stay looped to send backpressure RELEASE each cycle.
-        // a spurious wake (or the idle timeout) simply re-polls.
-        pollfd pfd{};
-        pfd.fd = conn.fd();
-        pfd.events = POLLIN;
-        const int pr = ::poll(&pfd, 1, 200);
-        if (pr < 0) {
-            if (errno == EINTR) continue;
-            throw ls::ipc::socket_error("poll() on present loop", errno);
+    // --- OUTPUT thread: the whole swapchain present path ----------------------
+    auto outputLoop = [&] {
+        // command buffer ring: one per in-flight present (destCount + 1)
+        // each has its own fence to know when the GPU is done with it
+        const size_t cbRingSize = destCount + 2;
+        std::vector<vk::CommandBuffer> cbs;
+        std::vector<vk::Fence> cbFences;
+        cbs.reserve(cbRingSize);
+        cbFences.reserve(cbRingSize);
+        for (size_t i = 0; i < cbRingSize; ++i) {
+            cbs.emplace_back(vk);
+            cbFences.emplace_back(vk, true);   // signaled: the first wait passes
         }
+        size_t cbIdx = 0;
+        vk::Semaphore acquireSem{ vk };   // never signaled; reused for every acquire
+        std::vector<vk::Semaphore> doneWaitSem;   // destCount + 1 (extra for snapshot)
+        doneWaitSem.reserve(destCount + 1);
+        for (size_t i = 0; i < destCount + 1; ++i)
+            doneWaitSem.emplace_back(vk, std::nullopt,
+                VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+        const size_t presentCount = destCount + 1;   // gen + real per frame
+        const size_t signalPool = std::max<size_t>(presentCount + 1, 4);
+        std::vector<vk::Semaphore> signalSem;        // rolling present pool
+        signalSem.reserve(signalPool);
+        for (size_t i = 0; i < signalPool; ++i)
+            signalSem.emplace_back(vk);
 
-        const auto now = Clock::now();
-
-        // idle detection: if no FRAME for >5 s, present the last real frame once
-        // and log a single notification. the window stays alive.
-        if (pr == 0 || !(pfd.revents & POLLIN)) {
-            dbg("present: idle branch (pr=%d revents=0x%x, since frame %.1fs)",
-                pr, (unsigned)(pfd.revents & 0xffff),
-                std::chrono::duration<double>(now - lastFrameTime).count());
-            if (!idleLogged && now - lastFrameTime >= idleThreshold) {
-                // present the last captured game frame to keep the window alive
-                uint32_t idx{};
-                if (acquireImage(idx)) {
-                    const VkImage dstImage = swapImages.at(idx);
-                    auto& srcImage = state.sourceImages.at(lastFrameStagingIdx);
-                    cmdbuf.begin(vk);
-                    cmdbuf.blitImage(vk,
-                        {
-                            makeBlitBarrier(srcImage.mut().handle(),
-                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                                VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-                            makeBlitBarrier(dstImage,
-                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-                        },
-                        { srcImage.mut().handle(), dstImage },
-                        extent,
-                        {
-                            makeBlitBarrier(dstImage,
-                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
-                        },
-                        VkExtent2D{ w, h },
-                        VK_FILTER_LINEAR
-                    );
-                    drawHud(dstImage);
-                    cmdbuf.end(vk);
-                    cmdbuf.submit(vk,
-                        { acquireSem.handle() }, VK_NULL_HANDLE, 0,
-                        { signalSem.at(destCount).handle() }, VK_NULL_HANDLE, 0,
-                        VK_NULL_HANDLE
-                    );
-                    processWsiEvents(0); // process events before present
-                    const VkPresentInfoKHR presentInfo{
-                        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                        .waitSemaphoreCount = 1,
-                        .pWaitSemaphores = &signalSem.at(destCount).handle(),
-                        .swapchainCount = 1,
-                        .pSwapchains = &swapchain,
-                        .pImageIndices = &idx,
-                    };
-                    (void)vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
-                    presentedFrames += 1;
+        // FIFO acquire paces the thread at one present per vblank.
+        constexpr uint64_t acquireTimeoutNs = 200ULL * 1000 * 1000;   // 200 ms
+        auto acquireImage = [&](uint32_t& outIdx) -> bool {
+            for (;;) {
+                if (stop.load(std::memory_order_relaxed)
+                        || failed.load(std::memory_order_relaxed))
+                    return false;
+                const auto res = vk.df().AcquireNextImageKHR(vk.dev(), swapchain,
+                    acquireTimeoutNs, acquireSem.handle(), VK_NULL_HANDLE, &outIdx);
+                if (res != VK_TIMEOUT) {
+                    if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+                        throw ls::vulkan_error(res, "AcquireNextImageKHR failed");
+                    return true;
                 }
-                std::cerr << "lsfg-vk-app: idle >5 s, presenting last frame (slot " << lastFrameStagingIdx << ")\n";
-                idleLogged = true;
+                processWsiEvents(0);   // may deliver the wl_buffer release
             }
-            maybeStats(now);
-            // Process WSI events even during idle to keep Wayland connection alive
-            processWsiEvents(0);
-            continue;
-        }
+        };
 
-        // receive is bounded by SO_RCVTIMEO (set on the socket by runStream).
-        auto msg = conn.receive(std::nullopt);
-        const auto* frame = std::get_if<ls::ipc::Frame>(&msg);
-        if (!frame)
-            // steady state is one FRAME per staging slot per generation cycle;
-            // anything else (a stray message) is silently drained.
-            continue;
+        // the frame the output is currently realizing on the display.
+        struct Cur {
+            bool active{ false };
+            size_t nextDest{ 0 };      // 0..destCount: gen presents in flight
+            uint32_t stagingIdx{ 0 };
+            std::vector<int> doneFds;  // produced gen fds; -1 once imported
+            int snapFd{ -1 };          // snapshot sync_fd sem for REAL blit
+        } cur;
+        int lastShownStagingIdx{ -1 }; // newest real frame actually shown (HOLD-LAST)
+        uint64_t presentIdx{ 0 };      // rolling index into the signal pool
 
-        // reset idle state on new frame
-        idleLogged = false;
-        lastFrameTime = now;
-        lastFrameStagingIdx = frame->stagingIdx;
-        ++frameCount;
-
-        // the FRAME carries the capture sync fd; scheduleFrames consumes it.
-        const int captureFd = conn.takeReceivedFd();
-
-        // TEMP DEBUG: probe the raw kernel sync fds (poll = non-destructive) to
-        // find which fence never signals: the layer's capture blit fd, then the
-        // backend's per-destination done fds. gated: the 500 ms polls add
-        // latency per frame when enabled.
-        if (dbgEnabled()) {
-            pollfd cf{captureFd, POLLIN, 0};
-            const int cr = captureFd >= 0 ? ::poll(&cf, 1, 500) : -1;
-            dbg("present: captureFd %d signaled within 500ms: %s (fidx %zu)",
-                captureFd, (cr == 1 && (cf.revents & POLLIN)) ? "yes" : "NO", fidx);
-        }
-
-        // cross-frame gate: the previous frame's last submit signaled the
-        // fence; wait for it before reusing the command buffer / re-reading the
-        // source images (mirrors the layer's renderFence gate).
-        if (fidx && !fence.wait(vk, 150ULL * 1000 * 1000))
-            throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
-        fence.reset(vk);
-
-        dbg("present: FRAME received (slot %u), scheduleFrames start (fidx %zu)",
-            frame->stagingIdx, fidx);
-        std::vector<int> doneFds;
-        try {
-            doneFds = backend.scheduleFrames(*state.context, captureFd);
-        } catch (const std::exception& e) {
-            throw ls::error("failed to schedule frames", e);
-        }
-        dbg("present: scheduleFrames done (fidx %zu)", fidx);
-        if (dbgEnabled())
-            for (size_t i = 0; i < doneFds.size(); ++i) {
-                if (doneFds.at(i) < 0)
-                    continue;
-                pollfd df{doneFds.at(i), POLLIN, 0};
-                const int dr = ::poll(&df, 1, 500);
-                dbg("present: doneFd[%zu] %d signaled within 500ms: %s (fidx %zu)",
-                    i, doneFds.at(i), (dr == 1 && (df.revents & POLLIN)) ? "yes" : "NO", fidx);
+        Clock::time_point statsLastTime = Clock::now();
+        const auto statsInterval = std::chrono::seconds(1);
+        // 1 Hz HUD/stats update from the output thread.
+        auto maybeStats = [&](Clock::time_point now) {
+            if (now - statsLastTime < statsInterval)
+                return;
+            const double dt = std::chrono::duration<double>(now - statsLastTime).count();
+            const uint32_t gameFps = static_cast<uint32_t>(frameCount.exchange(0) / dt);
+            const uint32_t presentedFps = static_cast<uint32_t>(presentedFrames.exchange(0) / dt);
+            if (verboseEnabled())
+                std::cerr << "lsfg-vk-app: " << gameFps << " fps game, "
+                          << presentedFps << " fps presented\n";
+            {
+                // hud.update submits on the queue; serialize against the input thread.
+                std::lock_guard<std::mutex> lk(submitMtx);
+                try {
+                    hud.update(std::to_string(gameFps) + "/" + std::to_string(presentedFps));
+                } catch (const std::exception& e) {
+                    std::cerr << "lsfg-vk-app: hud update failed: " << e.what() << "\n";
+                }
             }
-        if (doneFds.size() != destCount)
-            throw ls::error("backend returned " + std::to_string(doneFds.size())
-                + " done fds, expected " + std::to_string(destCount));
+            statsLastTime = now;
+        };
 
-        // wall-clock start of the present phase (blits + 2 presents + RELEASE)
-        const auto presentT0 = Clock::now();
-        const VkExtent2D imgExtent{ w, h };
-
-        // --- generated presents: one per destination image -----------------
-        for (size_t i = 0; i < destCount; ++i) {
-            // acquire a swapchain image (wait: acquireSem is always unsignaled).
-            dbg("present: acquire gen %zu/%zu (fidx %zu)", i, destCount, fidx);
-            const auto acqT0 = Clock::now();
+        // present one swapchain image that blits the private snapshot of the
+        // given real frame into it (used for REAL presents and HOLD-LAST).
+        auto presentReal = [&](int stagingIdx, int snapFd) -> bool {
             uint32_t idx{};
-            if (!acquireImage(idx))
-                break;
-            dbg("present: acquire gen BLOCKED %lld ms (fidx %zu)",
-                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - acqT0).count(), fidx);
+            const auto tReal0 = Clock::now();
+            if (!acquireImage(idx)) {
+                if (snapFd >= 0) ::close(snapFd);
+                return false;
+            }
+            const auto tAcquire = Clock::now();
             const VkImage dstImage = swapImages.at(idx);
-
-            // wait for this generated frame via its sync fd.
-            const int dFd = doneFds.at(i);
-            if (dFd >= 0)
-                importSyncFd(vk, doneWaitSem.at(i).handle(), dFd);
-
-            // blit destinationImage[i] -> swapchain image -> present.
-            cmdbuf.begin(vk);
-            cmdbuf.blitImage(vk,
-                {
-                    makeBlitBarrier(state.destinationImages.at(i).mut().handle(),
-                        VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-                    makeBlitBarrier(dstImage,
-                        VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-                },
-                { state.destinationImages.at(i).mut().handle(), dstImage },
-                extent,
-                {
-                    makeBlitBarrier(dstImage,
-                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
-                },
-                imgExtent,
-                VK_FILTER_LINEAR
-            );
-            drawHud(dstImage);
-            cmdbuf.end(vk);
-            cmdbuf.submit(vk,
-                { acquireSem.handle(), doneWaitSem.at(i).handle() },
-                VK_NULL_HANDLE, 0,
-                { signalSem.at(i).handle() }, VK_NULL_HANDLE, 0,
-                VK_NULL_HANDLE
-            );
-
-            processWsiEvents(0); // process events before present
-            const VkPresentInfoKHR presentInfo{
-                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                .waitSemaphoreCount = 1,
-                .pWaitSemaphores = &signalSem.at(i).handle(),
-                .swapchainCount = 1,
-                .pSwapchains = &swapchain,
-                .pImageIndices = &idx,
-            };
-            const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
-            if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
-                throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
-            dbg("present: gen-present done, present-phase %lld ms (fidx %zu)",
-                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - presentT0).count(), fidx);
-        }
-        // a stop mid-generation loop must exit the present loop, not just the
-        // per-destination for loop above.
-        if (stop.load(std::memory_order_relaxed))
-            break;
-
-        // --- ONE real frame: blit the latest captured game frame -----------
-        {
-            dbg("present: acquire real (fidx %zu)", fidx);
-            const auto acqT1 = Clock::now();
-            uint32_t idx{};
-            if (!acquireImage(idx))
-                break;
-            dbg("present: acquire real BLOCKED %lld ms (fidx %zu)",
-                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - acqT1).count(), fidx);
-            const VkImage dstImage = swapImages.at(idx);
-
-            auto& srcImage = state.sourceImages.at(frame->stagingIdx);
-            cmdbuf.begin(vk);
-            cmdbuf.blitImage(vk,
+            auto& srcImage = state.genSources.at(stagingIdx);
+            // wait for this command buffer's previous submit to complete
+            if (!cbFences.at(cbIdx).wait(vk, UINT64_MAX))
+                throw ls::vulkan_error(VK_TIMEOUT, "cb fence wait failed");
+            cbFences.at(cbIdx).reset(vk);
+            cbs.at(cbIdx).begin(vk);
+            // wait on the snapshot sync_fd semaphore (ensures copyImage done)
+            std::vector<VkSemaphore> realWaits{ acquireSem.handle() };
+            if (snapFd >= 0) {
+                const auto tImport0 = Clock::now();
+                // import consumes the fd on success (ownership transfers) - do NOT close
+                importSyncFd(vk, doneWaitSem.at(destCount).handle(), snapFd);
+                const auto tImport1 = Clock::now();
+                realWaits.push_back(doneWaitSem.at(destCount).handle());
+                dbg("output: REAL importSyncFd %lld us", elapsedUs(tImport0, tImport1));
+            }
+            cbs.at(cbIdx).blitImage(vk,
                 {
                     makeBlitBarrier(srcImage.mut().handle(),
-                        VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
                         VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
                     makeBlitBarrier(dstImage,
                         VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
@@ -623,21 +640,29 @@ if (dbgEnabled())
                 imgExtent,
                 VK_FILTER_LINEAR
             );
-            drawHud(dstImage);
-            cmdbuf.end(vk);
-            // the real present is the last submit of the frame: signal the fence
-            // so the next frame's gate waits for all of this frame's work.
-            cmdbuf.submit(vk,
-                { acquireSem.handle() }, VK_NULL_HANDLE, 0,
-                { signalSem.at(destCount).handle() }, VK_NULL_HANDLE, 0,
-                fence.handle()
-            );
-
-            processWsiEvents(0); // process events before present
+            drawHud(cbs.at(cbIdx), dstImage);
+            const auto tBlitEnd = Clock::now();
+            cbs.at(cbIdx).end(vk);
+            {
+                const auto tLock0 = Clock::now();
+                std::lock_guard<std::mutex> lk(submitMtx);
+                const auto tLock1 = Clock::now();
+                cbs.at(cbIdx).submit(vk,
+                    realWaits, VK_NULL_HANDLE, 0,
+                    { signalSem.at(presentIdx % signalPool).handle() }, VK_NULL_HANDLE, 0,
+                    cbFences.at(cbIdx).handle());
+                const auto tSubmit1 = Clock::now();
+                dbg("output: REAL acquire %lld us blit %lld us lock %lld us submit %lld us (total %lld us)",
+                    elapsedUs(tReal0, tAcquire), elapsedUs(tAcquire, tBlitEnd),
+                    elapsedUs(tLock0, tLock1), elapsedUs(tLock1, tSubmit1),
+                    elapsedUs(tReal0, tSubmit1));
+            }
+            cbIdx = (cbIdx + 1) % cbRingSize;
+            processWsiEvents(0);
             const VkPresentInfoKHR presentInfo{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                 .waitSemaphoreCount = 1,
-                .pWaitSemaphores = &signalSem.at(destCount).handle(),
+                .pWaitSemaphores = &signalSem.at(presentIdx % signalPool).handle(),
                 .swapchainCount = 1,
                 .pSwapchains = &swapchain,
                 .pImageIndices = &idx,
@@ -645,34 +670,427 @@ if (dbgEnabled())
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
-            dbg("present: real-present done, present-phase TOTAL %lld ms (fidx %zu)",
-                std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - presentT0).count(), fidx);
+            ++presentIdx;
+            ++presentedFrames;
+            return true;
+        };
+
+        try {
+            for (;;) {
+                if (stop.load(std::memory_order_relaxed)
+                        || failed.load(std::memory_order_relaxed))
+                    break;
+
+                // realize a freshly-produced frame (drop-oldest/newest).
+                // Session 13.21: when idle this BLOCKS on the inbox cv (wakes
+                // instantly on arrival; 15 ms cap only pumps WSI events). The
+                // taken frame is fully consumed into cur - fds never dropped.
+                if (!cur.active) {
+                    auto pf = inbox.takeNewest();
+                    if (!pf)
+                        pf = inbox.takeNewestWait(15);
+                    if (pf) {
+                        cur.active = true;
+                        cur.nextDest = 0;
+                        cur.stagingIdx = pf->stagingIdx;
+                        cur.doneFds = std::move(pf->doneFds);
+                        cur.snapFd = pf->snapFd;  // -1 if no snapshot fd
+                    }
+                }
+
+                // exactly one present this vblank: GEN, REAL, or HOLD-LAST.
+                if (cur.active && cur.nextDest < destCount) {
+                    // --- GEN present for destination images[cur.nextDest] ------
+                    const size_t i = cur.nextDest;
+                    const auto tGen0 = Clock::now();
+                    uint32_t idx{};
+                    if (!acquireImage(idx))
+                        break;
+                    const auto tAcquire = Clock::now();
+                    const VkImage dstImage = swapImages.at(idx);
+                    if (cur.doneFds.at(i) >= 0) {
+                        importSyncFd(vk, doneWaitSem.at(i).handle(), cur.doneFds.at(i));
+                        cur.doneFds.at(i) = -1;   // import consumed the fd
+                    }
+                    // wait for this command buffer's previous submit to complete
+                    if (!cbFences.at(cbIdx).wait(vk, UINT64_MAX))
+                        throw ls::vulkan_error(VK_TIMEOUT, "cb fence wait failed");
+                    cbFences.at(cbIdx).reset(vk);
+                    cbs.at(cbIdx).begin(vk);
+                    cbs.at(cbIdx).blitImage(vk,
+                        {
+                            makeBlitBarrier(state.destinationImages.at(i).mut().handle(),
+                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                            makeBlitBarrier(dstImage,
+                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                        },
+                        { state.destinationImages.at(i).mut().handle(), dstImage },
+                        extent,
+                        {
+                            makeBlitBarrier(dstImage,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                        },
+                        imgExtent,
+                        VK_FILTER_LINEAR
+                    );
+                    drawHud(cbs.at(cbIdx), dstImage);
+                    const auto tBlitEnd = Clock::now();
+                    cbs.at(cbIdx).end(vk);
+                    {
+                        std::lock_guard<std::mutex> lk(submitMtx);
+                        cbs.at(cbIdx).submit(vk,
+                            { acquireSem.handle(), doneWaitSem.at(i).handle() },
+                            VK_NULL_HANDLE, 0,
+                            { signalSem.at(presentIdx % signalPool).handle() }, VK_NULL_HANDLE, 0,
+                            cbFences.at(cbIdx).handle());
+                    }
+                    processWsiEvents(0);
+                    const VkPresentInfoKHR presentInfo{
+                        .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                        .waitSemaphoreCount = 1,
+                        .pWaitSemaphores = &signalSem.at(presentIdx % signalPool).handle(),
+                        .swapchainCount = 1,
+                        .pSwapchains = &swapchain,
+                        .pImageIndices = &idx,
+                    };
+                    const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+                    if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
+                        throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
+                    ++presentIdx;
+                    ++presentedFrames;
+                    ++cur.nextDest;
+                    dbg("output: GEN present dest %zu/%zu (slot %u)",
+                        i, destCount, cur.stagingIdx);
+                } else if (cur.active) {
+                    // --- REAL present: this frame's private snapshot -----------
+                    if (!presentReal(cur.stagingIdx, cur.snapFd >= 0 ? cur.snapFd : -1))
+                        break;
+                    lastShownStagingIdx = static_cast<int>(cur.stagingIdx);
+                    for (int d : cur.doneFds)   // close any never-imported gen fds
+                        if (d >= 0)
+                            ::close(d);
+                    cur.active = false;
+                    dbg("output: REAL present (slot %u)", cur.stagingIdx);
+                } else if (lastShownStagingIdx >= 0) {
+                    // --- HOLD-LAST: nothing newer to show ---------------------
+                    // Session 13.13: the last REAL present is still on screen;
+                    // re-blitting at 240 Hz burns the 9060 XT. Session 13.21:
+                    // do NOT consume anything here - the loop top's blocking
+                    // take fills cur the instant a frame arrives. Just pump
+                    // WSI events non-blockingly and continue.
+                } else {
+                    // first frame not shown yet: loop top's takeNewestWait
+                    // blocks for it; nothing to do here.
+                }
+
+                maybeStats(Clock::now());
+
+                // stop on a window resize/close (processEvents returns true).
+                if (wsi->processEvents(0))
+                    break;
+            }
+
+            // drain frames left in the inbox / cur so no fd leaks at teardown.
+            while (auto pf = inbox.takeNewest()) {
+                for (int d : pf->doneFds)
+                    if (d >= 0)
+                        ::close(d);
+                if (pf->snapFd >= 0)
+                    ::close(pf->snapFd);
+            }
+            for (int d : cur.doneFds)
+                if (d >= 0)
+                    ::close(d);
+            if (cur.snapFd >= 0)
+                ::close(cur.snapFd);
+        } catch (...) {
+            if (cur.snapFd >= 0) ::close(cur.snapFd);
+            if (!outputError)
+                outputError = std::current_exception();
+            failed.store(true, std::memory_order_relaxed);
         }
+    };
 
-        if (verboseEnabled())
-            std::cerr << "[gen x " << destCount << " + real]\n";
-        presentedFrames += presentCount;
+    // --- INPUT thread: receive -> schedule -> snapshot -> release -> enqueue --
+    auto inputLoop = [&] {
+        vk::CommandBuffer cb{ vk, vk.transferCmdPoolHandle() };
+        vk::Fence snapCbFence{ vk, true };
+        vk::CommandBuffer emptyGenCb{ vk };
+        vk::Fence emptyGenFence{ vk, true };
+        vk::CommandBuffer emptyXferCb{ vk, vk.transferCmdPoolHandle() };
+        vk::Fence emptyXferFence{ vk, true };
+        uint64_t fidx{ 0 };
+        try {
+            for (;;) {
+                if (stop.load(std::memory_order_relaxed)
+                        || failed.load(std::memory_order_relaxed))
+                    break;
+                pollfd pfd{};
+                pfd.fd = conn.fd();
+                pfd.events = POLLIN;
+                const int pr = ::poll(&pfd, 1, 200);
+                if (pr < 0) {
+                    if (errno == EINTR)
+                        continue;
+                    throw ls::ipc::socket_error("poll() on input thread", errno);
+                }
+                if (stop.load(std::memory_order_relaxed)
+                        || failed.load(std::memory_order_relaxed))
+                    break;
+                if (pr == 0 || !(pfd.revents & POLLIN))
+                    continue;
+                auto msg = conn.receive(std::nullopt);
+                const auto* frame = std::get_if<ls::ipc::Frame>(&msg);
+                if (!frame)
+                    continue;
 
-        // backpressure: tell the layer this slot is free so it can recapture
-        // into it (the ring is 2 deep, so the layer will not reuse it until a
-        // cycle later by which point this read is long done).
-        conn.send(ls::ipc::Release{ frame->stagingIdx });
+                int captureFd = conn.takeReceivedFd();
+                static const bool dropGen = std::getenv("LSFGVK_DROP_GEN")
+                    && std::getenv("LSFGVK_DROP_GEN")[0] == '1';
+                if (dropGen) {
+                    if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
+                    conn.send(ls::ipc::Release{ frame->stagingIdx });
+                    dbg("input: DROP_GEN Release (slot %u) (fidx %llu)",
+                        frame->stagingIdx, (unsigned long long)fidx);
+                    ++fidx;
+                    continue;
+                }
 
-        ++fidx;
-        maybeStats(Clock::now());
+                conn.send(ls::ipc::Release{ frame->stagingIdx });
+                dbg("input: Release first (slot %u) (fidx %llu)",
+                    frame->stagingIdx, (unsigned long long)fidx);
 
-        // stop on a window resize/close (processEvents returns true for both).
-        // Non-blocking (0): the wl queue is pumped non-blockingly before every
-        // acquire/present (processWsiEvents(0)), so releases/configures are
-        // handled there. A blocking poll (was 16 ms) slept up to 16 ms per
-        // cycle when the queue was empty - and when the compositor is stalling
-        // (empty queue) it stretched every cycle, amplifying the stall.
-        // Resize/close detection lands at most one cycle later; teardown unchanged.
-        if (wsi->processEvents(0))
-            break;
+                static const bool skipSnap = (std::getenv("LSFGVK_SKIP_SNAP")
+                    && std::getenv("LSFGVK_SKIP_SNAP")[0] == '1')
+                    || (std::getenv("LSFGVK_EMPTY_GEN")
+                        && std::getenv("LSFGVK_EMPTY_GEN")[0] == '1')
+                    || (std::getenv("LSFGVK_EMPTY_XFER")
+                        && std::getenv("LSFGVK_EMPTY_XFER")[0] == '1');
+                int snapFd = -1;
+                if (!skipSnap) {
+                if (!snapCbFence.wait(vk, 0)) {
+                    if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
+                    dbg("input: snapshot skip (cb busy) (fidx %llu)",
+                        (unsigned long long)fidx);
+                } else {
+                snapCbFence.reset(vk);
+                const uint32_t sidx = frame->stagingIdx;
+                if (sidx >= ls::ipc::STAGING_RING_DEPTH)
+                    throw ls::error("FRAME stagingIdx out of range");
+                if (state.shmBytes && sidx < state.shmMaps.size()
+                        && state.shmMaps.at(sidx) && state.hostPtrs.at(sidx)) {
+                    if (captureFd >= 0) {
+                        pollfd pfd{};
+                        pfd.fd = captureFd;
+                        pfd.events = POLLIN;
+                        ::poll(&pfd, 1, 1);
+                        ::close(captureFd);
+                        captureFd = -1;
+                    }
+                    if (state.shmSeq.at(sidx)) {
+                        for (int waits = 0; waits < 3; ++waits) {
+                            const uint32_t s = __atomic_load_n(
+                                state.shmSeq.at(sidx), __ATOMIC_ACQUIRE);
+                            if (s != state.shmSeen.at(sidx)) {
+                                state.shmSeen.at(sidx) = s;
+                                break;
+                            }
+                            if (waits < 2)
+                                ::poll(nullptr, 0, 1);
+                        }
+                    }
+                    std::memcpy(state.hostPtrs.at(sidx), state.shmMaps.at(sidx),
+                        state.shmBytes);
+                    dbg("input: posix-shm memcpy slot %u", sidx);
+                } else if (captureFd >= 0 && !state.aImports.at(sidx).has_value()) {
+                    try {
+                        const vk::ImageLayout aLayout{
+                            .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
+                                ? vk::ImageMode::Linear : vk::ImageMode::DrmModifier,
+                            .drmModifier = state.negotiatedModifier,
+                            .rowPitch = state.rowPitch,
+                        };
+                        const std::vector<uint32_t> families{
+                            vk.queueFamilyIndex(), vk.transferQueueFamilyIndex()
+                        };
+                        const VkSharingMode share = vk.hasTransferQueue()
+                            ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+                        const VkImageUsageFlags aUsage =
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                            | VK_IMAGE_USAGE_SAMPLED_BIT;
+                        auto importOne = [&](int fd) {
+                            state.aImports.at(sidx).emplace(vk,
+                                VkExtent2D{ state.width, state.height },
+                                state.sourceFormat, aUsage,
+                                fd, std::nullopt, aLayout, share, families);
+                        };
+                        int tryFd = ::dup(captureFd);
+                        if (tryFd < 0)
+                            throw ls::error("dup() failed before 9070 import");
+                        try {
+                            importOne(tryFd);
+                            tryFd = -1;
+                            ::close(captureFd); captureFd = -1;
+                            dbg("input: imported 9070 capture slot %u", sidx);
+                        } catch (const std::exception& e1) {
+                            dbg("input: direct import failed slot %u: %s",
+                                sidx, e1.what());
+                            const int localFd = primeReexportOn9060(captureFd);
+                            if (localFd < 0)
+                                throw;
+                            try {
+                                importOne(localFd);
+                                dbg("input: PRIME-imported 9070 capture slot %u", sidx);
+                            } catch (...) {
+                                ::close(localFd);
+                                throw;
+                            }
+                            if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
+                        }
+                    } catch (const std::exception& e) {
+                        dbg("input: 9070 dma-buf import failed slot %u: %s",
+                            sidx, e.what());
+                        if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
+                    }
+                } else if (captureFd >= 0) {
+                    ::close(captureFd);
+                    captureFd = -1;
+                }
+                auto& srcLazy = state.aImports.at(sidx).has_value()
+                    ? state.aImports.at(sidx)
+                    : state.sourceImages.at(sidx);
+                auto& snapLazy = state.genSources.at(sidx);
+                const VkImageLayout srcOld = state.shmBytes
+                    ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+                const VkImageLayout srcNew = state.shmBytes
+                    ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                cb.begin(vk);
+                cb.copyImage(vk,
+                    {
+                        makeBlitBarrier(srcLazy.mut().handle(),
+                            VK_ACCESS_NONE, srcOld,
+                            VK_ACCESS_TRANSFER_READ_BIT, srcNew),
+                        makeBlitBarrier(snapLazy.mut().handle(),
+                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                    },
+                    { srcLazy.mut().handle(), snapLazy.mut().handle() },
+                    imgExtent,
+                    {
+                        makeBlitBarrier(snapLazy.mut().handle(),
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                    }
+                );
+                cb.end(vk);
+                {
+                    std::lock_guard<std::mutex> lk(submitMtx);
+                    cb.submit(vk,
+                        std::vector<VkSemaphore>{}, VK_NULL_HANDLE, 0,
+                        {}, snapshotSem.handle(), 0,
+                        snapCbFence.handle(),
+                        vk.transferQueueHandle());
+                }
+                snapFd = snapshotSem.exportFd(vk);
+                dbg("input: snapshot submitted xferQ=%d (fidx %llu)",
+                    vk.transferQueueHandle() != VK_NULL_HANDLE,
+                    (unsigned long long)fidx);
+                }
+                } else {
+                    if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
+                }
+
+                static const bool emptyGen = std::getenv("LSFGVK_EMPTY_GEN")
+                    && std::getenv("LSFGVK_EMPTY_GEN")[0] == '1';
+                static const bool emptyXfer = std::getenv("LSFGVK_EMPTY_XFER")
+                    && std::getenv("LSFGVK_EMPTY_XFER")[0] == '1';
+                if (emptyGen || emptyXfer) {
+                    auto& eCb = emptyXfer ? emptyXferCb : emptyGenCb;
+                    auto& eFence = emptyXfer ? emptyXferFence : emptyGenFence;
+                    VkQueue q = emptyXfer ? vk.transferQueueHandle() : vk.queue();
+                    static int periodMs = [] {
+                        const char* p = std::getenv("LSFGVK_EMPTY_PERIOD_MS");
+                        return p ? std::atoi(p) : 0;
+                    }();
+                    static auto lastSubmit = Clock::now()
+                        - std::chrono::milliseconds(1000);
+                    const auto now = Clock::now();
+                    const bool due = periodMs <= 0
+                        || std::chrono::duration_cast<std::chrono::milliseconds>(
+                            now - lastSubmit).count() >= periodMs;
+                    if (due && q != VK_NULL_HANDLE && eFence.wait(vk, 0)) {
+                        eFence.reset(vk);
+                        eCb.begin(vk);
+                        eCb.end(vk);
+                        VkCommandBuffer rawBuf = eCb.raw();
+                        std::lock_guard<std::mutex> lk(submitMtx);
+                        const VkSubmitInfo si{
+                            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                            .commandBufferCount = 1,
+                            .pCommandBuffers = &rawBuf,
+                        };
+                        auto res = vk.df().QueueSubmit(q, 1, &si, eFence.handle());
+                        if (res != VK_SUCCESS)
+                            throw ls::vulkan_error(res, "empty gen QueueSubmit failed");
+                        lastSubmit = now;
+                        dbg("input: EMPTY_%s QueueSubmit period=%d (fidx %llu)",
+                            emptyXfer ? "XFER" : "GEN", periodMs,
+                            (unsigned long long)fidx);
+                    }
+                    ++fidx;
+                    continue;
+                }
+
+                const auto tSched0 = Clock::now();
+                std::vector<int> doneFds;
+                try {
+                    std::lock_guard<std::mutex> lk(submitMtx);
+                    doneFds = backend.scheduleFrames(*state.context, -1);
+                } catch (const std::exception& e) {
+                    if (snapFd >= 0) ::close(snapFd);
+                    throw ls::error("failed to schedule frames", e);
+                }
+                if (doneFds.size() != destCount)
+                    throw ls::error("backend returned " + std::to_string(doneFds.size())
+                        + " done fds, expected " + std::to_string(destCount));
+                dbg("input: scheduleFrames took %lld us (fidx %llu)",
+                    elapsedUs(tSched0, Clock::now()), (unsigned long long)fidx);
+
+                inbox.push(PendingFrame{ std::move(doneFds), snapFd, frame->stagingIdx });
+                ++frameCount;
+                ++fidx;
+            }
+        } catch (...) {
+            if (!inputError)
+                inputError = std::current_exception();
+            failed.store(true, std::memory_order_relaxed);
+        }
+    };
+
+    // --- run both until stop/failure, then join and tear down cleanly --------
+    std::thread inputThread(inputLoop);
+    std::thread outputThread(outputLoop);
+    inputThread.join();
+    outputThread.join();
+
+    // close any fds still in the inbox (the input may have pushed after the
+    // output's drain) and idle the device before the RAII guard destroys WSI.
+    while (auto pf = inbox.takeNewest())
+        for (int d : pf->doneFds)
+            if (d >= 0)
+                ::close(d);
+    {
+        std::lock_guard<std::mutex> lk(submitMtx);
+        vk.df().DeviceWaitIdle(vk.dev());
     }
-
-    // guard tears down the swapchain + surface + connection on return.
+    if (inputError)
+        std::rethrow_exception(inputError);
+    if (outputError)
+        std::rethrow_exception(outputError);
 }
 
 } // namespace ls::presentation

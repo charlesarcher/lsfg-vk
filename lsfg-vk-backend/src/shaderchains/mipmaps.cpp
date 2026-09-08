@@ -17,27 +17,24 @@
 using namespace lsfgvk::backend;
 
 Mipmaps::Mipmaps(const Ctx& ctx,
-        const std::pair<vk::Image, vk::Image>& sourceImages) {
+        const std::vector<vk::Image>& sourceImages) {
     // create output images for base and 6 mips
     this->images.reserve(7);
     for (uint32_t i = 0; i < 7; i++)
        this->images.emplace_back(ctx.vk,
             backend::shift_extent(ctx.flowExtent, i), VK_FORMAT_R8_UNORM);
 
-    // create descriptor sets for both input images
-    this->sets.reserve(2);
-    this->sets.emplace_back(ManagedShaderBuilder()
-        .sampled(sourceImages.first)
-        .storages(this->images)
-        .sampler(ctx.bnbSampler)
-        .buffer(ctx.constantBuffer)
-        .build(ctx.vk, ctx.pool, ctx.shaders.get().mipmaps));
-    this->sets.emplace_back(ManagedShaderBuilder()
-        .sampled(sourceImages.second)
-        .storages(this->images)
-        .sampler(ctx.bnbSampler)
-        .buffer(ctx.constantBuffer)
-        .build(ctx.vk, ctx.pool, ctx.shaders.get().mipmaps));
+    // create one descriptor set per source image; render() picks the set of
+    // the current frame (idx % sets.size()), so the chain rotates over the
+    // ring just like the layer does
+    this->sets.reserve(sourceImages.size());
+    for (const vk::Image& src : sourceImages)
+        this->sets.emplace_back(ManagedShaderBuilder()
+            .sampled(src)
+            .storages(this->images)
+            .sampler(ctx.bnbSampler)
+            .buffer(ctx.constantBuffer)
+            .build(ctx.vk, ctx.pool, ctx.shaders.get().mipmaps));
 
     // store dispatch extent
     this->dispatchExtent = backend::add_shift_extent(ctx.flowExtent, 63, 6);
@@ -49,5 +46,5 @@ void Mipmaps::prepare(std::vector<VkImage>& images) const {
 }
 
 void Mipmaps::render(const vk::Vulkan& vk, const vk::CommandBuffer& cmd, size_t idx) const {
-    this->sets.at(idx % 2).dispatch(vk, cmd, this->dispatchExtent);
+    this->sets.at(idx % this->sets.size()).dispatch(vk, cmd, this->dispatchExtent);
 }

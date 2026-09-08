@@ -456,18 +456,65 @@ public:
                 return false;
         }
 
-        mDisplay = wl_display_connect(nullptr);
-        if (!mDisplay)
-            throw ls::error("cannot connect to Wayland display ($WAYLAND_DISPLAY)");
+        // A second concurrent wl_display_connect in this process (game
+        // swapchain recreate while the old overlay is still up) can return a
+        // socket that never delivers registry globals. Roundtripping that
+        // dead display forever is the FS-black path. Fresh-connect retries
+        // after the previous overlay is gone; runPresent serializes so the
+        // old display is disconnected first.
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            if (mDisplay) {
+                wl_display_disconnect(mDisplay);
+                mDisplay = nullptr;
+            }
+            mGlobals = {};
+            mDisplay = wl_display_connect(nullptr);
+            if (!mDisplay)
+                throw ls::error("cannot connect to Wayland display ($WAYLAND_DISPLAY)");
 
-        wl_registry* registry = wl_display_get_registry(mDisplay);
-        wl_registry_add_listener(registry, &registryListener, &mGlobals);
-        wl_display_roundtrip(mDisplay); // block until globals bound
+            wl_registry* registry = wl_display_get_registry(mDisplay);
+            wl_registry_add_listener(registry, &registryListener, &mGlobals);
 
-        if (!mGlobals.compositor || !mGlobals.xdgWmBase)
-            throw ls::error("Wayland compositor missing required globals (compositor, xdg_wm_base)");
+            bool haveShell = false;
+            for (int i = 0; i < 4; ++i) {
+                const int rt = wl_display_roundtrip(mDisplay);
+                haveShell = mGlobals.layerShell || mGlobals.xdgWmBase;
+                if (rt < 0) {
+                    dbg("wl: roundtrip err attempt=%d i=%d display_err=%d",
+                        attempt, i, wl_display_get_error(mDisplay));
+                    break;
+                }
+                if (mGlobals.compositor && haveShell)
+                    break;
+            }
 
-        xdg_wm_base_add_listener(mGlobals.xdgWmBase, &xdgWmBaseListener, this);
+            if (mGlobals.compositor && haveShell) {
+                wl_registry_destroy(registry);
+                if (attempt > 0)
+                    dbg("wl: connected on attempt %d", attempt);
+                break;
+            }
+
+            dbg("wl: connect attempt %d compositor=%d layer=%d xdg=%d, retry",
+                attempt,
+                mGlobals.compositor != nullptr,
+                mGlobals.layerShell != nullptr,
+                mGlobals.xdgWmBase != nullptr);
+            wl_registry_destroy(registry);
+            wl_display_disconnect(mDisplay);
+            mDisplay = nullptr;
+            mGlobals = {};
+            std::this_thread::sleep_for(std::chrono::milliseconds(32));
+        }
+
+        if (!mGlobals.compositor || (!mGlobals.layerShell && !mGlobals.xdgWmBase))
+            throw ls::error("Wayland compositor missing required globals "
+                "(compositor=" + std::to_string(mGlobals.compositor != nullptr)
+                + " layer_shell=" + std::to_string(mGlobals.layerShell != nullptr)
+                + " xdg_wm_base=" + std::to_string(mGlobals.xdgWmBase != nullptr) + ")");
+
+        if (mGlobals.xdgWmBase)
+            xdg_wm_base_add_listener(mGlobals.xdgWmBase, &xdgWmBaseListener, this);
 
         // TEMP DEBUG (LSFGVK_APP_DBG): bind pointer/keyboard so the input
         // probe can log any event the compositor routes to this window.
@@ -480,10 +527,8 @@ public:
                 wl_keyboard_add_listener(g_inputProbe.keyboard, &probeKeyboardListener, nullptr);
         }
 
-        // Enumerate outputs
+        // Enumerate outputs (opens its own registry)
         mOutputs = enumerateOutputs();
-
-        wl_registry_destroy(registry);
         return true;
     }
 
@@ -550,6 +595,15 @@ public:
             // sides the surface is output-sized anyway); claiming a zone
             // would push/resize the game's window, which must stay put.
             zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, -1);
+            // Isolated overlay covers the output. 1 px gap was for forwarded
+            // WSI occlusion; LSFGVK_OVERLAY_GAP=N restores a margin.
+            int gap = 0;
+            if (const char* e = std::getenv("LSFGVK_OVERLAY_GAP"))
+                gap = std::atoi(e);
+            if (gap > 0) {
+                zwlr_layer_surface_v1_set_margin(mLayerSurface, gap, gap, gap, gap);
+                dbg("overlay gap %d px (LSFGVK_OVERLAY_GAP)", gap);
+            }
             // Protocol default keyboard_interactivity is `exclusive`, which
             // would steal the keyboard from the game - set it to none so the
             // overlay is input-transparent for keyboard focus as well.

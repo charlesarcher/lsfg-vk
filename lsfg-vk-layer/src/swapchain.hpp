@@ -29,6 +29,7 @@ namespace lsfgvk::layer {
         VkColorSpaceKHR colorSpace;
         VkExtent2D extent;
         VkPresentModeKHR presentMode;
+        bool fake{false};   // layer-owned images, no driver swapchain behind them
     };
 
     /// modify the swapchain create info based on the profile pre-swapchain creation
@@ -96,6 +97,10 @@ namespace lsfgvk::layer {
 
         ls::GameConf profile;
         SwapchainInfo info;
+
+        // nonblocking acquire prefetch state
+        std::optional<uint32_t> pendingAcquireIdx{std::nullopt};
+        std::optional<vk::Semaphore> pendingAcquireSemaphore{std::nullopt};
     };
 
 }

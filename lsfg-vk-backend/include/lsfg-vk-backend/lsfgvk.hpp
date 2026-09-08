@@ -9,6 +9,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <string>
@@ -279,6 +280,11 @@ namespace lsfgvk::backend {
         std::unique_ptr<InstanceImpl> m_impl;
 
         std::vector<std::unique_ptr<Context>> m_contexts;
+        // guards m_contexts across concurrent streams: the app's threaded
+        // accept loop can close one stream's context while opening
+        // another's (windowed->fullscreen switch opens conn #2 before
+        // conn #1's teardown lands) - emplace_back/erase must not race.
+        std::mutex m_contextsMtx;
     };
 
     ///

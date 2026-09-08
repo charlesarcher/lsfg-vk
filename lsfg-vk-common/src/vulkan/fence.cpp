@@ -13,11 +13,12 @@ using namespace vk;
 
 namespace {
     /// create a fence
-    ls::owned_ptr<VkFence> createFence(const vk::Vulkan& vk) {
+    ls::owned_ptr<VkFence> createFence(const vk::Vulkan& vk, bool signaled) {
         VkFence handle{};
 
         const VkFenceCreateInfo fenceInfo{
-            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO
+            .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+            .flags = signaled ? VK_FENCE_CREATE_SIGNALED_BIT : 0
         };
         auto res = vk.df().CreateFence(vk.dev(), &fenceInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
@@ -32,8 +33,8 @@ namespace {
     }
 }
 
-Fence::Fence(const vk::Vulkan& vk)
-    : fence(createFence(vk)) {}
+Fence::Fence(const vk::Vulkan& vk, bool signaled)
+    : fence(createFence(vk, signaled)) {}
 
 void Fence::reset(const vk::Vulkan& vk) const {
     auto res = vk.df().ResetFences(vk.dev(), 1, &*this->fence);

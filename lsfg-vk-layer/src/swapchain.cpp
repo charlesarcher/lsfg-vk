@@ -384,7 +384,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
     const auto& swapchainImage = this->info.images.at(imageIdx);
-    const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
+    const auto& sourceImage = this->sourceImages.at(this->fidx % this->sourceImages.size());
 
     std::vector<int> doneFds{};
 

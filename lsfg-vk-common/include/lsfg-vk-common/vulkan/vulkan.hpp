@@ -37,6 +37,7 @@ namespace vk {
 
         // extension functions
         PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
+        PFN_vkGetPhysicalDeviceSurfacePresentModesKHR GetPhysicalDeviceSurfacePresentModesKHR;
     };
 
     /// initialize vulkan instance function pointers
@@ -125,6 +126,7 @@ namespace vk {
         PFN_vkWaitSemaphoresKHR WaitSemaphoresKHR;
         PFN_vkGetMemoryFdKHR GetMemoryFdKHR;
         PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR;
+        PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
         PFN_vkImportSemaphoreFdKHR ImportSemaphoreFdKHR;
         PFN_vkGetSemaphoreFdKHR GetSemaphoreFdKHR;
         PFN_vkCreateSwapchainKHR CreateSwapchainKHR;
@@ -141,6 +143,16 @@ namespace vk {
     /// @return initialized function pointers
     VulkanDeviceFuncs initVulkanDeviceFuncs(const VulkanInstanceFuncs& fi, VkDevice device,
         bool graphical);
+
+    /// find a queue family index usable for transfer-only work: first pass
+    /// prefers a dedicated transfer family (TRANSFER without GRAPHICS/COMPUTE),
+    /// falling back to any non-graphics transfer-capable family (e.g. a
+    /// COMPUTE|TRANSFER family). returns std::nullopt when no such family exists
+    /// @param fi instance function pointers
+    /// @param physdev physical device handle
+    /// @return the queue family index, or std::nullopt if none exists
+    std::optional<uint32_t> findTransferQFI(const VulkanInstanceFuncs& fi,
+        VkPhysicalDevice physdev);
 
     /// vulkan version wrapper
     class version {
@@ -176,6 +188,10 @@ namespace vk {
         ///        VK_EXT_image_drm_format_modifier) when the selected physical
         ///        device supports them; requesting them on an unsupported device
         ///        is a hard error. defaults to off (legacy extension set)
+        /// @param enableTransferQueue whether to additionally create a second
+        ///        queue from a non-graphics transfer-capable family (used by
+        ///        the app's input thread for snapshot copies). only takes
+        ///        effect when such a family exists; defaults to off
         /// @throws ls::vulkan_error on failure
         Vulkan(const std::string& appName, version appVersion,
             const std::string& engineName, version engineVersion,
@@ -183,7 +199,8 @@ namespace vk {
             bool isGraphical = false,
             std::optional<PFN_vkSetDeviceLoaderData> setLoaderData = std::nullopt,
             const std::optional<std::filesystem::path>& cachefile = std::nullopt,
-            bool enableDmaBufExtensions = false);
+            bool enableDmaBufExtensions = false,
+            bool enableTransferQueue = false);
 
         /// create based on an existing externally managed vulkan instance.
         /// @param instance vulkan instance handle
@@ -235,6 +252,30 @@ namespace vk {
         /// get the compute queue family index
         /// @return the queue family index
         [[nodiscard]] uint32_t queueFamilyIndex() const { return this->queueFamilyIdx; }
+
+        /// get the transfer queue family index
+        /// @return the queue family index, or VK_QUEUE_FAMILY_IGNORED if no
+        ///         transfer queue was created
+        [[nodiscard]] uint32_t transferQueueFamilyIndex() const {
+            return this->transferQueueFamilyIdx;
+        }
+
+        /// get the transfer queue
+        /// @return the queue handle, or VK_NULL_HANDLE if not created
+        [[nodiscard]] VkQueue transferQueueHandle() const { return this->transferQueue; }
+
+        /// get the transfer command pool
+        /// @return the command pool handle, or VK_NULL_HANDLE if not created
+        [[nodiscard]] VkCommandPool transferCmdPoolHandle() const {
+            return this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+                ? *this->transferCmdPool : VK_NULL_HANDLE;
+        }
+
+        /// check if a transfer queue was created
+        /// @return true if a transfer queue exists
+        [[nodiscard]] bool hasTransferQueue() const {
+            return this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED;
+        }
 
         /// check if fp16 is supported
         /// @return true if fp16 is supported
@@ -295,6 +336,9 @@ namespace vk {
         VkQueue computeQueue;
 
         ls::owned_ptr<VkCommandPool> cmdPool;
+        uint32_t transferQueueFamilyIdx{VK_QUEUE_FAMILY_IGNORED};
+        VkQueue transferQueue{};
+        ls::owned_ptr<VkCommandPool> transferCmdPool;
         ls::owned_ptr<VkPipelineCache> pipelineCache;
         std::optional<std::filesystem::path> cachefile;
     };

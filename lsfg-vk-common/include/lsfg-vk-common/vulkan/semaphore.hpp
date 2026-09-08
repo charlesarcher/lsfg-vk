@@ -27,6 +27,15 @@ namespace vk {
             VkExternalSemaphoreHandleTypeFlagBits handleType =
                 VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT);
 
+        /// wait on the semaphore until signaled or timeout expires.
+        /// polls the exported sync_fd via GetSemaphoreFdKHR + poll() —
+        /// does NOT call DeviceWaitIdle, so it does not stall the GPU.
+        /// @param vk the vulkan instance
+        /// @param timeoutNs timeout in nanoseconds
+        /// @returns true if signaled, false on timeout
+        /// @throws ls::vulkan_error on failure
+        [[nodiscard]] bool wait(const vk::Vulkan& vk, uint64_t timeoutNs) const;
+
         /// export the semaphore payload to a file descriptor.
         /// requires the semaphore to have been created with a matching
         /// external handle type. for sync_fd this snapshots the current

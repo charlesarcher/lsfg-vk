@@ -2,6 +2,7 @@
 
 #include "instance.hpp"
 #include "lsfg-vk-common/helpers/paths.hpp"
+#include "lsfg-vk-layer/isolated_swapchain.hpp"
 #include "swapchain.hpp"
 #include "lsfg-vk-common/configuration/detection.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -256,7 +257,8 @@ void Root::modifyDeviceCreateInfo(const vk::VulkanInstanceFuncs& funcs, VkPhysic
         "VK_KHR_external_memory_fd",
         "VK_KHR_external_semaphore",
         "VK_KHR_external_semaphore_fd",
-        "VK_KHR_timeline_semaphore"
+        "VK_KHR_timeline_semaphore",
+        "VK_EXT_external_memory_host"
     };
     if (game.dmaBuf)
         requiredExtensions.push_back("VK_EXT_external_memory_dma_buf");
@@ -295,6 +297,62 @@ void Root::modifyDeviceCreateInfo(const vk::VulkanInstanceFuncs& funcs, VkPhysic
     if (!isFeatureEnabled)
         createInfo.pNext = &timelineFeatures;
 
+    // extra queue so isolated-swapchain acquire/present-fence signals do not
+    // convoy behind the game's render submits (failure #11).
+    std::vector<VkDeviceQueueCreateInfo> qcis;
+    std::vector<std::vector<float>> prios;
+    std::vector<float> computePrio{1.0f};
+    VkDeviceQueueCreateInfo extraQci{};
+    if (profile.presentation == ls::Presentation::External) {
+        uint32_t famCount = 0;
+        funcs.GetPhysicalDeviceQueueFamilyProperties(physdev, &famCount, nullptr);
+        std::vector<VkQueueFamilyProperties> fams(famCount);
+        funcs.GetPhysicalDeviceQueueFamilyProperties(physdev, &famCount, fams.data());
+        qcis.assign(createInfo.pQueueCreateInfos,
+            createInfo.pQueueCreateInfos + createInfo.queueCreateInfoCount);
+        prios.resize(qcis.size());
+        bool bumped = false;
+        uint32_t extraFam = ~0u;
+        uint32_t extraIdx = 0;
+        for (size_t i = 0; i < qcis.size(); ++i) {
+            prios[i].assign(qcis[i].pQueuePriorities,
+                qcis[i].pQueuePriorities + qcis[i].queueCount);
+            qcis[i].pQueuePriorities = prios[i].data();
+            const uint32_t f = qcis[i].queueFamilyIndex;
+            if (!bumped && f < fams.size()
+                    && (fams[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+                    && qcis[i].queueCount < fams[f].queueCount) {
+                prios[i].push_back(1.0f);
+                qcis[i].pQueuePriorities = prios[i].data();
+                extraFam = f;
+                extraIdx = qcis[i].queueCount; // new last index after bump
+                qcis[i].queueCount += 1;
+                bumped = true;
+            }
+        }
+        if (!bumped) {
+            for (uint32_t f = 0; f < fams.size(); ++f) {
+                if ((fams[f].queueFlags & VK_QUEUE_COMPUTE_BIT)
+                        && !(fams[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+                        && fams[f].queueCount > 0) {
+                    extraQci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+                    extraQci.queueFamilyIndex = f;
+                    extraQci.queueCount = 1;
+                    extraQci.pQueuePriorities = computePrio.data();
+                    qcis.push_back(extraQci);
+                    extraFam = f;
+                    extraIdx = 0;
+                    bumped = true;
+                    break;
+                }
+            }
+        }
+        if (bumped)
+            noteIsolatedSignalQueue(extraFam, extraIdx);
+        createInfo.pQueueCreateInfos = qcis.data();
+        createInfo.queueCreateInfoCount = static_cast<uint32_t>(qcis.size());
+    }
+
     finish();
 }
 
@@ -310,6 +368,34 @@ void Root::modifySwapchainCreateInfo(const vk::Vulkan& vk, VkSwapchainCreateInfo
         throw ls::vulkan_error(res, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR() failed");
 
     context_ModifySwapchainCreateInfo(*this->active_profile, caps.maxImageCount, createInfo);
+
+    if (this->active_profile->presentation == ls::Presentation::External) {
+        // one-variable: don't let FIFO on the occluded game window pace acquire.
+        // IMMEDIATE if the surface supports it, else MAILBOX, else leave FIFO.
+        auto getModes = vk.fi().GetPhysicalDeviceSurfacePresentModesKHR;
+        if (getModes) {
+            uint32_t modeCount = 0;
+            auto resModes = getModes(vk.physdev(), createInfo.surface, &modeCount, nullptr);
+            if (resModes == VK_SUCCESS && modeCount > 0) {
+                std::vector<VkPresentModeKHR> modes(modeCount);
+                resModes = getModes(vk.physdev(), createInfo.surface, &modeCount, modes.data());
+                if (resModes == VK_SUCCESS) {
+                    auto has = [&](VkPresentModeKHR m) {
+                        return std::find(modes.begin(), modes.end(), m) != modes.end();
+                    };
+                    const char* name = "FIFO (unchanged)";
+                    if (has(VK_PRESENT_MODE_IMMEDIATE_KHR)) {
+                        createInfo.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+                        name = "IMMEDIATE";
+                    } else if (has(VK_PRESENT_MODE_MAILBOX_KHR)) {
+                        createInfo.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
+                        name = "MAILBOX";
+                    }
+                    std::cerr << "lsfg-vk: external present mode " << name << "\n";
+                }
+            }
+        }
+    }
 
     finish();
 }

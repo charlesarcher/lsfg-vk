@@ -5,6 +5,7 @@
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
+#include <algorithm>
 #include <bitset>
 #include <cstdint>
 #include <optional>
@@ -19,7 +20,8 @@ namespace {
     /// create a image
     ls::owned_ptr<VkImage> createImage(const vk::Vulkan& vk,
             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
-            bool external) {
+            bool external, VkSharingMode sharingMode,
+            const std::vector<uint32_t>& queueFamilyIndices) {
         VkImage handle{};
 
         const VkExternalMemoryImageCreateInfo externalInfo{
@@ -40,7 +42,9 @@ namespace {
             .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .usage = usage,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+            .sharingMode = sharingMode,
+            .queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size()),
+            .pQueueFamilyIndices = queueFamilyIndices.empty() ? nullptr : queueFamilyIndices.data()
         };
         auto res = vk.df().CreateImage(vk.dev(), &imageInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
@@ -70,7 +74,9 @@ namespace {
     /// linear layout and is accepted by RADV and ANV alike (probe: 18/18 pairs)
     ls::owned_ptr<VkImage> createExchangeImage(const vk::Vulkan& vk,
             VkExtent2D extent, VkFormat format, VkImageUsageFlags usage,
-            bool external, bool imported, const ImageLayout& layout) {
+            bool external, bool imported, const ImageLayout& layout,
+            VkSharingMode sharingMode,
+            const std::vector<uint32_t>& queueFamilyIndices) {
         // modifier 0 IS the linear layout; force it so a stray drmModifier
         // value can never turn ImageMode::Linear into an explicit layout
         const uint64_t drmModifier = layout.mode == ImageMode::Linear ?
@@ -129,7 +135,9 @@ namespace {
             .samples = VK_SAMPLE_COUNT_1_BIT,
             .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
             .usage = usage,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+            .sharingMode = sharingMode,
+            .queueFamilyIndexCount = static_cast<uint32_t>(queueFamilyIndices.size()),
+            .pQueueFamilyIndices = queueFamilyIndices.empty() ? nullptr : queueFamilyIndices.data()
         };
         auto res = vk.df().CreateImage(vk.dev(), &imageInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
@@ -314,6 +322,91 @@ namespace {
             }
         );
     }
+    ls::owned_ptr<VkImage> createLinearImage(const vk::Vulkan& vk,
+            VkExtent2D extent, VkFormat format, VkImageUsageFlags usage) {
+        VkImage handle{};
+        const VkExternalMemoryImageCreateInfo ext{
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+            .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT
+        };
+        const VkImageCreateInfo imageInfo{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            .pNext = &ext,
+            .imageType = VK_IMAGE_TYPE_2D,
+            .format = format,
+            .extent = { extent.width, extent.height, 1 },
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = VK_SAMPLE_COUNT_1_BIT,
+            .tiling = VK_IMAGE_TILING_LINEAR,
+            .usage = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE
+        };
+        auto res = vk.df().CreateImage(vk.dev(), &imageInfo, VK_NULL_HANDLE, &handle);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkCreateImage() linear host failed");
+        return ls::owned_ptr<VkImage>(
+            new VkImage(handle),
+            [dev = vk.dev(), defunc = vk.df().DestroyImage](VkImage& image) {
+                defunc(dev, image, VK_NULL_HANDLE);
+            }
+        );
+    }
+    ls::owned_ptr<VkDeviceMemory> allocateHostImportedMemory(const vk::Vulkan& vk,
+            VkImage image, void* hostPtr, VkDeviceSize hostSize) {
+        if (!vk.df().GetMemoryHostPointerPropertiesEXT)
+            throw ls::vulkan_error("VK_EXT_external_memory_host not loaded");
+        VkMemoryRequirements reqs{};
+        vk.df().GetImageMemoryRequirements(vk.dev(), image, &reqs);
+        if (hostSize < reqs.size)
+            throw ls::vulkan_error("host mapping smaller than image memory requirements");
+        VkMemoryHostPointerPropertiesEXT hp{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT
+        };
+        auto res = vk.df().GetMemoryHostPointerPropertiesEXT(vk.dev(),
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostPtr, &hp);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkGetMemoryHostPointerPropertiesEXT() failed");
+        const uint32_t bits = reqs.memoryTypeBits & hp.memoryTypeBits;
+        if (!bits)
+            throw ls::vulkan_error("no common memory type for imported host pointer");
+        uint32_t mti = 0;
+        bool found = false;
+        for (uint32_t i = 0; i < 32; ++i) {
+            if (bits & (1u << i)) { mti = i; found = true; break; }
+        }
+        if (!found)
+            throw ls::vulkan_error("no memory type index for host pointer");
+        const VkImportMemoryHostPointerInfoEXT importInfo{
+            .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
+            .pHostPointer = hostPtr
+        };
+        const VkMemoryDedicatedAllocateInfo dedicated{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+            .pNext = &importInfo,
+            .image = image
+        };
+        const VkMemoryAllocateInfo alloc{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .pNext = &dedicated,
+            .allocationSize = hostSize,
+            .memoryTypeIndex = mti
+        };
+        VkDeviceMemory handle{};
+        res = vk.df().AllocateMemory(vk.dev(), &alloc, VK_NULL_HANDLE, &handle);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkAllocateMemory() host import failed");
+        res = vk.df().BindImageMemory(vk.dev(), image, handle, 0);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkBindImageMemory() host import failed");
+        return ls::owned_ptr<VkDeviceMemory>(
+            new VkDeviceMemory(handle),
+            [dev = vk.dev(), defunc = vk.df().FreeMemory](VkDeviceMemory& memory) {
+                defunc(dev, memory, VK_NULL_HANDLE);
+            }
+        );
+    }
 }
 
 Image::Image(const vk::Vulkan& vk,
@@ -322,16 +415,20 @@ Image::Image(const vk::Vulkan& vk,
             VkImageUsageFlags usage,
             std::optional<int> importFd,
             std::optional<int*> exportFd,
-            const ImageLayout& layout) :
+            const ImageLayout& layout,
+            VkSharingMode sharingMode,
+            const std::vector<uint32_t>& queueFamilyIndices) :
         image(layout.mode == ImageMode::Opaque ?
             createImage(vk,
                 extent, format, usage,
-                importFd.has_value() || exportFd.has_value()
+                importFd.has_value() || exportFd.has_value(),
+                sharingMode, queueFamilyIndices
             ) : createExchangeImage(vk,
                 extent, format, usage,
                 importFd.has_value() || exportFd.has_value(),
                 importFd.has_value(),
-                layout
+                layout,
+                sharingMode, queueFamilyIndices
             )),
         memory(allocateMemory(vk,
             *this->image,
@@ -368,4 +465,15 @@ ImageExport Image::exportDmaBuf(const vk::Vulkan& vk) const {
         .allocationSize = this->allocationSize,
         .rowPitch = this->rowPitch
     };
+}
+
+Image::Image(const vk::Vulkan& vk, VkExtent2D extent, VkFormat format,
+        VkImageUsageFlags usage, void* hostPtr, VkDeviceSize hostSize) :
+    image(createLinearImage(vk, extent, format, usage)),
+    memory(allocateHostImportedMemory(vk, *this->image, hostPtr, hostSize)),
+    view(createImageView(vk, *this->image, format)),
+    extent(extent),
+    mode(ImageMode::Opaque),
+    allocationSize(hostSize),
+    rowPitch(queryRowPitch(vk, *this->image, false)) {
 }

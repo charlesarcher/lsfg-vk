@@ -201,13 +201,10 @@ std::optional<TimingRing::FrameTiming> TimingRing::readFrame(uint64_t frameIdx) 
     timing.tTotalNs = timing.tCopyInNs + timing.tFlowNs + timing.tGenerateNs + timing.tCopyOutNs;
 
     if (std::getenv("LSFGVK_TIMING_DBG") && (frameIdx % 64) < 4) {
-        std::fprintf(stderr, "[timing] frame %llu: copyIn=%llu flow=%llu gen=%llu copyOut=%llu total=%llu\n",
+        std::fprintf(stderr, "[timing] frame %llu: copyIn=%llu gamesideIn=%llu ns\n",
             static_cast<unsigned long long>(frameIdx),
             static_cast<unsigned long long>(timing.tCopyInNs),
-            static_cast<unsigned long long>(timing.tFlowNs),
-            static_cast<unsigned long long>(timing.tGenerateNs),
-            static_cast<unsigned long long>(timing.tCopyOutNs),
-            static_cast<unsigned long long>(timing.tTotalNs));
+            static_cast<unsigned long long>(timing.tGameSideInNs));
     }
     return timing;
 }

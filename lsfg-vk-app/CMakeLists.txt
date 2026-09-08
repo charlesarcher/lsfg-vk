@@ -20,10 +20,12 @@ target_link_libraries(lsfg-vk-app
 # toolchain is missing, even though the wayland backend does not exist yet.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(XCB REQUIRED xcb xcb-randr)
+pkg_check_modules(LIBDRM REQUIRED libdrm)
+pkg_check_modules(LIBDRM_AMDGPU REQUIRED libdrm_amdgpu)
 target_link_libraries(lsfg-vk-app
-    PUBLIC ${XCB_LIBRARIES})
+    PUBLIC ${XCB_LIBRARIES} ${LIBDRM_LIBRARIES} ${LIBDRM_AMDGPU_LIBRARIES})
 target_include_directories(lsfg-vk-app
-    PUBLIC ${XCB_INCLUDE_DIRECTORIES})
+    PUBLIC ${XCB_INCLUDE_DIRECTORIES} ${LIBDRM_INCLUDE_DIRS} ${LIBDRM_AMDGPU_INCLUDE_DIRS})
 
 # Wayland client + scanner codegen are REQUIRED from task 7 onward (task 10/13 add the
 # second SurfaceBackend impl + xdg-shell/xdg-output protocols). Declared here so the

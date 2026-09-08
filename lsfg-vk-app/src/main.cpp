@@ -27,6 +27,7 @@
 
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
@@ -38,8 +39,11 @@
 #include <iostream>
 #include <atomic>
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
+#include <thread>
+#include <mutex>
 #include <vector>
 
 #include <getopt.h> // NOLINT (IWYU)
@@ -326,7 +330,8 @@ int main(int argc, char** argv) {
                        // swapchain PFNs are populated by df()
                 std::nullopt,   // setLoaderData
                 std::nullopt,   // cachefile
-                true            // enableDmaBufExtensions (full exchange extension set)
+                true,           // enableDmaBufExtensions (full exchange extension set)
+                true            // enableTransferQueue (input-thread snapshot queue)
             );
         } catch (const std::exception& e) {
             unsetenv("DISABLE_LSFGVK");
@@ -415,7 +420,15 @@ int main(int argc, char** argv) {
         // --- accept loop ---------------------------------------------------
         // registry of live streams keyed by accepted connection fd. each entry
         // owns its staging fds and closes them when the entry is erased below.
+        // THREADED: a game (e.g. re2 windowed->fullscreen) can open a SECOND
+        // layer connection while the first stream is still live; a synchronous
+        // runStream would park connection #2 in the socket backlog until the
+        // layer's handshake deadline fires and the game crashes. one detached
+        // thread per connection; the registry entry lives for the thread's
+        // duration and is erased by the thread itself.
         std::map<int, ls::ipc::StreamState> streams;
+        std::mutex streamsMtx;
+        std::condition_variable streamsCv;  // signaled when a stream ends
 
         while (!g_stop.load()) {
             pollfd pfd[2] = {
@@ -444,27 +457,46 @@ int main(int argc, char** argv) {
                 dbg("accept returned");
 
                 // own the stream's registry entry for the connection's lifetime;
-                // erasing it after runStream returns destroys the StreamState,
-                // which closes every staging fd the layer handed off (leak-free)
+                // the per-connection thread erases it when runStream returns,
+                // destroying the StreamState which closes every staging fd the
+                // layer handed off (leak-free)
                 const int key = conn.fd();
-                auto it = streams.emplace(key, ls::ipc::StreamState{});
-                if (!it.second) {
-                    // fd collision (a prior fd was reused before this entry was
-                    // erased) - drop this connection's stream
-                    std::cerr << "lsfg-vk-app: dropped stream on fd " << key << "\n";
-                    streams.erase(it.first);
-                    continue;
+                {
+                    std::lock_guard<std::mutex> lk(streamsMtx);
+                    if (streams.count(key)) {
+                        // fd collision (a prior fd was reused before this entry
+                        // was erased) - drop this connection's stream
+                        std::cerr << "lsfg-vk-app: dropped stream on fd " << key << "\n";
+                        continue;
+                    }
+                    streams.emplace(key, ls::ipc::StreamState{});
                 }
-                try {
-                    ls::ipc::runStream(conn, it.first->second, g_stop, *vk, *g_backend, conf, session);
-                } catch (const std::exception& e) {
-                    dbg("runStream returned (catch)");
-                    std::cerr << "lsfg-vk-app: stream ended: " << e.what() << "\n";
-                    dbg("about to erase stream state (dtor)");
-                }
-                dbg("erasing stream state");
-                streams.erase(it.first);  // StreamState dtor closes stored fds
-                dbg("stream state erased (dtor done)");
+                // per-connection thread; raw pointers are safe: vk/backend/conf
+                // all outlive this loop (shutdown drains below before they die)
+                auto connPtr = std::make_unique<ls::ipc::Connection>(std::move(conn));
+                auto thread = std::thread(
+                    [connPtr = std::move(connPtr), key, &streams, &streamsMtx, &streamsCv,
+                        vkPtr = &*vk, backendPtr = g_backend, confPtr = &conf,
+                        session]() mutable {
+                        try {
+                            ls::ipc::runStream(*connPtr, [&]() -> ls::ipc::StreamState& {
+                                std::lock_guard<std::mutex> lk(streamsMtx);
+                                return streams.at(key);
+                            }(), g_stop, *vkPtr, *backendPtr, *confPtr, session);
+                        } catch (const std::exception& e) {
+                            dbg("runStream returned (catch)");
+                            std::cerr << "lsfg-vk-app: stream ended: " << e.what() << "\n";
+                            dbg("about to erase stream state (dtor)");
+                        }
+                        dbg("erasing stream state");
+                        {
+                            std::lock_guard<std::mutex> lk(streamsMtx);
+                            streams.erase(key);  // StreamState dtor closes stored fds
+                            streamsCv.notify_all();
+                        }
+                        dbg("stream state erased (dtor done)");
+                    });
+                thread.detach();
             } catch (const ls::ipc::socket_error& e) {
                 if (g_stop.load())
                     break;
@@ -473,9 +505,16 @@ int main(int argc, char** argv) {
             dbg("about to poll listener");
         }
 
-        // --- shutdown: RAII closes the Listener socket + unlinks the file,
-        //     and destroys the vk::Vulkan (device + instance) ---------------
+        // --- shutdown: wait briefly for stream threads to drain their state;
+        //     RAII closes the Listener socket + unlinks the file, and destroys
+        //     the vk::Vulkan (device + instance) -------------------------------
         std::cerr << "lsfg-vk-app: shutting down\n";
+        // Session 13.20: cv-wait for stream teardown (no poll sleeps)
+        {
+            std::unique_lock<std::mutex> lk(streamsMtx);
+            streamsCv.wait_for(lk, std::chrono::seconds(2),
+                [&streams] { return streams.empty(); });
+        }
     } catch (const std::exception& e) {
         std::cerr << "lsfg-vk-app: fatal: " << e.what() << "\n";
         return EXIT_FAILURE;

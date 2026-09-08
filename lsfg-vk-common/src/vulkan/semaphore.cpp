@@ -7,6 +7,8 @@
 
 #include <optional>
 #include <unistd.h>
+#include <poll.h>
+#include <cerrno>
 
 #include <vulkan/vulkan_core.h>
 
@@ -83,6 +85,23 @@ namespace {
 Semaphore::Semaphore(const vk::Vulkan& vk, std::optional<int> fd,
     VkExternalSemaphoreHandleTypeFlagBits handleType)
     : semaphore(createSemaphore(vk, fd, handleType)), handleType(handleType) {}
+
+bool Semaphore::wait(const vk::Vulkan& vk, uint64_t timeoutNs) const {
+    // export the sync_fd, poll it until signaled or timeout.
+    // does NOT call DeviceWaitIdle — just blocks in the kernel
+    // via poll() on the fd, which is non-GPU-stalling.
+    const int fd = exportFd(vk);
+    struct pollfd pfd{ fd, POLLIN, 0 };
+    const int ms = static_cast<int>(timeoutNs / 1000000);
+    const int r = ::poll(&pfd, 1, ms);
+    if (r <= 0) {
+        ::close(fd);
+        return r == 0 ? false : throw ls::error("poll on snapshot semaphore failed");
+    }
+    // fd is signaled
+    ::close(fd);
+    return true;
+}
 
 int Semaphore::exportFd(const vk::Vulkan& vk) const {
     const VkSemaphoreGetFdInfoKHR getFdInfo{

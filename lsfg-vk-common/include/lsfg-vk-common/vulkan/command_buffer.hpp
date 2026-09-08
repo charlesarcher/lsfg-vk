@@ -24,13 +24,32 @@ namespace vk {
     public:
         /// create a command buffer
         /// @param vk the vulkan instance
+        /// @param pool optional command pool to allocate from (defaults to the
+        ///        vulkan instance's main pool)
         /// @throws ls::vulkan_error on failure
-        CommandBuffer(const vk::Vulkan& vk);
+        CommandBuffer(const vk::Vulkan& vk, VkCommandPool pool = VK_NULL_HANDLE);
 
         /// begin recording commands
         /// @param vk the vulkan instance
         /// @throws ls::vulkan_error on failure
         void begin(const vk::Vulkan& vk) const;
+
+        /// copy an image (transfer queue only — requires TRANSFER_BIT,
+        /// not GRAPHICS_BIT like blitImage). @param vk the vulkan instance
+        /// @param preBarriers image memory barriers to apply before copy
+        /// @param images source and destination images
+        /// @param extent the extent of the copy (destination rect,
+        ///        anchored at 0,0)
+        /// @param postBarriers image memory barriers to apply after copy
+        /// @param srcExtent the source rect (anchored at 0,0); 0x0 = same
+        ///        as @p extent (a 1:1 copy). a nonzero src scales the
+        ///        source onto the dest extent
+        /// @throws ls::vulkan_error on failure
+        void copyImage(const vk::Vulkan& vk,
+            const std::vector<vk::Barrier>& preBarriers,
+            std::pair<VkImage, VkImage> images, VkExtent2D extent,
+            const std::vector<vk::Barrier>& postBarriers,
+            VkExtent2D srcExtent = VkExtent2D{ 0, 0 }) const;
 
         /// blit an image
         /// @param vk the vulkan instance
@@ -115,13 +134,16 @@ namespace vk {
         /// @param signalTimelineSemaphore the timeline semaphore to signal
         /// @param signalValue the value to signal
         /// @param fence optional fence to signal on completion
+        /// @param queue optional queue to submit on (defaults to the vulkan
+        ///        instance's main queue)
         /// @throws ls::vulkan_error on failure
         void submit(const vk::Vulkan& vk,
             std::vector<VkSemaphore> waitSemaphores,
             VkSemaphore waitTimelineSemaphore, uint64_t waitValue,
             std::vector<VkSemaphore> signalSemaphores,
             VkSemaphore signalTimelineSemaphore, uint64_t signalValue,
-            VkFence fence = VK_NULL_HANDLE) const;
+            VkFence fence = VK_NULL_HANDLE,
+            VkQueue queue = VK_NULL_HANDLE) const;
 
         /// submit the command buffer instantly
         /// @param vk the vulkan instance

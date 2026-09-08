@@ -9,30 +9,126 @@
 #include "swapchain.hpp"
 
 #include "lsfg-vk-layer/capture_context.hpp"
+#include "lsfg-vk-layer/isolated_swapchain.hpp"
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include <cerrno>
+#include <poll.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <vulkan/vulkan_core.h>
 
 using namespace lsfgvk::layer;
+using namespace ls::ipc;
+
+struct lsfgvk::layer::CopyHop {
+    struct Job {
+        void* src{nullptr};
+        void* dst{nullptr};
+        size_t n{0};
+        int fd{-1};
+        uint32_t* seq{nullptr};
+    };
+    std::mutex mx;
+    std::condition_variable cv;
+    std::queue<Job> q;
+    std::atomic<bool> stop{false};
+    std::thread th;
+
+    CopyHop() { th = std::thread([this] { this->run(); }); }
+    CopyHop(const CopyHop&) = delete;
+    CopyHop& operator=(const CopyHop&) = delete;
+    ~CopyHop() {
+        stop.store(true);
+        cv.notify_all();
+        if (th.joinable())
+            th.join();
+        while (!q.empty()) {
+            if (q.front().fd >= 0)
+                ::close(q.front().fd);
+            q.pop();
+        }
+    }
+    void push(Job j) {
+        {
+            std::lock_guard<std::mutex> lk(mx);
+            q.push(j);
+        }
+        cv.notify_one();
+    }
+    void run() {
+        while (!stop.load()) {
+            Job j{};
+            {
+                std::unique_lock<std::mutex> lk(mx);
+                cv.wait(lk, [&] { return stop.load() || !q.empty(); });
+                if (stop.load() && q.empty())
+                    return;
+                if (q.empty())
+                    continue;
+                j = q.front();
+                q.pop();
+            }
+            if (j.fd >= 0) {
+                pollfd pfd{};
+                pfd.fd = j.fd;
+                pfd.events = POLLIN;
+                ::poll(&pfd, 1, 2);
+                ::close(j.fd);
+                j.fd = -1;
+            }
+            if (j.src && j.dst && j.n) {
+                // Game swapchain is B8G8R8A8_UNORM; FG/overlay want RGBA.
+                // copyImage is bit-preserving (R/B swap). Capture queue is
+                // compute — cannot vkCmdBlitImage. Swizzle on the hop thread.
+                auto* d = static_cast<std::uint32_t*>(j.dst);
+                const auto* s = static_cast<const std::uint32_t*>(j.src);
+                const size_t px = j.n / 4;
+                for (size_t i = 0; i < px; ++i) {
+                    const std::uint32_t v = s[i];
+                    d[i] = (v & 0xFF00FF00u)
+                        | ((v & 0xFFu) << 16)
+                        | ((v >> 16) & 0xFFu);
+                }
+            }
+            if (j.seq)
+                __atomic_add_fetch(j.seq, 1u, __ATOMIC_RELEASE);
+        }
+    }
+};
 
 namespace {
-    // TEMP DEBUG (Session 2, E7): per-present wall-clock breakdown of the
-    // game-thread present hook. gated by LSFGVK_LAYER_DBG=1; remove with the
-    // debug journal when the perf diagnosis is done.
+    // TEMP DEBUG (Session 13.29d): per-phase absolute wall-clock timestamps
+    // to identify exactly which step in present() blocks the game thread.
     [[maybe_unused]] const bool layerDbg{ std::getenv("LSFGVK_LAYER_DBG") != nullptr };
     using SteadyClock = std::chrono::steady_clock;
     [[maybe_unused]] auto g_layerDbgT0 = SteadyClock::now();
     [[maybe_unused]] long long layerDbgMs(SteadyClock::time_point from) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             SteadyClock::now() - from).count();
+    }
+    std::string phaseAbsMs() {
+        if (!layerDbg) return "";
+        using namespace std::chrono;
+        auto now = system_clock::now();
+        auto ms = duration_cast<milliseconds>(now.time_since_epoch()).count();
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), " @%.3fs", ms / 1000.0);
+        return buf;
     }
 
     VkImageMemoryBarrier barrierHelper(VkImage handle,
@@ -63,11 +159,18 @@ namespace {
 CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         SwapchainInfo info, const std::string& gameDeviceName)
         : profile(std::move(profile)), info(std::move(info)),
-          gameDeviceName(gameDeviceName), vkPtr(&vk),
+          gameDeviceName(gameDeviceName), fake(this->info.fake), vkPtr(&vk),
           timingRing(vk, "layer-capture") {
     // only constructed for External presentation; caller guards this
     if (this->profile.presentation != ls::Presentation::External)
         throw ls::error("CaptureContext created for non-external presentation");
+
+    // all ring slots start free (the member declaration is value-initialized
+    // to all-false; the app has not captured anything yet, so every slot is
+    // reusable from frame 1)
+    this->slotFree.fill(true);
+    this->localExportFds.fill(-1);
+    this->bExportFds.fill(-1);
 
     // --- IPC handshake (2 s deadline on the NEGOTIATED reply) --------------
     std::filesystem::path sockPath;
@@ -98,7 +201,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     // receive NEGOTIATED with 2 s deadline (poll-based, never hangs)
     ls::ipc::Negotiated negotiated{};
     try {
-        auto msg = this->ipcConn->receive(std::chrono::milliseconds(2000));
+        auto msg = this->ipcConn->receive(std::chrono::milliseconds(10000));
         if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
             std::cerr << "lsfg-vk: external stream error: peer refused: " << err->message << "\n";
             throw ls::error("lsfg-vk: external stream error: peer refused handshake: " + err->message);
@@ -180,11 +283,12 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         layout.drmModifier = negotiated.modifier;
         layout.rowPitch = negotiated.rowPitch;
     }
+    this->exchangeLayout = layout;
 
     try {
-        this->stagingImages.reserve(2);
-        for (int i = 0; i < 2; ++i) {
-            auto msg = this->ipcConn->receive(std::chrono::milliseconds(2000));
+        this->stagingImages.reserve(STAGING_RING_DEPTH);
+        for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+            auto msg = this->ipcConn->receive(std::chrono::milliseconds(10000));
             if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
                 std::cerr << "lsfg-vk: external stream error: peer refused: " << err->message << "\n";
                 throw ls::error("lsfg-vk: external stream error: peer refused at STAGING: " + err->message);
@@ -197,6 +301,37 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             const int fd = this->ipcConn->takeReceivedFd();
             if (fd < 0)
                 throw ls::error("lsfg-vk: external stream error: STAGING arrived without its fd");
+            const bool importStaging = (std::getenv("LSFGVK_IMPORT_STAGING")
+                    && std::getenv("LSFGVK_IMPORT_STAGING")[0] == '1')
+                || (!this->fake && !(std::getenv("LSFGVK_NO_IMPORT")
+                    && std::getenv("LSFGVK_NO_IMPORT")[0] == '1'));
+            if (!importStaging) {
+                static const bool posixShm = !(std::getenv("LSFGVK_POSIX_SHM")
+                    && std::getenv("LSFGVK_POSIX_SHM")[0] == '0');
+                if (!posixShm) {
+                    ::close(fd);
+                    continue;
+                }
+                const VkDeviceSize hostSize = std::max<VkDeviceSize>(
+                    negotiated.allocationSize,
+                    static_cast<VkDeviceSize>(layout.rowPitch) * extent.height);
+                const size_t mapBytes = static_cast<size_t>(hostSize) + 4096;
+                void* map = ::mmap(nullptr, mapBytes,
+                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                ::close(fd);
+                if (map == MAP_FAILED) {
+                    std::cerr << "lsfg-vk: posix-shm mmap failed slot " << i
+                        << " errno=" << errno << "\n";
+                    continue;
+                }
+                this->shmMaps.at(i) = map;
+                this->shmSeq.at(i) = reinterpret_cast<uint32_t*>(
+                    static_cast<char*>(map) + static_cast<size_t>(hostSize));
+                this->hostAllocSize = hostSize;
+                std::cerr << "lsfg-vk: posix-shm mmap slot " << i
+                    << " size=" << hostSize << "\n";
+                continue;
+            }
             // import consumes the fd on success; on failure the image closes it
             this->stagingImages.emplace_back(vk, extent, format,
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT,
@@ -214,7 +349,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
 
     // wait for READY (2 s deadline as well)
     try {
-        auto msg = this->ipcConn->receive(std::chrono::milliseconds(2000));
+        auto msg = this->ipcConn->receive(std::chrono::milliseconds(10000));
         if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
             std::cerr << "lsfg-vk: external stream error: peer refused: " << err->message << "\n";
             throw ls::error("lsfg-vk: external stream error: peer refused at READY: " + err->message);
@@ -236,11 +371,150 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
 
     // --- capture command buffer + per-slot sync-fd semaphores ---------------
     try {
+        // Session 13.17: capture ring - render thread never blocks on the
+        // previous blit (fences created signaled so first uses pass freely)
+        uint32_t extraFam = 0, extraIdx = 0;
+        if (this->fake && getIsolatedSignalQueue(extraFam, extraIdx)) {
+            vk.df().GetDeviceQueue(vk.dev(), extraFam, extraIdx, &this->captureQ);
+            const VkCommandPoolCreateInfo poolInfo{
+                .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT,
+                .queueFamilyIndex = extraFam
+            };
+            auto res = vk.df().CreateCommandPool(vk.dev(), &poolInfo, VK_NULL_HANDLE, &this->capturePool);
+            if (res != VK_SUCCESS)
+                throw ls::vulkan_error(res, "capture command pool failed");
+            std::cerr << "lsfg-vk: capture copy on extra queue fam=" << extraFam
+                      << " idx=" << extraIdx << "\n";
+        }
+        const bool importStaging = (std::getenv("LSFGVK_IMPORT_STAGING")
+            && std::getenv("LSFGVK_IMPORT_STAGING")[0] == '1');
+        this->localCopyOnly = (this->fake && !importStaging)
+            || (std::getenv("LSFGVK_LOCAL_COPY")
+                && std::getenv("LSFGVK_LOCAL_COPY")[0] == '1')
+            || (std::getenv("LSFGVK_NO_IMPORT")
+                && std::getenv("LSFGVK_NO_IMPORT")[0] == '1');
+        if (this->fake) {
+            this->localImages.reserve(STAGING_RING_DEPTH);
+            const VkImageUsageFlags localUsage =
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                | VK_IMAGE_USAGE_SAMPLED_BIT;
+            for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+                this->localImages.emplace_back(vk, this->info.extent,
+                    VK_FORMAT_R8G8B8A8_UNORM, localUsage,
+                    std::nullopt, std::nullopt, this->exchangeLayout);
+                auto exp = this->localImages.back().exportDmaBuf(vk);
+                this->localExportFds.at(i) = exp.fd;
+                VkMemoryFdPropertiesKHR fp{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR
+                };
+                auto pr = vk.df().GetMemoryFdPropertiesKHR(vk.dev(),
+                    VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                    exp.fd, &fp);
+                std::cerr << "lsfg-vk: 9070 dma-buf slot " << i
+                    << " fd=" << exp.fd << " props=" << pr
+                    << " types=0x" << std::hex << fp.memoryTypeBits << std::dec
+                    << " pitch=" << exp.rowPitch
+                    << " size=" << exp.allocationSize << "\n";
+            }
+            if (this->localCopyOnly)
+                std::cerr << "lsfg-vk: capture dst=9070-owned dma-buf\n";
+        }
+        if (this->fake && this->hostImages.empty() && this->shmMaps.at(0)) {
+            const VkDeviceSize hostSize = this->hostAllocSize
+                ? this->hostAllocSize
+                : ((static_cast<VkDeviceSize>(this->info.extent.width) * 4
+                    * this->info.extent.height + 4095) & ~4095ull);
+            const VkImageUsageFlags hostUsage =
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            this->hostAllocSize = hostSize;
+            for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+                void* p = nullptr;
+                if (::posix_memalign(&p, 4096, static_cast<size_t>(hostSize)) != 0)
+                    throw ls::error("posix_memalign 9070 host capture failed");
+                std::memset(p, 0, static_cast<size_t>(hostSize));
+                this->hostPtrsA.at(i) = p;
+                this->hostImages.emplace_back(vk, this->info.extent,
+                    VK_FORMAT_R8G8B8A8_UNORM, hostUsage, p, hostSize);
+            }
+            std::cerr << "lsfg-vk: capture dst=9070-host-malloc size=" << hostSize << "\n";
+            this->copyHop = std::make_unique<CopyHop>();
+        }
+        static const bool dualHost = std::getenv("LSFGVK_DUAL_HOST")
+            && std::getenv("LSFGVK_DUAL_HOST")[0] == '1';
+        if (dualHost && this->fake && !this->shmMaps.at(0)) {
+            try {
+                auto selectB = [](const vk::VulkanInstanceFuncs& fi,
+                        const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
+                    for (auto pd : devs) {
+                        VkPhysicalDeviceProperties2 p{
+                            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+                        };
+                        fi.GetPhysicalDeviceProperties2(pd, &p);
+                        if (p.properties.deviceID == 0x7590)
+                            return pd;
+                    }
+                    throw ls::error("dual-host: RX 9060 XT not found");
+                };
+                this->bVk = std::make_unique<vk::Vulkan>(
+                    "lsfg-dual-host", vk::version{2, 0, 0},
+                    "lsfg-dual-host", vk::version{2, 0, 0},
+                    selectB, true, std::nullopt, std::nullopt, true, false);
+                const VkDeviceSize hostSize =
+                    (static_cast<VkDeviceSize>(this->info.extent.width) * 4
+                        * this->info.extent.height + 4095) & ~4095ull;
+                const VkImageUsageFlags hostUsage =
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+                this->hostImages.clear();
+                this->bHostImages.clear();
+                this->bVramImages.clear();
+                this->hostAllocSize = hostSize;
+                const vk::ImageLayout bLayout{ .mode = vk::ImageMode::Linear };
+                const VkImageUsageFlags vramUsage =
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                    | VK_IMAGE_USAGE_SAMPLED_BIT;
+                for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+                    void* p = nullptr;
+                    if (::posix_memalign(&p, 4096, static_cast<size_t>(hostSize)) != 0)
+                        throw ls::error("posix_memalign dual-host A failed");
+                    std::memset(p, 0, static_cast<size_t>(hostSize));
+                    this->hostPtrsA.at(i) = p;
+                    this->hostImages.emplace_back(vk, this->info.extent,
+                        VK_FORMAT_R8G8B8A8_UNORM, hostUsage, p, hostSize);
+                    void* q = nullptr;
+                    if (::posix_memalign(&q, 4096, static_cast<size_t>(hostSize)) != 0)
+                        throw ls::error("posix_memalign dual-host B failed");
+                    std::memset(q, 0, static_cast<size_t>(hostSize));
+                    this->hostPtrsB.at(i) = q;
+                    this->bHostImages.emplace_back(*this->bVk, this->info.extent,
+                        VK_FORMAT_R8G8B8A8_UNORM, hostUsage, q, hostSize);
+                    this->bVramImages.emplace_back(*this->bVk, this->info.extent,
+                        VK_FORMAT_R8G8B8A8_UNORM, vramUsage,
+                        std::nullopt, std::nullopt, bLayout);
+                    auto exp = this->bVramImages.back().exportDmaBuf(*this->bVk);
+                    this->bExportFds.at(i) = exp.fd;
+                }
+                this->bEmptyCb.emplace(*this->bVk);
+                this->bEmptyFence.emplace(*this->bVk, true);
+                std::cerr << "lsfg-vk: dual-host A-malloc + B-malloc + 9060 dma-buf size="
+                    << hostSize << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "lsfg-vk: dual-host failed: " << e.what() << "\n";
+                this->hostImages.clear();
+                this->bHostImages.clear();
+                this->bVramImages.clear();
+                this->bVk.reset();
+            }
+        }
+        for (size_t i = 0; i < CAPTURE_RING_DEPTH; ++i) {
+            this->captureCommandBuffers.emplace_back(vk, this->capturePool);
+            this->captureFences.emplace_back(vk, true);
+        }
         this->captureCommandBuffer.emplace(vk);
         this->captureFence.emplace(vk);
-        this->captureSemaphores.reserve(2);
-        this->presentSemaphores.reserve(2);
-        for (int i = 0; i < 2; ++i) {
+        this->captureSemaphores.reserve(STAGING_RING_DEPTH);
+        this->presentSemaphores.reserve(STAGING_RING_DEPTH);
+        for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
             this->captureSemaphores.emplace_back(vk, std::nullopt,
                 VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
             this->presentSemaphores.emplace_back(vk, std::nullopt,
@@ -248,6 +522,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         }
         // FRAME sends should not block forever if app stops reading
         this->ipcConn->setSendTimeout(std::chrono::milliseconds(250));
+        std::cerr << "lsfg-vk: ipc sockFd=" << this->ipcConn->fd() << "\n";
     } catch (const std::exception& e) {
         throw ls::error("lsfg-vk: failed to create capture semaphores", e);
     }
@@ -259,30 +534,70 @@ CaptureContext::CaptureContext(CaptureContext&&) noexcept = default;
 CaptureContext& CaptureContext::operator=(CaptureContext&&) noexcept = default;
 
 CaptureContext::~CaptureContext() {
-    if (this->vkPtr && this->fenceSubmitted && this->captureFence.has_value()) {
-        // bounded wait so destruction of pending-work semaphores does not trip VUID-05149
-        // 150 ms matches swapchain.cpp:436-438 renderFence pattern
+    this->copyHop.reset();
+    if (this->vkPtr) {
         try {
-            (void)this->captureFence->wait(*this->vkPtr, 150ULL * 1000 * 1000);
+            if (this->fenceSubmitted && this->captureFence.has_value())
+                (void)this->captureFence->wait(*this->vkPtr, 150ULL * 1000 * 1000);
+            for (auto& f : this->captureFences)
+                (void)f.wait(*this->vkPtr, 150ULL * 1000 * 1000);
         } catch (...) {
             // teardown must not throw
         }
     }
-    // Connection and images/semaphores destroy via RAII; pending fds closed by Connection dtor
+    for (int& fd : this->localExportFds) {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    for (int& fd : this->bExportFds) {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    this->bEmptyCb.reset();
+    this->bEmptyFence.reset();
+    // RADV FreeMemory on HOST_ALLOCATION_BIT + dual VkDevice teardown
+    // aborts FurMark (free(): invalid size). Intentionally never destroy.
+    static auto* leakHost = new std::vector<vk::Image>;
+    static auto* leakBHost = new std::vector<vk::Image>;
+    static auto* leakBVram = new std::vector<vk::Image>;
+    static auto* leakBvks = new std::vector<std::unique_ptr<vk::Vulkan>>;
+    leakHost->insert(leakHost->end(),
+        std::make_move_iterator(this->hostImages.begin()),
+        std::make_move_iterator(this->hostImages.end()));
+    this->hostImages.clear();
+    leakBHost->insert(leakBHost->end(),
+        std::make_move_iterator(this->bHostImages.begin()),
+        std::make_move_iterator(this->bHostImages.end()));
+    this->bHostImages.clear();
+    leakBVram->insert(leakBVram->end(),
+        std::make_move_iterator(this->bVramImages.begin()),
+        std::make_move_iterator(this->bVramImages.end()));
+    this->bVramImages.clear();
+    if (this->bVk)
+        leakBvks->push_back(std::move(this->bVk));
 }
 
-void CaptureContext::drainReleases() {
-    if (!this->ipcConn.has_value()) return;
+int CaptureContext::drainReleases() {
+    if (!this->ipcConn.has_value()) return 0;
     // non-blocking drain: poll until no readable data
+    int applied = 0;
     while (true) {
-        bool drained = false;
-        try {
-            drained = this->ipcConn->drained();
-        } catch (const std::exception& e) {
-            std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
-            throw ls::error(std::string("lsfg-vk: external stream error: ") + e.what(), e);
+        // Inlined ::poll on purpose (not Connection::drained()): GCC 16.2
+        // -O2/-O3 dropped the `if (drained) break;` guard when `drained` was a
+        // function-call result assigned inside a try/catch (its catch edge
+        // leaves the `false` initializer, wrongly generalized to "always
+        // false"), so this drain became a blocking receive(nullopt) on an
+        // empty socket -> first-present deadlock. A direct poll result feeding
+        // a plain branch is immune, and HUP/ERR is separated from "empty"
+        // (the old `res == 0` conflated them, misreading a closed peer as data).
+        pollfd pfd{};
+        pfd.fd = this->ipcConn->fd();
+        pfd.events = POLLIN;
+        const int res = ::poll(&pfd, 1, 0);
+        if (res < 0) {
+            if (errno == EINTR) continue;
+            break; // poll error: stop draining conservatively
         }
-        if (drained) break;
+        if (res == 0) break;
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) break;
 
         ls::ipc::Message msg;
         try {
@@ -296,6 +611,7 @@ void CaptureContext::drainReleases() {
         if (auto* rel = std::get_if<ls::ipc::Release>(&msg)) {
             if (rel->stagingIdx < this->slotFree.size())
                 this->slotFree.at(rel->stagingIdx) = true;
+            applied++;
         } else if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
             std::cerr << "lsfg-vk: external stream error: peer error: " << err->message << "\n";
             throw ls::error("lsfg-vk: external stream error: peer error: " + err->message);
@@ -307,47 +623,29 @@ void CaptureContext::drainReleases() {
                 + ls::ipc::nameOf(got));
         }
     }
+    return applied;
 }
 
-size_t CaptureContext::selectFreeSlot() {
-    // round-robin over free slots with 500 ms deadline polling
-    constexpr auto deadline = std::chrono::milliseconds(500);
-    const auto start = std::chrono::steady_clock::now();
-
-    while (true) {
-        for (size_t tries = 0; tries < this->slotFree.size(); ++tries) {
-            const size_t idx = (this->nextSlot + tries) % this->slotFree.size();
-            if (this->slotFree.at(idx)) {
-                this->nextSlot = (idx + 1) % this->slotFree.size();
-                return idx;
-            }
+std::optional<size_t> CaptureContext::trySelectFreeSlot() {
+    // never waits on GPU B. one probe; caller skips capture on nullopt.
+    for (size_t tries = 0; tries < this->slotFree.size(); ++tries) {
+        const size_t idx = (this->nextSlot + tries) % this->slotFree.size();
+        if (this->slotFree.at(idx)) {
+            this->nextSlot = (idx + 1) % this->slotFree.size();
+            return idx;
         }
-
-        // no free slot yet; check deadline
-        if (std::chrono::steady_clock::now() - start >= deadline) {
-            throw ls::error("lsfg-vk: external stream error: no free staging slots within 500 ms (app stalled)");
-        }
-
-        // drain any pending RELEASE messages before retrying
-        try {
-            this->drainReleases();
-        } catch (const ls::error& e) {
-            // already logged inside drainReleases; surface as stream error
-            throw;
-        }
-
-        // brief sleep to avoid busy-waiting
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    return std::nullopt;
 }
 
 VkResult CaptureContext::present(const vk::Vulkan& vk,
         VkQueue queue, VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
-    // RELEASE handling frees slots draining non-blocking
+// RELEASE handling frees slots draining non-blocking
+    int entryDrained = 0;
     try {
-        this->drainReleases();
+        entryDrained = this->drainReleases();
     } catch (const ls::error& e) {
         // already logged inside drainReleases; surface as stream error
         throw;
@@ -355,14 +653,70 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
 
     // TEMP DEBUG (E7): wall-clock entry
     const SteadyClock::time_point dbgEnter = layerDbg ? SteadyClock::now()
-                                                      : SteadyClock::time_point{};
-    auto dbgMs = [&dbgEnter]() { return layerDbgMs(dbgEnter); };
-    auto dbgLog = [&dbgMs, this](const char* phase) {
+                                                       : std::chrono::steady_clock::time_point{};
+    auto phaseLog = [this](const char* phase) {
         if (layerDbg)
             std::cerr << "lsfg-vk-layer: [dbg] present: " << phase
-                      << " (fidx " << this->fidx << ") t+" << dbgMs() << " ms\n";
+                      << " (fidx " << this->fidx << ")" << phaseAbsMs() << "\n";
     };
-    dbgLog("enter (post-drain)");
+    phaseLog("enter (post-drain)");
+    static const bool emptyCb = std::getenv("LSFGVK_EMPTY_CB")
+        && std::getenv("LSFGVK_EMPTY_CB")[0] == '1';
+    static const bool copyNoSig = std::getenv("LSFGVK_COPY_NOSIG")
+        && std::getenv("LSFGVK_COPY_NOSIG")[0] == '1';
+    if ((emptyCb || copyNoSig) && this->fake && !this->captureCommandBuffers.empty()) {
+        const auto& cmdbuf = this->captureCommandBuffers.at(0);
+        cmdbuf.begin(vk);
+        if (copyNoSig && imageIdx < this->info.images.size()
+                && !this->stagingImages.empty()) {
+            const VkImage srcImage = this->info.images.at(imageIdx);
+            const vk::Image& dstImage = this->stagingImages.at(0);
+            cmdbuf.copyImage(vk,
+                {
+                    barrierHelper(srcImage,
+                        VK_ACCESS_NONE,
+                        VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                    barrierHelper(dstImage.handle(),
+                        VK_ACCESS_NONE,
+                        VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                },
+                { srcImage, dstImage.handle() },
+                dstImage.getExtent(),
+                {
+                    barrierHelper(srcImage,
+                        VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_ACCESS_MEMORY_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                });
+        }
+        cmdbuf.end(vk);
+        VkCommandBuffer rawBuf = cmdbuf.raw();
+        std::vector<VkPipelineStageFlags> stages(semaphores.size(),
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        const VkSubmitInfo submit{
+            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+            .pWaitDstStageMask = stages.empty() ? nullptr : stages.data(),
+            .commandBufferCount = 1,
+            .pCommandBuffers = &rawBuf,
+        };
+        VkQueue q = this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue;
+        const auto res = vk.df().QueueSubmit(q, 1, &submit, VK_NULL_HANDLE);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkQueueSubmit() failed");
+        phaseLog("empty CB wait-only (no fence)");
+        return VK_SUCCESS;
+    }
+    if (layerDbg && entryDrained > 0)
+        std::cerr << "lsfg-vk-layer: [dbg] present: enter drain +" << entryDrained
+                  << " free=" << this->freeMask() << " next=" << this->nextSlot
+                  << " (fidx " << this->fidx << ")" << phaseAbsMs() << "\n";
 
     // read back capture-blit timing for frame fidx-4 (GPU has finished it)
     if (this->timingRing.enabled() && this->fidx >= 4) {
@@ -371,30 +725,76 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     }
 
     size_t slot = 0;
-    try {
-        slot = this->selectFreeSlot();
-    } catch (const ls::error& e) {
-        std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
-        throw;
+    static const bool skipAll = std::getenv("LSFGVK_SKIP_ALL")
+        && std::getenv("LSFGVK_SKIP_ALL")[0] == '1';
+    if (const auto picked = skipAll ? std::nullopt : this->trySelectFreeSlot()) {
+        slot = *picked;
+    } else {
+        // GPU B is behind: skip this capture. do NOT wait. blit never ran so
+        // the game's wait semaphores are still pending — present must wait
+        // on them (the capture path consumes them in QueueSubmit).
+        this->droppedCaptures++;
+        if (layerDbg && (this->droppedCaptures == 1 || (this->droppedCaptures % 64) == 0))
+            std::cerr << "lsfg-vk-layer: [dbg] present: capture skipped (no slot)"
+                      << " dropped=" << this->droppedCaptures
+                      << " free=" << this->freeMask()
+                      << " (fidx " << this->fidx << ")" << phaseAbsMs() << "\n";
+        phaseLog("capture skipped (no slot)");
+        if (this->fake) {
+            if (!semaphores.empty()) {
+                std::vector<VkPipelineStageFlags> stages(semaphores.size(),
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+                const VkSubmitInfo submit{
+                    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                    .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+                    .pWaitSemaphores = semaphores.data(),
+                    .pWaitDstStageMask = stages.data(),
+                };
+                VkQueue sig = this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue;
+                const auto res = vk.df().QueueSubmit(sig, 1, &submit, VK_NULL_HANDLE);
+                if (res != VK_SUCCESS)
+                    throw ls::vulkan_error(res, "vkQueueSubmit() failed");
+            }
+            phaseLog("isolated present (skipped capture)");
+            return VK_SUCCESS;
+        }
+        const VkPresentInfoKHR presentInfo{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = next_chain,
+            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &imageIdx,
+        };
+        auto res = vk.df().QueuePresentKHR(queue, &presentInfo);
+        if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+            throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
+        phaseLog("forwarded present returned (TOTAL)");
+        return res;
     }
-    dbgLog("slot selected");
+    phaseLog("slot selected");
 
     if (imageIdx >= this->info.images.size())
         throw ls::error("swapchain image index out of range");
 
-    const VkImage srcImage = this->info.images.at(imageIdx);
-    const vk::Image& dstImage = this->stagingImages.at(slot);
+    const bool dummySrc = std::getenv("LSFGVK_DUMMY_SRC")
+        && std::getenv("LSFGVK_DUMMY_SRC")[0] == '1'
+        && !this->localImages.empty();
+    const VkImage srcImage = dummySrc
+        ? this->localImages.front().handle() : this->info.images.at(imageIdx);
+    const vk::Image& dstImage = !this->hostImages.empty()
+        ? this->hostImages.at(slot)
+        : ((this->localCopyOnly && !this->localImages.empty())
+            ? this->localImages.at(slot) : this->stagingImages.at(slot));
     const vk::Semaphore& presentSem = this->presentSemaphores.at(slot);
 
-    // bounded fence wait for previous capture work before reusing command buffer
-    // (mirrors swapchain.cpp:436-438 150 ms pattern)
-    if (this->fenceSubmitted) {
-        if (!this->captureFence->wait(vk, 150ULL * 1000 * 1000))
-            throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
-        this->captureFence->reset(vk);
-        this->fenceSubmitted = false;
-    }
-    dbgLog("prev-blit fence cleared");
+    // Empty-CB + no fence holds 141 fps. A fence on that same submit is 53.
+    // Copy is 343 µs; 6 CBs at 140 fps reuse after ~43 ms. Do not host-wait
+    // or signal a fence on the capture submit.
+    const size_t ringIdx = this->captureRingIdx % CAPTURE_RING_DEPTH;
+    this->captureRingIdx = (ringIdx + 1) % CAPTURE_RING_DEPTH;
+    phaseLog("ring slot acquired");
 
     // FRESH capture semaphore per cycle, replacing the previous one now that
     // the fence gate proves its signal completed. re-signaling an already
@@ -402,23 +802,33 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // read as signaled immediately - letting the app's pre-pass sample the
     // staging image before this cycle's blit completes (ghosting under load).
     // first present uses the ctor-created, never-signaled semaphores.
-    this->captureSemaphores.at(slot) = vk::Semaphore(vk, std::nullopt,
-        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
-    const vk::Semaphore& sigSem = this->captureSemaphores.at(slot);
+    static const bool leakSem = std::getenv("LSFGVK_LEAK_SEM")
+        && std::getenv("LSFGVK_LEAK_SEM")[0] == '1';
+    const vk::Semaphore* sigSemPtr = nullptr;
+    if (leakSem) {
+        this->leakCaptureSems.emplace_back(vk, std::nullopt,
+            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+        sigSemPtr = &this->leakCaptureSems.back();
+    } else {
+        this->captureSemaphores.at(slot) = vk::Semaphore(vk, std::nullopt,
+            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+        sigSemPtr = &this->captureSemaphores.at(slot);
+    }
+    const vk::Semaphore& sigSem = *sigSemPtr;
 
     // record blit info.images[imageIdx] -> staging[slot] waiting on game's
     // present wait-semaphores, signal slot's capture semaphore
-    const auto& cmdbuf = *this->captureCommandBuffer;
+    const auto& cmdbuf = this->captureCommandBuffers.at(ringIdx);
     cmdbuf.begin(vk);
-    // capture blit GPU timing (GameCopyIn = swapchain -> staging A->B write)
-    this->timingRing.resetFrame(cmdbuf.handle(), this->fidx);
-    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInStart, true);
-    cmdbuf.blitImage(vk,
+    static const bool emptyFrame = std::getenv("LSFGVK_EMPTY_FRAME")
+        && std::getenv("LSFGVK_EMPTY_FRAME")[0] == '1';
+    if (!emptyFrame) {
+    cmdbuf.copyImage(vk,
         {
             barrierHelper(srcImage,
                 VK_ACCESS_NONE,
                 VK_ACCESS_TRANSFER_READ_BIT,
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                dummySrc ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
             ),
             barrierHelper(dstImage.handle(),
@@ -435,11 +845,12 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 VK_ACCESS_TRANSFER_READ_BIT,
                 VK_ACCESS_MEMORY_READ_BIT,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                dummySrc ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                         : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
             ),
         }
     );
-    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInEnd, false);
+    }
     cmdbuf.end(vk);
 
     // submit the capture blit waiting on the game's present wait-semaphores
@@ -457,15 +868,16 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         const VkSubmitInfo submitInfo{
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount = static_cast<uint32_t>(waitSems.size()),
-            .pWaitSemaphores = waitSems.data(),
-            .pWaitDstStageMask = stages.data(),
+            .pWaitSemaphores = waitSems.empty() ? nullptr : waitSems.data(),
+            .pWaitDstStageMask = stages.empty() ? nullptr : stages.data(),
             .commandBufferCount = 1,
             .pCommandBuffers = &rawBuf,
             .signalSemaphoreCount = static_cast<uint32_t>(signalSems.size()),
             .pSignalSemaphores = signalSems.data()
         };
-        auto res = vk.df().QueueSubmit(queue, 1, &submitInfo,
-            this->captureFence->handle());
+        auto res = vk.df().QueueSubmit(
+            this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue,
+            1, &submitInfo, VK_NULL_HANDLE);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkQueueSubmit() failed");
         this->fenceSubmitted = true;
@@ -473,7 +885,49 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
         throw ls::error(std::string("lsfg-vk: external stream error: capture submit failed: ") + e.what(), e);
     }
-    dbgLog("blit submitted");
+    phaseLog("blit submitted");
+    if (this->bVk && this->bEmptyCb.has_value() && this->bEmptyFence.has_value()) {
+        auto& bvk = *this->bVk;
+        if (this->bEmptyFence->wait(bvk, 0)
+                && slot < this->bHostImages.size()
+                && slot < this->bVramImages.size()) {
+            this->bEmptyFence->reset(bvk);
+            if (this->hostPtrsA.at(slot) && this->hostPtrsB.at(slot)
+                    && this->hostAllocSize > 0)
+                std::memcpy(this->hostPtrsB.at(slot), this->hostPtrsA.at(slot),
+                    static_cast<size_t>(this->hostAllocSize));
+            this->bEmptyCb->begin(bvk);
+            const auto& srcB = this->bHostImages.at(slot);
+            const auto& dstB = this->bVramImages.at(slot);
+            this->bEmptyCb->copyImage(bvk,
+                {
+                    barrierHelper(srcB.handle(),
+                        VK_ACCESS_NONE, VK_ACCESS_TRANSFER_READ_BIT,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL),
+                    barrierHelper(dstB.handle(),
+                        VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                },
+                { srcB.handle(), dstB.handle() },
+                dstB.getExtent(),
+                {
+                    barrierHelper(dstB.handle(),
+                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
+                });
+            this->bEmptyCb->end(bvk);
+            VkCommandBuffer rawB = this->bEmptyCb->raw();
+            const VkSubmitInfo bsi{
+                .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                .commandBufferCount = 1,
+                .pCommandBuffers = &rawB,
+            };
+            auto bres = bvk.df().QueueSubmit(bvk.queue(), 1, &bsi,
+                this->bEmptyFence->handle());
+            if (bres != VK_SUCCESS)
+                std::cerr << "lsfg-vk: dual-host 9060 QueueSubmit " << bres << "\n";
+        }
+    }
 
     // export sync-fd immediately after enqueue (copy transference)
     int syncFd = -1;
@@ -483,12 +937,57 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
         throw ls::error(std::string("lsfg-vk: external stream error: export sync fd failed: ") + e.what(), e);
     }
+    if (this->copyHop && slot < this->shmMaps.size() && this->shmMaps.at(slot)
+            && this->hostPtrsA.at(slot) && this->hostAllocSize > 0 && syncFd >= 0) {
+        const int hopFd = ::dup(syncFd);
+        if (hopFd >= 0) {
+            this->copyHop->push(CopyHop::Job{
+                this->hostPtrsA.at(slot),
+                this->shmMaps.at(slot),
+                static_cast<size_t>(this->hostAllocSize),
+                hopFd,
+                this->shmSeq.at(slot)
+            });
+        }
+    }
+
+    static const bool noFrame = std::getenv("LSFGVK_NO_FRAME")
+        && std::getenv("LSFGVK_NO_FRAME")[0] == '1';
+    if (noFrame) {
+        if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+        phaseLog("no FRAME (export closed)");
+        if (this->fake)
+            return VK_SUCCESS;
+    }
 
     // send FRAME (owns fd on success, closes on failure path via Connection)
     try {
-        this->ipcConn->attachFd(syncFd);
+        int sendFd = syncFd;
+        if (this->shmMaps.at(0)) {
+            // POSIX shm already has the pixels; keep the 9070 capture sync-fd
+        } else if (this->fake && slot < this->bExportFds.size()
+                && this->bExportFds.at(slot) >= 0) {
+            sendFd = ::dup(this->bExportFds.at(slot));
+            if (sendFd < 0)
+                sendFd = syncFd;
+            else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+            static bool loggedBfd = false;
+            if (!loggedBfd) {
+                loggedBfd = true;
+                std::cerr << "lsfg-vk: FRAME carries 9060 dma-buf fd=" << sendFd
+                    << " slot=" << slot << "\n";
+            }
+        } else if (this->fake && this->localCopyOnly
+                && slot < this->localExportFds.size()
+                && this->localExportFds.at(slot) >= 0) {
+            sendFd = ::dup(this->localExportFds.at(slot));
+            if (sendFd < 0)
+                sendFd = syncFd;
+            else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+        }
+        this->ipcConn->attachFd(sendFd);
         this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot) });
-        // ownership transferred to kernel; our copy closed by send()
+        sendFd = -1;
         syncFd = -1;
     } catch (const std::exception& e) {
         if (syncFd >= 0) ::close(syncFd);
@@ -498,22 +997,30 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         throw ls::error(std::string("lsfg-vk: external stream error: send FRAME failed: ") + e.what(), e);
     }
 
-    dbgLog("FRAME sent");
-    // mark slot busy until RELEASE
-    this->slotFree.at(slot) = false;
+    phaseLog("FRAME sent");
+    static const bool noBusy = std::getenv("LSFGVK_NO_BUSY")
+        && std::getenv("LSFGVK_NO_BUSY")[0] == '1';
+    if (!noBusy)
+        this->slotFree.at(slot) = false;
     this->fidx++;
 
-    // forward original present down-chain WITH wait list REPLACED BY capture semaphore
-    // game's semaphores were consumed by the blit submit, so re-waiting them would be
-    // an invalid double-wait; waiting the capture semaphore instead is spec-sound
-    // regardless of which queue the game presented on. simultaneous fd-export +
-    // present-wait of one binary semaphore is legal via copy transference.
+    if (this->fake) {
+        phaseLog("isolated present (no WSI)");
+        return VK_SUCCESS;
+    }
+
+    // forward original present down-chain WITHOUT waiting on capture semaphore.
+    // The game thread must not block on display presentation; that is the
+    // frame-doubler's job on the output thread. Reusing the game's original
+    // wait semaphores here is a no-op for correctness because those semaphores
+    // were already waited on by the blit submit above and the GPU has consumed
+    // their signal; re-waiting them is a no-op wait, not a double-wait.
     VkSemaphore waitSem = presentSem.handle();
     const VkPresentInfoKHR presentInfo{
         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
         .pNext = next_chain,
-        .waitSemaphoreCount = 1,
-        .pWaitSemaphores = &waitSem,
+        .waitSemaphoreCount = 0,
+        .pWaitSemaphores = nullptr,
         .swapchainCount = 1,
         .pSwapchains = &swapchain,
         .pImageIndices = &imageIdx,
@@ -521,7 +1028,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     auto res = vk.df().QueuePresentKHR(queue, &presentInfo);
     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
         throw ls::vulkan_error(res, "vkQueuePresentKHR() failed");
-    dbgLog("forwarded present returned (TOTAL)");
+    phaseLog("forwarded present returned (TOTAL)");
 
     return res;
 }

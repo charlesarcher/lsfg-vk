@@ -30,6 +30,12 @@ namespace lsfgvk::layer {
         /// @return true if active
         [[nodiscard]] bool active() const { return this->active_profile.has_value(); }
 
+        /// whether the active profile uses external presentation (fake-swapchain gate)
+        [[nodiscard]] bool externalPresentation() const {
+            return this->active_profile.has_value()
+                && this->active_profile->presentation == ls::Presentation::External;
+        }
+
         /// ensure the layer is up-to-date
         /// @return true if the configuration was updated
         bool update();

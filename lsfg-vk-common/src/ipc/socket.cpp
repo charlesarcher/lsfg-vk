@@ -149,6 +149,11 @@ namespace ls::ipc {
                 mh.msg_controllen = ctrl.size();
 
                 const ssize_t n = recvmsg(fd, &mh, MSG_NOSIGNAL | MSG_CMSG_CLOEXEC);
+                // SESSION 13.21 debug: fd loss hunt (MSG_CTRUNC seen on FRAME)
+                if (n > 0)
+                    std::fprintf(stderr, "lsfg-ipc: [dbg] recvmsg n=%zd ctrl_size=%zu controllen=%zu flags=0x%x fds=%zu fd=%d\n",
+                        n, ctrl.size(), mh.msg_controllen, mh.msg_flags, fds.size(),
+                        fds.empty() ? -1 : fds.back());
                 if (n < 0) {
                     if (errno == EINTR) continue;
                     throw socket_error("recvmsg() on ipc socket", errno);
@@ -501,6 +506,14 @@ namespace ls::ipc {
     }
 
     void Connection::send(const Message& msg) {
+        (void)this->sendCommon(msg, MSG_NOSIGNAL);
+    }
+
+    bool Connection::trySend(const Message& msg) {
+        return this->sendCommon(msg, MSG_NOSIGNAL | MSG_DONTWAIT);
+    }
+
+    bool Connection::sendCommon(const Message& msg, int flags) {
         if (this->sockFd < 0) throw ls::error("send on closed ipc connection");
 
         const MsgType type = typeOf(msg);
@@ -551,21 +564,21 @@ namespace ls::ipc {
         while (!remaining.empty()) {
             ssize_t n = 0;
             if (firstCall) {
-                n = ::sendmsg(this->sockFd, &mh, MSG_NOSIGNAL);
+                n = ::sendmsg(this->sockFd, &mh, flags);
                 firstCall = false;
             } else {
-                n = ::send(this->sockFd, remaining.data(), remaining.size(), MSG_NOSIGNAL);
+                n = ::send(this->sockFd, remaining.data(), remaining.size(), flags);
             }
 
             if (n < 0) {
                 if (errno == EINTR) continue;
                 const int err = errno;
                 if (err == EAGAIN || err == EWOULDBLOCK) {
-                    // SO_SNDTIMEO fired; a partial frame leaves the stream
-                    // framing-corrupted, which must be surfaced loudly
                     if (sent > 0)
                         throw ls::error("ipc send timed out after a partial frame; "
                             "stream is unusable");
+                    if (flags & MSG_DONTWAIT)
+                        return false;
                     throw socket_error("send() on ipc socket (timed out)", err);
                 }
                 throw socket_error("send() on ipc socket", err);
@@ -584,6 +597,7 @@ namespace ls::ipc {
             sent += static_cast<size_t>(n);
             remaining = remaining.subspan(static_cast<size_t>(n));
         }
+        return true;
     }
 
     Message Connection::receive(const std::optional<std::chrono::milliseconds>& deadline) {

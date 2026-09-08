@@ -4,9 +4,12 @@
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
+#include "lsfg-vk-layer/isolated_swapchain.hpp"
 #include "swapchain.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -22,6 +25,41 @@
 using namespace lsfgvk::layer;
 
 namespace {
+    struct LayerInfo;
+    struct InstanceInfo;
+
+    // ---- dry-run timing ----------------------------------------------------
+    static void dryRunSample(std::string_view name, double ms) {
+        static bool enabled = !!std::getenv("LSFGVK_DRY_RUN");
+        if (!enabled) return;
+        static std::mutex m;
+        static std::unordered_map<std::string, std::vector<double>> samples;
+        std::unique_lock lock(m);
+        samples[std::string(name)].push_back(ms);
+    }
+
+    static void dryRunPrint() {
+        static bool enabled = !!std::getenv("LSFGVK_DRY_RUN");
+        if (!enabled) return;
+        static std::mutex m;
+        static std::unordered_map<std::string, std::vector<double>> samples;
+        std::unique_lock lock(m);
+        for (const auto& [name, vals] : samples) {
+            std::fprintf(stderr, "lsfg-vk-layer: [dry-run] %s n=%zu max=%.3f ms\n",
+                name.c_str(), vals.size(), *std::max_element(vals.begin(), vals.end()));
+            if (vals.size() > 1) {
+                std::vector<double> sorted = vals;
+                std::sort(sorted.begin(), sorted.end());
+                const double p50 = sorted[sorted.size() / 2];
+                const double p90 = sorted[sorted.size() * 9 / 10];
+                std::fprintf(stderr, "lsfg-vk-layer: [dry-run]   p50=%.3f ms  p90=%.3f ms\n",
+                    p50, p90);
+            }
+        }
+        std::fprintf(stderr, "lsfg-vk-layer: [dry-run] entries=%zu\n", samples.size());
+    }
+    // ------------------------------------------------------------------------
+
     // global layer info initialized at layer negotiation
     struct LayerInfo {
         std::unordered_map<std::string, PFN_vkVoidFunction> map; //!< function pointer override map
@@ -295,6 +333,8 @@ namespace {
         try {
             // retire old swapchain
             if (info->oldSwapchain) {
+                if (isIsolated(info->oldSwapchain))
+                    destroyIsolated(it->second, info->oldSwapchain);
                 const auto& info_mapping = instance_info->swapchainInfos.find(info->oldSwapchain);
                 if (info_mapping != instance_info->swapchainInfos.end())
                     instance_info->swapchainInfos.erase(info_mapping);
@@ -308,8 +348,29 @@ namespace {
 
             layer_info->root.update(); // ensure config is up to date
 
-            // create swapchain
+            const bool isolated = layer_info->root.externalPresentation()
+                && isolatedSwapchainEnabled();
+
             VkSwapchainCreateInfoKHR newInfo = *info;
+            if (isolated) {
+                IsolatedSwapchain iso = createIsolated(it->second, newInfo);
+                *swapchain = allocIsolatedHandle();
+                std::vector<VkImage> handles = iso.handles;
+                storeIsolated(*swapchain, std::move(iso));
+                auto& sinfo = instance_info->swapchainInfos.emplace(*swapchain, SwapchainInfo {
+                    .images = std::move(handles),
+                    .format = newInfo.imageFormat,
+                    .colorSpace = newInfo.imageColorSpace,
+                    .extent = newInfo.imageExtent,
+                    .presentMode = newInfo.presentMode,
+                    .fake = true
+                }).first->second;
+                layer_info->root.createSwapchainContext(it->second, *swapchain, sinfo);
+                instance_info->swapchains.emplace(*swapchain, ls::R<vk::Vulkan>(it->second));
+                return VK_SUCCESS;
+            }
+
+            // create swapchain
             layer_info->root.modifySwapchainCreateInfo(it->second, newInfo,
                 [=, newInfo = &newInfo]() {
                     auto res = it->second.df().CreateSwapchainKHR(
@@ -356,6 +417,49 @@ namespace {
             std::cerr << "- " << e.what() << '\n';
             return VK_ERROR_INITIALIZATION_FAILED;
         }
+    }
+
+    VkResult myvkAcquireNextImageKHR(
+            VkDevice device,
+            VkSwapchainKHR swapchain,
+            uint64_t timeout,
+            VkSemaphore semaphore,
+            VkFence fence,
+            uint32_t* pImageIndex) {
+        const auto& swIt = instance_info->swapchains.find(swapchain);
+        if (swIt == instance_info->swapchains.end())
+            return VK_ERROR_INITIALIZATION_FAILED;
+
+        static const bool dbgAcq = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        VkResult res = VK_SUCCESS;
+        if (isIsolated(swapchain)) {
+            auto& iso = isolatedAt(swapchain);
+            const uint32_t idx = iso.next % static_cast<uint32_t>(iso.recycleFences.size());
+            const uint64_t ns = timeout == UINT64_MAX ? UINT64_MAX : timeout;
+            if (!iso.recycleFences.at(idx).wait(swIt->second.get(), ns))
+                res = VK_NOT_READY;
+            else {
+                iso.recycleFences.at(idx).reset(swIt->second.get());
+                iso.next = idx + 1;
+                *pImageIndex = idx;
+                isolatedSignal(swIt->second.get(), iso.signalQueue,
+                    swIt->second.get().queue(),
+                    semaphore, fence);
+                res = VK_SUCCESS;
+            }
+        } else {
+            res = swIt->second.get().df().AcquireNextImageKHR(
+                device, swapchain, timeout, semaphore, fence, pImageIndex);
+        }
+        if (dbgAcq) {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr,
+                "lsfg-vk-layer: [dbg] acquire timeout=%llu result=%d wait=%lld ms\n",
+                static_cast<unsigned long long>(timeout), res, static_cast<long long>(ms));
+        }
+        return res;
     }
 
     VkResult myvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
@@ -412,12 +516,57 @@ namespace {
                 for (size_t j = 0; j < info->waitSemaphoreCount; j++)
                     waitSemaphores.push_back(info->pWaitSemaphores[j]);
 
-                result = layer_info->root.presentSwapchain(swapchain,
-                    it->second, queue,
-                    const_cast<void*>(info->pNext),
-                    info->pImageIndices[i],
-                    { waitSemaphores.begin(), waitSemaphores.end() }
-                );
+                {
+                    static const bool dbgPres{ std::getenv("LSFGVK_LAYER_DBG") != nullptr };
+                    const auto t0 = std::chrono::steady_clock::now();
+                    if (dbgPres) {
+                        const auto now = std::chrono::steady_clock::now();
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                        std::fprintf(stderr,
+                            "lsfg-vk-layer: [dbg] present-enter swapchain=%p idx=%u @%lld ms\n",
+                            (void*)swapchain,
+                            static_cast<unsigned>(info->pImageIndices[i]),
+                            static_cast<long long>(ms));
+                    }
+                    result = layer_info->root.presentSwapchain(swapchain,
+                        it->second, queue,
+                        const_cast<void*>(info->pNext),
+                        info->pImageIndices[i],
+                        { waitSemaphores.begin(), waitSemaphores.end() }
+                    );
+                    if (isIsolated(swapchain) && result == VK_SUCCESS) {
+                        auto& iso = isolatedAt(swapchain);
+                        const uint32_t idx = info->pImageIndices[i];
+                        isolatedSignal(it->second.get(), iso.signalQueue, iso.signalQueue,
+                            VK_NULL_HANDLE, iso.recycleFences.at(idx).handle());
+                        // DXVK frame-latency latch: present fences in pNext must
+                        // signal or the game waits forever (fullscreen freeze).
+                        for (const auto* n = static_cast<const VkBaseInStructure*>(info->pNext);
+                                n != nullptr;
+                                n = static_cast<const VkBaseInStructure*>(n->pNext)) {
+                            if (n->sType != VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR)
+                                continue;
+                            const auto* fi = reinterpret_cast<const VkSwapchainPresentFenceInfoKHR*>(n);
+                            for (uint32_t k = 0; k < fi->swapchainCount; ++k) {
+                                if (fi->pFences && fi->pFences[k] != VK_NULL_HANDLE)
+                                    isolatedSignal(it->second.get(), iso.signalQueue, queue,
+                                        VK_NULL_HANDLE, fi->pFences[k]);
+                            }
+                        }
+                    }
+                    const auto d = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    if (dbgPres) {
+                        const auto now = std::chrono::steady_clock::now();
+                        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+                        std::fprintf(stderr,
+                            "lsfg-vk-layer: [dbg] present-exit  swapchain=%p result=%d wait=%lld ms @%lld ms\n",
+                            (void*)swapchain,
+                            static_cast<int>(result),
+                            static_cast<long long>(d),
+                            static_cast<long long>(ms));
+                    }
+                }
             } catch (const ls::vulkan_error& e) {
                 if (e.error() != VK_ERROR_OUT_OF_DATE_KHR) {
                     std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain presentation:\n";
@@ -439,6 +588,90 @@ namespace {
 #pragma clang diagnostic pop
     }
 
+    VkResult myvkAcquireNextImage2KHR(VkDevice device,
+            const VkAcquireNextImageInfoKHR* info, uint32_t* pImageIndex) {
+        if (!info) return VK_ERROR_INITIALIZATION_FAILED;
+        return myvkAcquireNextImageKHR(device, info->swapchain, info->timeout,
+            info->semaphore, info->fence, pImageIndex);
+    }
+
+    VkResult myvkWaitForPresent2KHR(VkDevice, VkSwapchainKHR, const VkPresentWait2InfoKHR*) {
+        return VK_SUCCESS;
+    }
+
+    void myvkSetHdrMetadataEXT(VkDevice, uint32_t, const VkSwapchainKHR*, const VkHdrMetadataEXT*) {}
+
+    VkResult myvkReleaseSwapchainImagesKHR(VkDevice, const void*) { return VK_SUCCESS; }
+    VkResult myvkReleaseSwapchainImagesEXT(VkDevice, const void*) { return VK_SUCCESS; }
+    VkResult myvkGetPastPresentationTimingGOOGLE(VkDevice, VkSwapchainKHR, uint32_t*, void*) {
+        return VK_SUCCESS;
+    }
+    VkResult myvkGetPastPresentationTimingEXT(VkDevice, const void*, void*) {
+        return VK_SUCCESS;
+    }
+
+    VkResult myvkSetSwapchainPresentTimingQueueSizeEXT(VkDevice, VkSwapchainKHR, uint32_t) {
+        return VK_SUCCESS;
+    }
+    VkResult myvkGetSwapchainTimingPropertiesEXT(VkDevice, VkSwapchainKHR,
+            VkSwapchainTimingPropertiesEXT* pProps, uint64_t* pCounter) {
+        if (pProps) *pProps = {};
+        if (pCounter) *pCounter = 0;
+        return VK_SUCCESS;
+    }
+    VkResult myvkGetSwapchainTimeDomainPropertiesEXT(VkDevice, VkSwapchainKHR,
+            VkSwapchainTimeDomainPropertiesEXT* pProps, uint64_t* pCounter) {
+        if (pProps) *pProps = {};
+        if (pCounter) *pCounter = 0;
+        return VK_SUCCESS;
+    }
+    VkResult myvkGetRefreshCycleDurationGOOGLE(VkDevice, VkSwapchainKHR,
+            VkRefreshCycleDurationGOOGLE* p) {
+        if (p) *p = {};
+        return VK_SUCCESS;
+    }
+    VkResult myvkGetSwapchainCounterEXT(VkDevice, VkSwapchainKHR, VkSurfaceCounterFlagBitsEXT, uint64_t* v) {
+        if (v) *v = 0;
+        return VK_SUCCESS;
+    }
+    void myvkSetLocalDimmingAMD(VkDevice, VkSwapchainKHR, VkBool32) {}
+
+    VkResult myvkGetSwapchainImagesKHR(VkDevice device, VkSwapchainKHR swapchain,
+            uint32_t* pCount, VkImage* pImages) {
+        if (isIsolatedTombstone(swapchain)) {
+            if (pCount) *pCount = 0;
+            return VK_SUCCESS;
+        }
+        if (isIsolated(swapchain)) {
+            auto& iso = isolatedAt(swapchain);
+            const uint32_t n = static_cast<uint32_t>(iso.handles.size());
+            if (pImages == nullptr) {
+                *pCount = n;
+                return VK_SUCCESS;
+            }
+            if (*pCount < n) {
+                *pCount = n;
+                return VK_INCOMPLETE;
+            }
+            for (uint32_t i = 0; i < n; ++i)
+                pImages[i] = iso.handles[i];
+            *pCount = n;
+            return VK_SUCCESS;
+        }
+        const auto& it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end())
+            return VK_ERROR_INITIALIZATION_FAILED;
+        return it->second.df().GetSwapchainImagesKHR(device, swapchain, pCount, pImages);
+    }
+
+    VkResult myvkWaitForPresentKHR(VkDevice, VkSwapchainKHR, uint64_t, uint64_t) {
+        return VK_SUCCESS; // isolated presents complete when QueuePresent returns
+    }
+
+    VkResult myvkGetSwapchainStatusKHR(VkDevice, VkSwapchainKHR) {
+        return VK_SUCCESS;
+    }
+
     void myvkDestroySwapchainKHR(
             VkDevice device,
             VkSwapchainKHR swapchain,
@@ -456,6 +689,12 @@ namespace {
             instance_info->swapchains.erase(mapping);
 
         layer_info->root.removeSwapchainContext(swapchain);
+
+        if (isIsolated(swapchain) || isIsolatedTombstone(swapchain)) {
+            if (isIsolated(swapchain))
+                destroyIsolated(it->second, swapchain);
+            return;
+        }
 
         // destroy swapchain
         it->second.df().DestroySwapchainKHR(device, swapchain, alloc);
@@ -490,6 +729,23 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkDestroyDevice", VKPTR(myvkDestroyDevice) },
                 { "vkDestroyInstance", VKPTR(myvkDestroyInstance) },
                 { "vkCreateSwapchainKHR", VKPTR(myvkCreateSwapchainKHR) },
+                { "vkGetSwapchainImagesKHR", VKPTR(myvkGetSwapchainImagesKHR) },
+                { "vkAcquireNextImageKHR", VKPTR(myvkAcquireNextImageKHR) },
+                { "vkAcquireNextImage2KHR", VKPTR(myvkAcquireNextImage2KHR) },
+                { "vkWaitForPresentKHR", VKPTR(myvkWaitForPresentKHR) },
+                { "vkWaitForPresent2KHR", VKPTR(myvkWaitForPresent2KHR) },
+                { "vkGetSwapchainStatusKHR", VKPTR(myvkGetSwapchainStatusKHR) },
+                { "vkSetHdrMetadataEXT", VKPTR(myvkSetHdrMetadataEXT) },
+                { "vkReleaseSwapchainImagesKHR", VKPTR(myvkReleaseSwapchainImagesKHR) },
+                { "vkReleaseSwapchainImagesEXT", VKPTR(myvkReleaseSwapchainImagesEXT) },
+                { "vkGetPastPresentationTimingGOOGLE", VKPTR(myvkGetPastPresentationTimingGOOGLE) },
+                { "vkGetPastPresentationTimingEXT", VKPTR(myvkGetPastPresentationTimingEXT) },
+                { "vkSetSwapchainPresentTimingQueueSizeEXT", VKPTR(myvkSetSwapchainPresentTimingQueueSizeEXT) },
+                { "vkGetSwapchainTimingPropertiesEXT", VKPTR(myvkGetSwapchainTimingPropertiesEXT) },
+                { "vkGetSwapchainTimeDomainPropertiesEXT", VKPTR(myvkGetSwapchainTimeDomainPropertiesEXT) },
+                { "vkGetRefreshCycleDurationGOOGLE", VKPTR(myvkGetRefreshCycleDurationGOOGLE) },
+                { "vkGetSwapchainCounterEXT", VKPTR(myvkGetSwapchainCounterEXT) },
+                { "vkSetLocalDimmingAMD", VKPTR(myvkSetLocalDimmingAMD) },
                 { "vkQueuePresentKHR", VKPTR(myvkQueuePresentKHR) },
                 { "vkDestroySwapchainKHR", VKPTR(myvkDestroySwapchainKHR) }
 #undef VKPTR
@@ -515,5 +771,6 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
     pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
     pVersionStruct->pfnGetDeviceProcAddr = myvkGetDeviceProcAddr;
     pVersionStruct->pfnGetInstanceProcAddr = myvkGetInstanceProcAddr;
+    std::atexit(dryRunPrint);
     return VK_SUCCESS;
 }

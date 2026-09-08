@@ -6,6 +6,7 @@
 #include "vulkan.hpp"
 
 #include <optional>
+#include <vector>
 
 #include <vulkan/vulkan_core.h>
 
@@ -59,6 +60,10 @@ namespace vk {
         /// @param importFd optional file descriptor for shared memory
         /// @param exportFd optional pointer to an integer where the file descriptor will be stored
         /// @param layout optional tiling/modifier layout for dma-buf exchange images
+        /// @param sharingMode sharing mode of the image (CONCURRENT when the
+        ///        image is accessed from more than one queue family)
+        /// @param queueFamilyIndices queue family indices for CONCURRENT
+        ///        sharing; ignored for EXCLUSIVE
         /// @throws ls::vulkan_error on failure
         Image(const vk::Vulkan& vk,
             VkExtent2D extent,
@@ -66,7 +71,13 @@ namespace vk {
             VkImageUsageFlags usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             std::optional<int> importFd = std::nullopt,
             std::optional<int*> exportFd = std::nullopt,
-            const ImageLayout& layout = {});
+            const ImageLayout& layout = {},
+            VkSharingMode sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            const std::vector<uint32_t>& queueFamilyIndices = {});
+
+        /// LINEAR image bound to imported host memory (memfd mmap).
+        Image(const vk::Vulkan& vk, VkExtent2D extent, VkFormat format,
+            VkImageUsageFlags usage, void* hostPtr, VkDeviceSize hostSize);
 
         /// get the image handle
         /// @return the image handle

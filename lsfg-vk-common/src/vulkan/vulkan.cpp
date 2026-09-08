@@ -268,10 +268,12 @@ namespace {
     /// create a logical device
     ls::owned_ptr<VkDevice> createLogicalDevice(const VulkanInstanceFuncs& fi,
             VkPhysicalDevice physdev, uint32_t cfi, bool fp16,
-            bool enableDmaBufExtensions) {
+            bool enableDmaBufExtensions,
+            std::optional<uint32_t> transferQFI) {
         VkDevice handle{};
 
         const float queuePriority{1.0F}; // highest priority
+        const float transferQueuePriority{1.0F}; // highest priority
         const VkPhysicalDeviceVulkan12Features requestedFeaturesVulkan12{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             .shaderFloat16 = fp16,
@@ -283,12 +285,24 @@ namespace {
             .queueCount = 1,
             .pQueuePriorities = &queuePriority
         };
+        std::vector<VkDeviceQueueCreateInfo> queueInfos{ requestedQueueInfo };
+        if (transferQFI.has_value()) {
+            const VkDeviceQueueCreateInfo transferQueueInfo{
+                .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                .queueFamilyIndex = *transferQFI,
+                .queueCount = 1,
+                .pQueuePriorities = &transferQueuePriority
+            };
+            queueInfos.push_back(transferQueueInfo);
+        }
         std::vector<const char*> requestedExtensions{
             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
             VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
             VK_KHR_SWAPCHAIN_EXTENSION_NAME
         };
+        if (hasDeviceExtension(fi, physdev, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+            requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
         if (enableDmaBufExtensions) {
             // two-stage policy: capability is requested best-effort here
             // (silent skip keeps same-device users on drivers without these
@@ -315,8 +329,8 @@ namespace {
         const VkDeviceCreateInfo deviceInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .pNext = &requestedFeaturesVulkan12,
-            .queueCreateInfoCount = 1,
-            .pQueueCreateInfos = &requestedQueueInfo,
+            .queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size()),
+            .pQueueCreateInfos = queueInfos.data(),
             .enabledExtensionCount = static_cast<uint32_t>(requestedExtensions.size()),
             .ppEnabledExtensionNames = requestedExtensions.data()
         };
@@ -449,6 +463,30 @@ namespace {
     }
 }
 
+std::optional<uint32_t> vk::findTransferQFI(const VulkanInstanceFuncs& fi,
+        VkPhysicalDevice physdev) {
+    uint32_t queueCount{};
+    fi.GetPhysicalDeviceQueueFamilyProperties(physdev, &queueCount, VK_NULL_HANDLE);
+
+    std::vector<VkQueueFamilyProperties> queues(queueCount);
+    fi.GetPhysicalDeviceQueueFamilyProperties(physdev, &queueCount, queues.data());
+
+    for (uint32_t i = 0; i < queueCount; ++i) {
+        const auto flags = queues.at(i).queueFlags;
+        if ((flags & VK_QUEUE_TRANSFER_BIT)
+                && !(flags & VK_QUEUE_GRAPHICS_BIT)
+                && !(flags & VK_QUEUE_COMPUTE_BIT))
+            return i;
+    }
+    for (uint32_t i = 0; i < queueCount; ++i) {
+        const auto flags = queues.at(i).queueFlags;
+        if ((flags & VK_QUEUE_TRANSFER_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT))
+            return i;
+    }
+
+    return std::nullopt;
+}
+
 /// initialize vulkan instance function pointers
 VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceProcAddr mpa,
         bool graphical) {
@@ -481,7 +519,10 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
 
         .GetPhysicalDeviceSurfaceCapabilitiesKHR = graphical ?
             ipa<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(mpa, i,
-                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") : nullptr
+                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") : nullptr,
+        .GetPhysicalDeviceSurfacePresentModesKHR = graphical ?
+            ipa<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(mpa, i,
+                "vkGetPhysicalDeviceSurfacePresentModesKHR") : nullptr
     };
 }
 
@@ -565,6 +606,8 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .GetMemoryFdKHR = dpa<PFN_vkGetMemoryFdKHR>(f, d, "vkGetMemoryFdKHR"),
         .GetMemoryFdPropertiesKHR = dpa<PFN_vkGetMemoryFdPropertiesKHR>(f, d,
             "vkGetMemoryFdPropertiesKHR"),
+        .GetMemoryHostPointerPropertiesEXT = dpa_optional<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            f, d, "vkGetMemoryHostPointerPropertiesEXT"),
         .ImportSemaphoreFdKHR = dpa<PFN_vkImportSemaphoreFdKHR>(f, d, "vkImportSemaphoreFdKHR"),
         .GetSemaphoreFdKHR = dpa<PFN_vkGetSemaphoreFdKHR>(f, d, "vkGetSemaphoreFdKHR"),
 
@@ -587,7 +630,8 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         bool isGraphical,
         std::optional<PFN_vkSetDeviceLoaderData> setLoaderData,
         const std::optional<std::filesystem::path>& cachefile,
-        bool enableDmaBufExtensions) :
+        bool enableDmaBufExtensions,
+        bool enableTransferQueue) :
     instance(createInstance(
         appName, appVersion,
         engineName, engineVersion,
@@ -605,7 +649,10 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         this->phys_dev,
         this->queueFamilyIdx,
         this->fp16,
-        enableDmaBufExtensions
+        enableDmaBufExtensions,
+        enableTransferQueue
+            ? findTransferQFI(this->instance_funcs, this->phys_dev)
+            : std::nullopt
     )),
     setLoaderData(setLoaderData),
     device_funcs(initVulkanDeviceFuncs(
@@ -619,6 +666,17 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         *this->device,
         this->queueFamilyIdx
     )),
+    transferQueueFamilyIdx(enableTransferQueue
+        ? findTransferQFI(this->instance_funcs, this->phys_dev).value_or(VK_QUEUE_FAMILY_IGNORED)
+        : VK_QUEUE_FAMILY_IGNORED),
+    transferQueue(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+        ? getQueue(this->device_funcs, *this->device,
+            this->setLoaderData, this->transferQueueFamilyIdx)
+        : VK_NULL_HANDLE),
+    transferCmdPool(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+        ? createCommandPool(this->device_funcs,
+            *this->device, this->transferQueueFamilyIdx)
+        : ls::owned_ptr<VkCommandPool>{}),
     pipelineCache(createPipelineCache(this->device_funcs,
         *this->device, cachefile
     )),

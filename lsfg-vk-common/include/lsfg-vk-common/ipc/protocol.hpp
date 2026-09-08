@@ -29,6 +29,16 @@ namespace ls::ipc {
     /// payload is HELLO at 288 bytes, so this leaves ample headroom
     inline constexpr size_t MAX_PAYLOAD_LEN = 4096;
 
+    /// depth of the staging ring shared between the layer and the companion
+    /// app. the game captures each presented frame into one of these slots and
+    /// blocks in selectFreeSlot until the app RELEASES a slot, so a deeper
+    /// ring lets the game run ahead of the (slower, ~one-cycle-behind) app and
+    /// avoids stalling the game present on the app's frame-gen + present cycle.
+    /// MUST be identical on both processes (layer and app) — they exchange
+    /// staging fds and Release acks indexed by slot < this value. raised from 2
+    /// to give the game headroom against the app cycle.
+    inline constexpr size_t STAGING_RING_DEPTH = 4;
+
     /// message types on the wire (the u8 following the magic)
     enum class MsgType : uint8_t {
         Hello = 1,
@@ -101,7 +111,7 @@ namespace ls::ipc {
     /// the APP owns the staging images (created on its processing device,
     /// local VRAM) and exports them as dma-buf; the layer imports each fd
     /// TRANSFER_DST-only and writes captured frames A→B over PCIe. one
-    /// message per fd, sent twice during handshake (ring depth is 2)
+    /// message per fd, sent STAGING_RING_DEPTH times during handshake
     struct Staging { };
 
     /// A→C acknowledgement; the stream is live after this point
@@ -110,7 +120,8 @@ namespace ls::ipc {
     /// C→A per-frame notification; carries exactly one sync fd (the capture
     /// blit's completion payload) alongside the staging slot it filled
     struct Frame {
-        /// index of the staging slot this frame was captured into (0 or 1)
+        /// index of the staging slot this frame was captured into
+        /// (0 .. STAGING_RING_DEPTH-1)
         uint32_t stagingIdx;
     };
 

@@ -28,12 +28,26 @@ namespace ls::ipc {
     /// std::map registry can still emplace/erase StreamState by value.
     class StreamState {
     public:
-        /// the two B-local source images: created natively on this device at
-        /// the negotiated layout, exported to the layer as the staging
+        /// the STAGING_RING_DEPTH B-local source images: created natively on this
+        /// device at the negotiated layout, exported to the layer as the staging
         /// handoff (STAGING messages), and handed to the backend as the
         /// source descriptors (dups of the same exports). empty until the
         /// staging phase completes; the vk::Image members RAII their handles.
-        std::array<ls::lazy<vk::Image>, 2> sourceImages{};
+        std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> sourceImages{};
+
+        /// B-local copies the backend samples. Snapshot copies the imported
+        /// 9070-owned capture (aImports) → genSources, then Release, then gen.
+        std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> genSources{};
+        /// 9070-owned capture images imported on B for the snapshot only.
+        std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> aImports{};
+        uint32_t rowPitch{0};
+        /// POSIX memfd maps (not Vulkan). Layer memcpy capture here; we memcpy
+        /// into hostPtrs (9060 malloc import) then GPU-copy to genSources.
+        std::array<void*, STAGING_RING_DEPTH> shmMaps{};
+        std::array<void*, STAGING_RING_DEPTH> hostPtrs{};
+        std::array<uint32_t*, STAGING_RING_DEPTH> shmSeq{};
+        std::array<uint32_t, STAGING_RING_DEPTH> shmSeen{};
+        size_t shmBytes{0};
 
         /// the (multiplier-1) B-local destination images, created natively on this
         /// device and self-exported to become the backend's destination
@@ -58,6 +72,11 @@ namespace ls::ipc {
         /// swapchain width/height in pixels
         uint32_t width{0};
         uint32_t height{0};
+        /// pixel format of the B-local source (staging) images, kept so the
+        /// presentation task can create a same-format snapshot image for the
+        /// early-release path (the real present reads the snapshot, not the
+        /// live source, so the slot can be released before the display present)
+        VkFormat sourceFormat{VK_FORMAT_R8G8B8A8_UNORM};
         /// motion-flow factor handed to openContext (1/flow_scale)
         float flow{1.0F};
         /// performance-mode flag handed to openContext
@@ -66,6 +85,7 @@ namespace ls::ipc {
         // move-only: user-declared move ops keep std::map<int,StreamState>
         // emplace/erase by value working (copy stays implicitly deleted).
         StreamState() = default;
+        ~StreamState();
         StreamState(StreamState&&) = default;
         StreamState& operator=(StreamState&&) = default;
     };

@@ -123,6 +123,10 @@ namespace ls::ipc {
         /// @throws socket_error on send failures (incl. EPIPE after peer death)
         void send(const Message& msg);
 
+        /// like send(), but MSG_DONTWAIT. false = socket would block (no
+        /// bytes sent; attached fd still owned by this connection).
+        [[nodiscard]] bool trySend(const Message& msg);
+
         /// receive one full message, decoding its payload. blocks until the
         /// message completes or the deadline expires; an fd on STAGING/FRAME
         /// is stored for takeReceivedFd()
@@ -197,6 +201,7 @@ namespace ls::ipc {
 
         int sockFd{-1};
         int attachedFd{-1};
+        bool sendCommon(const Message& msg, int flags);
         int receivedFd{-1};
     };
 }

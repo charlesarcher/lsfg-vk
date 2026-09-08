@@ -37,6 +37,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -143,7 +144,7 @@ namespace lsfgvk::backend {
         /// @return per-generated-frame done sync fds
         std::vector<int> scheduleFramesCross(int captureReadyFd);
 
-        std::pair<vk::Image, vk::Image> sourceImages;
+        std::vector<vk::Image> sourceImages;
         std::vector<vk::Image> destImages;
         vk::Image blackImage;
 
@@ -379,8 +380,8 @@ namespace {
             std::array<uint8_t, 16> exporterDeviceUUID,
             uint64_t negotiatedModifier,
             VkExtent2D extent, VkFormat format) {
-        if (sources.size() != 2)
-            throw backend::error("context requires exactly 2 source descriptors, got "
+        if (sources.size() < 2)
+            throw backend::error("context requires at least 2 source descriptors, got "
                 + std::to_string(sources.size()));
         if (dests.empty())
             throw backend::error("context requires at least one destination descriptor");
@@ -481,6 +482,7 @@ Context& Instance::openContext(
         VkExtent2D{ width, height },
         hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM);
 
+    const std::lock_guard<std::mutex> lock(this->m_contextsMtx);
     return *this->m_contexts.emplace_back(std::make_unique<ContextImpl>(*this->m_impl,
         sources, dests, exporterDeviceUUID,
         syncFd, VkExtent2D{ width, height }, hdr, flow, perf
@@ -548,14 +550,16 @@ namespace {
             std::nullopt, layout};
     }
     /// import source images
-    std::pair<vk::Image, vk::Image> importSourceImages(const vk::Vulkan& vk,
+    std::vector<vk::Image> importSourceImages(const vk::Vulkan& vk,
             std::span<const vk::ExchangeDescriptor> sources, VkImageUsageFlags usage) {
         try {
-            // both descriptors validated above (exactly 2 sources required)
-            return {
-                importImage(vk, sources[0], usage),  // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-                importImage(vk, sources[1], usage)   // NOLINT(cppcoreguidelines-pro-bounds-avoid-unchecked-container-access)
-            };
+            // every source descriptor imported up-front; the LSSC chains index
+            // them circularly by frame idx (see Mipmaps/Generate render)
+            std::vector<vk::Image> images;
+            images.reserve(sources.size());
+            for (const auto& desc : sources)
+                images.emplace_back(importImage(vk, desc, usage));
+            return images;
         } catch (const std::exception& e) {
             throw backend::error("Unable to import source images", e);
         }
@@ -972,23 +976,12 @@ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
             throw;
         }
     }();
-    if (captureReadyFd >= 0) {
+    const bool haveCapture = captureReadyFd >= 0;
+    if (haveCapture) {
         importSyncFdSemaphore(this->ctx.vk, captureSem.handle(), captureReadyFd);
-    } else {
-        const VkSubmitInfo submitInfo{
-            .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-            .signalSemaphoreCount = 1,
-            .pSignalSemaphores = &captureSem.handle()
-        };
-        auto res = this->ctx.vk.get().df().QueueSubmit(
-            this->ctx.vk.get().queue(), 1, &submitInfo, VK_NULL_HANDLE);
-        if (res != VK_SUCCESS)
-            throw ls::vulkan_error(res, "vkQueueSubmit() failed");
-
-        res = this->ctx.vk.get().df().DeviceWaitIdle(this->ctx.vk.get().dev());
-        if (res != VK_SUCCESS)
-            throw ls::vulkan_error(res, "vkDeviceWaitIdle() failed");
     }
+    // fd < 0: caller already completed capture (or A/B skip). Do not
+    // DeviceWaitIdle and do not wait an unsignaled capture sem.
 
     std::vector<int> doneFds{};
     try {
@@ -1014,8 +1007,9 @@ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
         // ordering comes from the fences (cmdbufFence here, the layer's
         // renderFence on the game device), never from re-waiting exported
         // slots - that recycle-wait deadlocked RADV inside vkQueueSubmit
-        const auto& captureWaitHandle = this->captureWait->handle();
-        const std::vector<VkSemaphore> prepassWaits{ captureWaitHandle };
+        const std::vector<VkSemaphore> prepassWaits = haveCapture
+            ? std::vector<VkSemaphore>{ this->captureWait->handle() }
+            : std::vector<VkSemaphore>{};
 
         // schedule pre-pass
         const auto& cmdbuf = this->cmdbufs.at(0);
@@ -1102,6 +1096,7 @@ std::vector<int> ContextImpl::scheduleFramesCross(int captureReadyFd) {
 }
 
 void Instance::closeContext(const Context& context) {
+    const std::lock_guard<std::mutex> lock(this->m_contextsMtx);
     auto it = std::ranges::find_if(this->m_contexts,
         [context = &context](const std::unique_ptr<ContextImpl>& ctx) {
             return ctx.get() == context;

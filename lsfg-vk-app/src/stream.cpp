@@ -18,6 +18,8 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <cstdlib>
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -29,8 +31,25 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/memfd.h>
+#include <libdrm/amdgpu.h>
+#include <libdrm/amdgpu_drm.h>
 
 using namespace ls::ipc;
+
+StreamState::~StreamState() {
+    // RADV FreeMemory on HOST_ALLOCATION_BIT frees the posix_memalign
+    // pointer and aborts the overlay on FurMark swapchain recreate.
+    if (this->shmBytes == 0)
+        return;
+    static auto* leak = new std::vector<ls::lazy<vk::Image>>;
+    for (auto& im : this->sourceImages)
+        if (im.has_value())
+            leak->push_back(std::move(im));
+}
 
 namespace {
     /// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
@@ -50,6 +69,37 @@ namespace {
         const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - g_dbgT0).count();
         std::fprintf(stderr, "lsfg-vk-app: [dbg] %s (t+%lld ms)\n", buf, ms);
+    }
+
+    int allocExplicitDmaBuf(uint64_t size) {
+        static amdgpu_device_handle adev = nullptr;
+        if (!adev) {
+            const int dfd = ::open("/dev/dri/renderD130", O_RDWR | O_CLOEXEC);
+            if (dfd < 0)
+                throw ls::error("open renderD130 for explicit-sync BO failed");
+            uint32_t maj = 0, min = 0;
+            if (amdgpu_device_initialize(dfd, &maj, &min, &adev) != 0)
+                throw ls::error("amdgpu_device_initialize failed");
+        }
+        amdgpu_bo_alloc_request req{};
+        req.alloc_size = size;
+        req.phys_alignment = 256;
+        req.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM;
+        req.flags = AMDGPU_GEM_CREATE_EXPLICIT_SYNC
+            | AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+        amdgpu_bo_handle bo{};
+        int r = amdgpu_bo_alloc(adev, &req, &bo);
+        if (r != 0) {
+            req.preferred_heap = AMDGPU_GEM_DOMAIN_GTT;
+            r = amdgpu_bo_alloc(adev, &req, &bo);
+        }
+        if (r != 0)
+            throw ls::error("amdgpu_bo_alloc EXPLICIT_SYNC failed");
+        uint32_t rawFd = 0;
+        r = amdgpu_bo_export(bo, amdgpu_bo_handle_type_dma_buf_fd, &rawFd);
+        if (r != 0)
+            throw ls::error("amdgpu_bo_export dma-buf failed");
+        return static_cast<int>(rawFd);
     }
 
     /// bound the blocking recv() so a SIGINT (EINTR) or a silent peer can never
@@ -164,6 +214,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     const auto neg = vk::negotiateExchangeLayout(appCaps, gameProxyCaps, fmt, usageNeeds);
     state.negotiatedModifier = neg.modifier;
     state.width = w; state.height = h; state.gameUuid = hello->gameUuid;
+    state.sourceFormat = fmt;
+    state.rowPitch = rowPitch;
     conn.send(ls::ipc::Negotiated{
         .modifier = neg.modifier,
         .rowPitch = rowPitch,
@@ -179,34 +231,125 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     const VkImageUsageFlags imgUsage =
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
-    // 3. two STAGING messages: create the staging images LOCALLY on B at the
-    //    negotiated layout, self-export each as dma-buf, and hand the fds to
-    //    the layer (one SCM_RIGHTS fd per STAGING message). the layer imports
-    //    them TRANSFER_DST-only, so its capture blit writes each frame A→B
-    //    over PCIe as a sequential DMA transfer while the LSSC chain runs on
-    //    B-local sources. the app keeps the images as sourceImages (real
-    //    frame blits) and hands the backend a dup of the same exports as the
-    //    source descriptor fds (the backend imports the dup; the kernel
+    // 3. STAGING_RING_DEPTH STAGING messages: create the staging images LOCALLY
+    //    on B at the negotiated layout, self-export each as dma-buf, and hand
+    //    the fds to the layer (one SCM_RIGHTS fd per STAGING message). the
+    //    layer imports them TRANSFER_DST-only, so its capture blit writes each
+    //    frame A→B over PCIe as a sequential DMA transfer while the LSSC chain
+    //    runs on B-local sources. the app keeps the images as sourceImages
+    //    (real frame blits) and hands the backend a dup of the same exports as
+    //    the source descriptor fds (the backend imports the dup; the kernel
     //    duplicated the fd on send, no re-export roundtrip).
     std::vector<vk::ExchangeDescriptor> sourceDescs;
     std::vector<int> handedSourceFds;
-    for (size_t i = 0; i < 2; ++i) {
+    const std::vector<uint32_t> concurrentFamilies{
+        vk.queueFamilyIndex(), vk.transferQueueFamilyIndex()
+    };
+    const VkSharingMode sourceSharing = vk.hasTransferQueue()
+        ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    {
+        const size_t probeSz = 4ull * 1024 * 1024;
+        void* mall = nullptr;
+        if (::posix_memalign(&mall, 4096, probeSz) == 0) {
+            try {
+                vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    mall, probeSz);
+                dbg("host-import malloc OK");
+            } catch (const std::exception& e) {
+                dbg("host-import malloc FAIL %s", e.what());
+            }
+            ::free(mall);
+        }
+        {
+            const size_t probeSz = 4ull * 1024 * 1024;
+            const int sfd = ::shm_open("/lsfg-vk-host-probe", O_CREAT | O_RDWR, 0600);
+            if (sfd >= 0) {
+                (void)::ftruncate(sfd, static_cast<off_t>(probeSz));
+                void* p = ::mmap(nullptr, probeSz, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
+                ::shm_unlink("/lsfg-vk-host-probe");
+                if (p != MAP_FAILED) {
+                    ::memset(p, 0, probeSz);
+                    try {
+                        vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
+                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                            p, probeSz);
+                        dbg("host-import shm_open OK");
+                    } catch (const std::exception& e) {
+                        dbg("host-import shm_open FAIL %s", e.what());
+                    }
+                    ::munmap(p, probeSz);
+                }
+                ::close(sfd);
+            }
+        }
+    }
+    for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+        const uint64_t bytes = (static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull;
+        static const bool posixShm =
+            conf.presentation == ls::Presentation::External
+            && !(std::getenv("LSFGVK_POSIX_SHM")
+                && std::getenv("LSFGVK_POSIX_SHM")[0] == '0');
+        if (posixShm) {
+        const uint64_t mapBytes = bytes + 4096ull;
+        const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", MFD_CLOEXEC));
+        if (memfd < 0 || ::ftruncate(memfd, static_cast<off_t>(mapBytes)) != 0)
+            throw ls::error("memfd_create/ftruncate failed for POSIX staging");
+        void* map = ::mmap(nullptr, static_cast<size_t>(mapBytes),
+            PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+        if (map == MAP_FAILED) {
+            ::close(memfd);
+            throw ls::error("mmap memfd failed for POSIX staging");
+        }
+        ::memset(map, 0, static_cast<size_t>(mapBytes));
+        (void)::mlock(map, static_cast<size_t>(mapBytes));
+        void* host = nullptr;
+        if (::posix_memalign(&host, 4096, static_cast<size_t>(bytes)) != 0) {
+            ::munmap(map, static_cast<size_t>(mapBytes));
+            ::close(memfd);
+            throw ls::error("posix_memalign 9060 staging failed");
+        }
+        ::memset(host, 0, static_cast<size_t>(bytes));
+        state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt,
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                | VK_IMAGE_USAGE_SAMPLED_BIT,
+            host, bytes);
+        state.shmMaps.at(i) = map;
+        state.hostPtrs.at(i) = host;
+        state.shmSeq.at(i) = reinterpret_cast<uint32_t*>(
+            static_cast<char*>(map) + static_cast<size_t>(bytes));
+        state.shmSeen.at(i) = 0;
+        state.shmBytes = static_cast<size_t>(bytes);
+        const int sendFd = ::dup(memfd);
+        ::close(memfd);
+        if (sendFd < 0)
+            throw ls::error("dup() failed for POSIX staging memfd");
+        conn.attachFd(sendFd);
+        conn.send(Staging{});
+        dbg("posix-shm staging slot %zu size=%llu", i, (unsigned long long)bytes);
+        continue;
+        }
         state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt, imgUsage,
-            std::nullopt /*importFd*/, std::nullopt /*exportFd*/, layout);
+            std::nullopt /*importFd*/, std::nullopt /*exportFd*/, layout,
+            sourceSharing, concurrentFamilies);
         auto exp = state.sourceImages.at(i).mut().exportDmaBuf(vk);
+        conn.attachFd(exp.fd);
+        conn.send(Staging{});
+    }
+    const VkImageUsageFlags genUsage =
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT;
+    for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+        state.genSources.at(i).emplace(vk, VkExtent2D{ w, h }, fmt, genUsage,
+            std::nullopt, std::nullopt, layout,
+            sourceSharing, concurrentFamilies);
+        auto exp = state.genSources.at(i).mut().exportDmaBuf(vk);
         const int dupForDescriptor = ::dup(exp.fd);
         if (dupForDescriptor < 0) {
             ::close(exp.fd);
-            throw ls::error("dup() failed for staging descriptor fd");
+            throw ls::error("dup() failed for gen-source descriptor fd");
         }
-        try {
-            conn.attachFd(exp.fd);
-            conn.send(Staging{});
-            // attachFd ownership transferred to kernel; send closed our copy
-        } catch (const std::exception& e) {
-            ::close(dupForDescriptor);
-            throw e;
-        }
+        ::close(exp.fd);
         handedSourceFds.push_back(dupForDescriptor);
         sourceDescs.push_back({
             .fd = dupForDescriptor,
@@ -298,6 +441,30 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     //    window, surface and swapchain for this stream and tears them all down
     //    on every return path. The handshake above already opened the backend
     //    context that runPresent drives via backend.scheduleFrames.
-    ls::presentation::runPresent(conn, state, vk, backend, conf, session, stop);
+    //
+    //    Session 13.23: a stale display swapchain (VK_ERROR_OUT_OF_DATE /
+    //    SUBOPTIMAL-then-failure: output mode change, compositor reflow) must
+    //    NOT kill the IPC stream - the game's connection would EPIPE and die
+    //    (observed: black screen). Rebuild the whole present session (window,
+    //    surface, swapchain, threads); the connection and backend context
+    //    survive. The layer keeps sending FRAMEs; the first few may land while
+    //    no window exists yet - the input thread's staging slot recycle
+    //    handles that (slots free after Release, no dependency on presents).
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        try {
+            ls::presentation::runPresent(conn, state, vk, backend, conf, session, stop);
+            break;  // clean return (stop requested / game disconnected)
+        } catch (const ls::vulkan_error& e) {
+            const auto res = e.error();
+            if (res != VK_ERROR_OUT_OF_DATE_KHR && res != VK_SUBOPTIMAL_KHR
+                    && res != VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT)
+                throw;
+            std::cerr << "lsfg-vk-app: swapchain stale ("
+                << (res == VK_ERROR_OUT_OF_DATE_KHR ? "OUT_OF_DATE" : "mode change")
+                << "), rebuilding present session (attempt " << attempt + 1 << ")\n";
+        }
+        if (stop.load(std::memory_order_relaxed))
+            break;
+    }
 }
 }  // namespace ls::ipc

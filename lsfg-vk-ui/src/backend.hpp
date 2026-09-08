@@ -9,6 +9,8 @@
 #include "lsfg-vk-common/configuration/config.hpp"
 
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
 #include <utility>
 
 #define getters public
@@ -113,6 +115,7 @@ namespace lsfgvk::ui {
 
 #define MARK_DIRTY() \
     this->m_dirty.store(true, std::memory_order_relaxed); \
+    this->m_saveCv.notify_all(); \
     emit refreshUI();
 
         void dllUpdated(const QString& dll) {
@@ -259,6 +262,8 @@ namespace lsfgvk::ui {
         QStringList m_gpu_list;
 
         std::atomic_bool m_dirty{false};
+        std::mutex m_saveMtx{};
+        std::condition_variable m_saveCv{};
     };
 
 }

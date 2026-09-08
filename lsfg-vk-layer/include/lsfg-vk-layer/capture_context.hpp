@@ -14,6 +14,8 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -22,6 +24,7 @@
 namespace lsfgvk::layer {
 
     struct SwapchainInfo;
+    struct CopyHop;
 
     /// capture context for external presentation (one-way dual-GPU).
     /// imports the two app-owned staging images (the app creates them in its
@@ -63,33 +66,76 @@ namespace lsfgvk::layer {
             void* next_chain, uint32_t imageIdx,
             const std::vector<VkSemaphore>& semaphores);
     private:
-        void drainReleases();
-        [[nodiscard]] size_t selectFreeSlot();
+        /// non-blocking drain of RELEASE messages; @returns count applied
+        int drainReleases();
+        /// one round-robin probe. never waits on GPU B. nullopt = skip this capture
+        [[nodiscard]] std::optional<size_t> trySelectFreeSlot();
+        /// bitmap of currently free slots (bit i = slot i free); debug only
+        [[nodiscard]] unsigned freeMask() const {
+            unsigned m = 0;
+            for (size_t i = 0; i < this->slotFree.size(); ++i)
+                if (this->slotFree.at(i))
+                    m |= 1u << i;
+            return m;
+        }
 
         ls::GameConf profile;
         SwapchainInfo info;
         std::string gameDeviceName;
+        bool fake{false};               // fake swapchain: layer-owned images
+        VkFence lastImageGateFence{VK_NULL_HANDLE}; // cb-reuse gate when fake
 
         // vulkan objects (created on the game device)
-        std::vector<vk::Image> stagingImages; // imported from the app's dma-buf exports, TRANSFER_DST only
+        std::vector<vk::Image> stagingImages; // imported B staging (two-way / IMPORT_STAGING)
+        std::vector<vk::Image> localImages;   // 9070-owned capture dest; dma-buf exported on FRAME
+        std::vector<vk::Image> hostImages;    // LINEAR images bound to host memory
+        std::unique_ptr<vk::Vulkan> bVk;      // same-process 9060 device (LSFGVK_DUAL_HOST)
+        std::vector<vk::Image> bHostImages;   // 9060 import of a separate malloc
+        std::vector<vk::Image> bVramImages;   // 9060-local dma-buf export dest
+        std::array<void*, ls::ipc::STAGING_RING_DEPTH> hostPtrsA{};
+        std::array<void*, ls::ipc::STAGING_RING_DEPTH> hostPtrsB{};
+        std::array<void*, ls::ipc::STAGING_RING_DEPTH> shmMaps{};
+        std::array<uint32_t*, ls::ipc::STAGING_RING_DEPTH> shmSeq{};
+        std::unique_ptr<CopyHop> copyHop;
+        VkDeviceSize hostAllocSize{0};
+        std::array<int, ls::ipc::STAGING_RING_DEPTH> bExportFds{};
+        std::optional<vk::CommandBuffer> bEmptyCb;
+        std::optional<vk::Fence> bEmptyFence;
+        vk::ImageLayout exchangeLayout{};     // negotiated LINEAR/DRM layout for localImages
+        std::array<int, ls::ipc::STAGING_RING_DEPTH> localExportFds{};
+        bool localCopyOnly{false};
         std::vector<vk::Semaphore> captureSemaphores; // recreated per cycle in present(), behind the fence gate
+        std::vector<vk::Semaphore> leakCaptureSems;   // LSFGVK_LEAK_SEM=1: never DestroySemaphore
         std::vector<vk::Semaphore> presentSemaphores;
+        // Session 13.17: capture cb RING - the render thread must never wait
+        // on the previous blit. each ring slot owns a command buffer + fence;
+        // a slot is reused only when its fence is ALREADY signaled (non-
+        // blocking test, 0 timeout). ring is deep enough (STAGING_RING_DEPTH
+        // + slack) that a busy GPU never makes the render thread wait.
+        static constexpr size_t CAPTURE_RING_DEPTH = 6;
+        std::vector<vk::CommandBuffer> captureCommandBuffers{};
+        std::vector<vk::Fence> captureFences{};
+        size_t captureRingIdx{0};
+        // deprecated singles (kept for dtor compat, unused in fake path)
         ls::lazy<vk::CommandBuffer> captureCommandBuffer;
         ls::lazy<vk::Fence> captureFence;
         bool fenceSubmitted{false};
         // GPU timestamp instrumentation of the capture blit (LSFGVK_TIMING=1)
         vk::TimingRing timingRing;
 
-        // IPC stream (exactly 2 slots, maps to backend's two sources)
+        // IPC stream (STAGING_RING_DEPTH slots, maps to the backend's sources)
         std::optional<ls::ipc::Connection> ipcConn;
 
         // slot ring state
-        std::array<bool, 2> slotFree{true, true};
+        std::array<bool, ls::ipc::STAGING_RING_DEPTH> slotFree{};
         size_t nextSlot{0};
         uint64_t fidx{0};
+        uint64_t droppedCaptures{0};
 
         // for teardown fence wait (need vk + device functions)
         const vk::Vulkan* vkPtr{nullptr};
+        VkCommandPool capturePool{VK_NULL_HANDLE};
+        VkQueue captureQ{VK_NULL_HANDLE};
     };
 
 }
