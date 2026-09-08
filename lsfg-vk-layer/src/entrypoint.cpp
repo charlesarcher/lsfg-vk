@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <string>
@@ -145,6 +146,53 @@ namespace {
                     "Your GPU driver is not supported.\n";
             return e.error();
         }
+    }
+
+    // Wine's unix thunk for vkGetPastPresentationTimingEXT (winevulkan
+    // thunk64 +0x2a2f5) does `mov (%rax)` on info->swapchain, treating
+    // VkSwapchainKHR as a pointer to a wine object. Isolated handles are
+    // 0x5af5xxxx integers, not wine objects → 0xc0000005 in the thunk
+    // BEFORE our stub runs. Hide the extensions so DXVK never calls it.
+    bool hideDeviceExt(const char* name) {
+        return std::strcmp(name, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0
+            || std::strcmp(name, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0;
+    }
+
+    VkResult myvkEnumerateDeviceExtensionProperties(
+            VkPhysicalDevice physdev, const char* layerName,
+            uint32_t* pCount, VkExtensionProperties* pProperties) {
+        if (!pCount || !instance_info || !instance_info->funcs.EnumerateDeviceExtensionProperties)
+            return VK_ERROR_INITIALIZATION_FAILED;
+        auto* next = instance_info->funcs.EnumerateDeviceExtensionProperties;
+        if (layerName && layerName[0])
+            return next(physdev, layerName, pCount, pProperties);
+
+        uint32_t n = 0;
+        VkResult r = next(physdev, nullptr, &n, nullptr);
+        if (r != VK_SUCCESS)
+            return r;
+        std::vector<VkExtensionProperties> all(n);
+        if (n > 0) {
+            r = next(physdev, nullptr, &n, all.data());
+            if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+                return r;
+        }
+        std::vector<VkExtensionProperties> keep;
+        keep.reserve(all.size());
+        for (const auto& e : all)
+            if (!hideDeviceExt(e.extensionName))
+                keep.push_back(e);
+
+        if (!pProperties) {
+            *pCount = static_cast<uint32_t>(keep.size());
+            return VK_SUCCESS;
+        }
+        const uint32_t cap = *pCount;
+        const uint32_t out = std::min(cap, static_cast<uint32_t>(keep.size()));
+        for (uint32_t i = 0; i < out; ++i)
+            pProperties[i] = keep[i];
+        *pCount = out;
+        return out < keep.size() ? VK_INCOMPLETE : VK_SUCCESS;
     }
 
     // create device
@@ -354,20 +402,30 @@ namespace {
             VkSwapchainCreateInfoKHR newInfo = *info;
             if (isolated) {
                 IsolatedSwapchain iso = createIsolated(it->second, newInfo);
-                *swapchain = allocIsolatedHandle();
+                const VkSwapchainKHR handle = allocIsolatedHandle();
                 std::vector<VkImage> handles = iso.handles;
-                storeIsolated(*swapchain, std::move(iso));
-                auto& sinfo = instance_info->swapchainInfos.emplace(*swapchain, SwapchainInfo {
-                    .images = std::move(handles),
-                    .format = newInfo.imageFormat,
-                    .colorSpace = newInfo.imageColorSpace,
-                    .extent = newInfo.imageExtent,
-                    .presentMode = newInfo.presentMode,
-                    .fake = true
-                }).first->second;
-                layer_info->root.createSwapchainContext(it->second, *swapchain, sinfo);
-                instance_info->swapchains.emplace(*swapchain, ls::R<vk::Vulkan>(it->second));
-                return VK_SUCCESS;
+                storeIsolated(handle, std::move(iso));
+                try {
+                    auto& sinfo = instance_info->swapchainInfos.emplace(handle, SwapchainInfo {
+                        .images = std::move(handles),
+                        .format = newInfo.imageFormat,
+                        .colorSpace = newInfo.imageColorSpace,
+                        .extent = newInfo.imageExtent,
+                        .presentMode = newInfo.presentMode,
+                        .fake = true
+                    }).first->second;
+                    layer_info->root.createSwapchainContext(it->second, handle, sinfo);
+                    instance_info->swapchains.emplace(handle, ls::R<vk::Vulkan>(it->second));
+                    *swapchain = handle;
+                    return VK_SUCCESS;
+                } catch (...) {
+                    instance_info->swapchains.erase(handle);
+                    instance_info->swapchainInfos.erase(handle);
+                    layer_info->root.removeSwapchainContext(handle);
+                    if (isIsolated(handle))
+                        destroyIsolated(it->second, handle);
+                    throw;
+                }
             }
 
             // create swapchain
@@ -436,18 +494,18 @@ namespace {
         if (isIsolated(swapchain)) {
             auto& iso = isolatedAt(swapchain);
             const uint32_t idx = iso.next % static_cast<uint32_t>(iso.recycleFences.size());
-            const uint64_t ns = timeout == UINT64_MAX ? UINT64_MAX : timeout;
-            if (!iso.recycleFences.at(idx).wait(swIt->second.get(), ns))
-                res = VK_NOT_READY;
-            else {
-                iso.recycleFences.at(idx).reset(swIt->second.get());
-                iso.next = idx + 1;
-                *pImageIndex = idx;
-                isolatedSignal(swIt->second.get(), iso.signalQueue,
-                    swIt->second.get().queue(),
-                    semaphore, fence);
-                res = VK_SUCCESS;
-            }
+            // Never UINT64_MAX: a stuck recycle fence under exclusive overlay
+            // is an untabbable black screen. 8 ms then hand out the image.
+            constexpr uint64_t kCapNs = 8ull * 1000ull * 1000ull;
+            const uint64_t ns = (timeout == UINT64_MAX || timeout > kCapNs) ? kCapNs : timeout;
+            (void)iso.recycleFences.at(idx).wait(swIt->second.get(), ns);
+            iso.recycleFences.at(idx).reset(swIt->second.get());
+            iso.next = idx + 1;
+            *pImageIndex = idx;
+            isolatedSignal(swIt->second.get(), iso.signalQueue,
+                swIt->second.get().queue(),
+                semaphore, fence);
+            res = VK_SUCCESS;
         } else {
             res = swIt->second.get().df().AcquireNextImageKHR(
                 device, swapchain, timeout, semaphore, fence, pImageIndex);
@@ -528,12 +586,22 @@ namespace {
                             static_cast<unsigned>(info->pImageIndices[i]),
                             static_cast<long long>(ms));
                     }
-                    result = layer_info->root.presentSwapchain(swapchain,
-                        it->second, queue,
-                        const_cast<void*>(info->pNext),
-                        info->pImageIndices[i],
-                        { waitSemaphores.begin(), waitSemaphores.end() }
-                    );
+                    try {
+                        result = layer_info->root.presentSwapchain(swapchain,
+                            it->second, queue,
+                            const_cast<void*>(info->pNext),
+                            info->pImageIndices[i],
+                            { waitSemaphores.begin(), waitSemaphores.end() }
+                        );
+                    } catch (const std::exception& e) {
+                        // Overlay kicked the 1080 socket for a 1440 HELLO.
+                        // Isolated has no scanout; still SUCCESS so DXVK
+                        // present-fences do not latch.
+                        if (!isIsolated(swapchain))
+                            throw;
+                        std::cerr << "lsfg-vk: isolated present skipped: " << e.what() << "\n";
+                        result = VK_SUCCESS;
+                    }
                     if (isIsolated(swapchain) && result == VK_SUCCESS) {
                         auto& iso = isolatedAt(swapchain);
                         const uint32_t idx = info->pImageIndices[i];
@@ -603,13 +671,38 @@ namespace {
 
     VkResult myvkReleaseSwapchainImagesKHR(VkDevice, const void*) { return VK_SUCCESS; }
     VkResult myvkReleaseSwapchainImagesEXT(VkDevice, const void*) { return VK_SUCCESS; }
-    VkResult myvkGetPastPresentationTimingGOOGLE(VkDevice, VkSwapchainKHR, uint32_t*, void*) {
+    VkResult myvkGetPastPresentationTimingGOOGLE(VkDevice, VkSwapchainKHR,
+            uint32_t* count, void*) {
+        if (count) *count = 0;
         return VK_SUCCESS;
     }
-    VkResult myvkGetPastPresentationTimingEXT(VkDevice, const void*, void*) {
+    VkResult myvkGetPastPresentationTimingEXT(VkDevice, const void*, void* out) {
+        if (out) {
+            auto* p = static_cast<VkPastPresentationTimingPropertiesEXT*>(out);
+            p->timingPropertiesCounter = 0;
+            p->timeDomainsCounter = 0;
+            p->presentationTimingCount = 0;
+        }
         return VK_SUCCESS;
     }
 
+    void myvkGetLatencyTimingsNV(VkDevice, VkSwapchainKHR, void* info) {
+        if (info) {
+            auto* p = static_cast<VkGetLatencyMarkerInfoNV*>(info);
+            p->timingCount = 0;
+        }
+    }
+    VkResult myvkSetLatencySleepModeNV(VkDevice, VkSwapchainKHR, const void*) {
+        return VK_SUCCESS;
+    }
+    VkResult myvkLatencySleepNV(VkDevice, VkSwapchainKHR, const void*) {
+        return VK_SUCCESS;
+    }
+    void myvkSetLatencyMarkerNV(VkDevice, VkSwapchainKHR, const void*) {}
+    VkResult myvkCreateSharedSwapchainsKHR(VkDevice, uint32_t, const void*,
+            const VkAllocationCallbacks*, VkSwapchainKHR*) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
     VkResult myvkSetSwapchainPresentTimingQueueSizeEXT(VkDevice, VkSwapchainKHR, uint32_t) {
         return VK_SUCCESS;
     }
@@ -726,6 +819,7 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
 #define VKPTR(name) reinterpret_cast<PFN_vkVoidFunction>(name)
                 { "vkCreateInstance", VKPTR(myvkCreateInstance) },
                 { "vkCreateDevice", VKPTR(myvkCreateDevice) },
+                { "vkEnumerateDeviceExtensionProperties", VKPTR(myvkEnumerateDeviceExtensionProperties) },
                 { "vkDestroyDevice", VKPTR(myvkDestroyDevice) },
                 { "vkDestroyInstance", VKPTR(myvkDestroyInstance) },
                 { "vkCreateSwapchainKHR", VKPTR(myvkCreateSwapchainKHR) },
@@ -746,6 +840,11 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkGetRefreshCycleDurationGOOGLE", VKPTR(myvkGetRefreshCycleDurationGOOGLE) },
                 { "vkGetSwapchainCounterEXT", VKPTR(myvkGetSwapchainCounterEXT) },
                 { "vkSetLocalDimmingAMD", VKPTR(myvkSetLocalDimmingAMD) },
+                { "vkGetLatencyTimingsNV", VKPTR(myvkGetLatencyTimingsNV) },
+                { "vkSetLatencySleepModeNV", VKPTR(myvkSetLatencySleepModeNV) },
+                { "vkLatencySleepNV", VKPTR(myvkLatencySleepNV) },
+                { "vkSetLatencyMarkerNV", VKPTR(myvkSetLatencyMarkerNV) },
+                { "vkCreateSharedSwapchainsKHR", VKPTR(myvkCreateSharedSwapchainsKHR) },
                 { "vkQueuePresentKHR", VKPTR(myvkQueuePresentKHR) },
                 { "vkDestroySwapchainKHR", VKPTR(myvkDestroySwapchainKHR) }
 #undef VKPTR

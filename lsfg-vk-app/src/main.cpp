@@ -14,6 +14,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lsfg-vk-app/stream.hpp"
+#include "lsfg-vk-app/presentation.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
@@ -440,7 +441,16 @@ int main(int argc, char** argv) {
                 if (errno == EINTR) continue;
                 throw ls::ipc::socket_error("poll() on listener", errno);
             }
-            if (r == 0) continue;                 // 200ms timeout: re-check stop
+            if (r == 0) {
+                bool idle = false;
+                {
+                    std::lock_guard<std::mutex> lk(streamsMtx);
+                    idle = streams.empty();
+                }
+                if (idle && vk.has_value())
+                    ls::presentation::releaseOverlayWsi(*vk);
+                continue;
+            }
             if (pfd[0].revents & POLLIN) {        // SIGINT: drain and break
                 char b{};
                 while (::read(selfPipe[0], &b, 1) > 0) {}
@@ -448,31 +458,20 @@ int main(int argc, char** argv) {
             }
             if (!(pfd[1].revents & POLLIN)) continue;
 
-            // accept() returns a Connection by value (move-only, no default
-            // ctor); bind it before touching the registry so a failed accept
-            // cannot leave a stray fd open.
             dbg("listener ready, accepting");
             try {
                 auto conn = listener.accept();
                 dbg("accept returned");
 
-                // own the stream's registry entry for the connection's lifetime;
-                // the per-connection thread erases it when runStream returns,
-                // destroying the StreamState which closes every staging fd the
-                // layer handed off (leak-free)
                 const int key = conn.fd();
                 {
                     std::lock_guard<std::mutex> lk(streamsMtx);
                     if (streams.count(key)) {
-                        // fd collision (a prior fd was reused before this entry
-                        // was erased) - drop this connection's stream
                         std::cerr << "lsfg-vk-app: dropped stream on fd " << key << "\n";
                         continue;
                     }
                     streams.emplace(key, ls::ipc::StreamState{});
                 }
-                // per-connection thread; raw pointers are safe: vk/backend/conf
-                // all outlive this loop (shutdown drains below before they die)
                 auto connPtr = std::make_unique<ls::ipc::Connection>(std::move(conn));
                 auto thread = std::thread(
                     [connPtr = std::move(connPtr), key, &streams, &streamsMtx, &streamsCv,
@@ -491,7 +490,7 @@ int main(int argc, char** argv) {
                         dbg("erasing stream state");
                         {
                             std::lock_guard<std::mutex> lk(streamsMtx);
-                            streams.erase(key);  // StreamState dtor closes stored fds
+                            streams.erase(key);
                             streamsCv.notify_all();
                         }
                         dbg("stream state erased (dtor done)");
@@ -505,16 +504,14 @@ int main(int argc, char** argv) {
             dbg("about to poll listener");
         }
 
-        // --- shutdown: wait briefly for stream threads to drain their state;
-        //     RAII closes the Listener socket + unlinks the file, and destroys
-        //     the vk::Vulkan (device + instance) -------------------------------
         std::cerr << "lsfg-vk-app: shutting down\n";
-        // Session 13.20: cv-wait for stream teardown (no poll sleeps)
         {
             std::unique_lock<std::mutex> lk(streamsMtx);
             streamsCv.wait_for(lk, std::chrono::seconds(2),
                 [&streams] { return streams.empty(); });
         }
+        if (vk.has_value())
+            ls::presentation::releaseOverlayWsi(*vk);
     } catch (const std::exception& e) {
         std::cerr << "lsfg-vk-app: fatal: " << e.what() << "\n";
         return EXIT_FAILURE;

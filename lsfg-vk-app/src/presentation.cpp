@@ -44,6 +44,7 @@
 #include <deque>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -158,29 +159,40 @@ void dbg(const char* fmt, ...) {
     bool verboseEnabled() {
         return std::getenv("LSFGVK_APP_VERBOSE") != nullptr;
     }
+
+    // Process-lifetime overlay. Recreating exclusive layer-shell on every
+    // HELLO (RE2 1080→1080→1440) closes Xwayland :0 (XIO EBADF) and the
+    // isolated game goes black. Keep WSI across streams; drop only on idle.
+    struct OverlayDisplay {
+        std::unique_ptr<ls::wsi::SurfaceBackend> wsi;
+        VkSurfaceKHR surface{VK_NULL_HANDLE};
+        VkSwapchainKHR swapchain{VK_NULL_HANDLE};
+        VkExtent2D extent{};
+        uint32_t imageFormat{};
+        std::vector<VkImage> swapImages;
+        const char* modeName{"MAILBOX"};
+    };
+    OverlayDisplay g_overlay;
 } // namespace
 
 void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const vk::Vulkan& vk, lsfgvk::backend::Instance& backend,
         const ls::GameConf& conf, std::string_view session,
         const std::atomic<bool>& stop) {
-    // One overlay connection per process. A second concurrent wl_display
-    // (swapchain recreate / FS) gets an empty registry and the isolated
-    // game has no scanout → black screen, audio still running.
-    static std::mutex presentMu;
-    std::lock_guard<std::mutex> presentLock(presentMu);
-
     const uint32_t w = state.width, h = state.height;
+    bool dropOverlay = false;
 
+    auto ensureOverlayWsi = [&] {
+    if (g_overlay.wsi)
+        return;
     // --- surface backend + window/surface on the transport vk ----------------
-    std::unique_ptr<ls::wsi::SurfaceBackend> wsi;
     if (session == "wayland") {
-        wsi = ls::wsi::createWaylandSurfaceBackend();
+        g_overlay.wsi = ls::wsi::createWaylandSurfaceBackend();
     } else {
         // default to X11 for "x11" or "auto" (XWayland)
-        wsi = ls::wsi::createX11SurfaceBackend();
+        g_overlay.wsi = ls::wsi::createX11SurfaceBackend();
     }
-    if (!wsi->connect(session))
+    if (!g_overlay.wsi->connect(session))
         throw ls::error("could not connect the surface backend for session: " + std::string(session));
 
     if (verboseEnabled())
@@ -188,7 +200,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
     // --- resolve the target output: an explicit output must match a connector
     //     exactly; absent/empty selects the primary/active output.
-    const auto outputs = wsi->outputs();
+    const auto outputs = g_overlay.wsi->outputs();
     if (conf.output.has_value()) {
         bool found{false};
         for (const auto& out : outputs)
@@ -202,20 +214,20 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     }
     const std::string outputName = conf.output.has_value() ? *conf.output : std::string{};
 
-    const auto handle = wsi->createWindow(outputName, VkExtent2D{ w, h }, 0u);
-    VkSurfaceKHR surface = wsi->createSurface(vk, handle);
+    const auto handle = g_overlay.wsi->createWindow(outputName, VkExtent2D{ w, h }, 0u);
+    VkSurfaceKHR surface = g_overlay.wsi->createSurface(vk, handle);
 
     // --- query caps, then pick an extent the surface will accept (> 0x0) -----
     VkSurfaceCapabilitiesKHR caps{};
     std::vector<VkColorSpaceKHR> colorspaces;
-    wsi->surfaceCaps(surface, caps, colorspaces);
+    g_overlay.wsi->surfaceCaps(surface, caps, colorspaces);
 
     // match the swapchain to the window size the compositor reports: on
     // Wayland a presented buffer smaller than the window implicitly resizes
     // the window every frame, which would tear the stream down. the stream
     // images are blit-scaled into the swapchain instead. 0x0 (no size report
     // yet) falls back to the stream size.
-    VkExtent2D extent = wsi->windowExtent();
+    VkExtent2D extent = g_overlay.wsi->windowExtent();
     if (extent.width == 0 || extent.height == 0)
         extent = VkExtent2D{ w, h };
     // only clamp to caps when the reported range is sane (min<=max, max>0);
@@ -288,7 +300,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
     ci.surface = surface;
     ci.minImageCount = minImages;
-    ci.imageFormat = wsi->swapchainFormat(surface);
+    ci.imageFormat = g_overlay.wsi->swapchainFormat(surface);
     ci.imageColorSpace = colorSpace;
     ci.imageExtent = extent;
     ci.imageArrayLayers = 1;
@@ -321,6 +333,22 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     if (vk.df().GetSwapchainImagesKHR(vk.dev(), swapchain, &imageCount, swapImages.data())
             != VK_SUCCESS)
         throw ls::vulkan_error("failed to enumerate swapchain images");
+    g_overlay.surface = surface;
+    g_overlay.swapchain = swapchain;
+    g_overlay.extent = extent;
+    g_overlay.imageFormat = ci.imageFormat;
+    g_overlay.swapImages = std::move(swapImages);
+    g_overlay.modeName = modeName;
+    };
+    if (g_overlay.wsi) {
+        dbg("reusing overlay WSI %ux%u (stream %ux%u)",
+            g_overlay.extent.width, g_overlay.extent.height, w, h);
+    } else {
+        dbg("defer overlay WSI until first FRAME (stream %ux%u)", w, h);
+    }
+    VkSwapchainKHR swapchain = g_overlay.swapchain;
+    auto& swapImages = g_overlay.swapImages;
+    VkExtent2D extent = g_overlay.extent;
 
     // --- shared size: destination count used by the two-thread split below ----
     // per-frame work objects (command buffer, acquire/signal/done semaphores,
@@ -329,40 +357,36 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     const size_t destCount = state.destinationImages.size();
 
     // --- early-release snapshot path -----------------------------------------
-    // The staging source is read by BOTH the gen (backend) and the real
-    // present. Releasing the slot only after the display-paced real present
-    // throttles the game's selectFreeSlot to the present cadence (the input
-    // lag). Instead, snapshot the source into a private per-slot image right
-    // after scheduleFrames (~2ms, gated on the capture sync fd), release the
-    // slot once that read is done, and have the real present blit the snapshot
-    // (private, never recaptured by the layer) instead of the live source.
     vk::Semaphore snapshotSem{vk, std::nullopt,
         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
 
-    // --- FPS HUD: the "<game>/<presented>" box in the top-right window corner.
-    //     created after the swapchain so its format and scale match the
-    //     display; torn down with the loop's other locals on return.
-    ls::hud::Hud hud{ vk, extent.height, ci.imageFormat };
-    hud.update("0/0");
+    std::unique_ptr<ls::hud::Hud> hud;
+    auto makeHud = [&] {
+        if (!hud && g_overlay.extent.height > 0)
+            hud = std::make_unique<ls::hud::Hud>(vk, g_overlay.extent.height,
+                static_cast<VkFormat>(g_overlay.imageFormat));
+    };
 
-    // RAII guard: tear down swapchain + surface + connection on EVERY exit path
-    // (normal return, stop, or throw) so no WSI handle leaks. Declared last so
-    // it is destroyed first, before the vk:: objects below.
     struct SwapchainGuard {
         const vk::Vulkan* vk;
-        VkSwapchainKHR swapchain;
-        ls::wsi::SurfaceBackend* wsi;
+        bool* drop;
         ~SwapchainGuard() {
-            dbg("guard: destroying swapchain");
-            if (swapchain != VK_NULL_HANDLE && vk != nullptr)
-                vk->df().DestroySwapchainKHR(vk->dev(), swapchain, VK_NULL_HANDLE);
-            dbg("guard: swapchain destroyed, destroying wsi");
-            if (wsi != nullptr)
-                wsi->destroy();
-            dbg("guard: wsi destroyed");
+            if (drop == nullptr || !*drop) {
+                dbg("guard: keeping overlay WSI");
+                return;
+            }
+            dbg("guard: dropping overlay WSI");
+            if (g_overlay.swapchain != VK_NULL_HANDLE && vk != nullptr)
+                vk->df().DestroySwapchainKHR(vk->dev(), g_overlay.swapchain, VK_NULL_HANDLE);
+            g_overlay.swapchain = VK_NULL_HANDLE;
+            g_overlay.swapImages.clear();
+            if (g_overlay.wsi)
+                g_overlay.wsi->destroy();
+            g_overlay.wsi.reset();
+            dbg("guard: overlay WSI dropped");
         }
     };
-    SwapchainGuard guard{ &vk, swapchain, wsi.get() };
+    SwapchainGuard guard{ &vk, &dropOverlay };
 
     // =========================================================================
     // Stage 2/3: split frame-PRODUCE (INPUT) from display-PRESENT (OUTPUT) onto
@@ -394,6 +418,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
     // --- shared cross-thread state -------------------------------------------
     std::atomic<bool> failed{ false };
+    std::atomic<bool> wantDropWsi{ false };
     std::exception_ptr inputError, outputError;
 
     // bounded SPSC inbox: INPUT pushes each fully-produced frame; OUTPUT pops
@@ -462,7 +487,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // WSI events must be pumped before blocking Vulkan calls (Wayland release /
     // configure events only reach RADV through display dispatch). output-only.
     auto processWsiEvents = [&](int timeoutMs = 0) {
-        wsi->processEvents(timeoutMs);
+        if (g_overlay.wsi)
+            g_overlay.wsi->processEvents(timeoutMs);
     };
 
     const VkExtent2D imgExtent{ w, h };
@@ -472,9 +498,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // TRANSFER_DST_OPTIMAL with in-flight write access, and is left in that same
     // layout so the caller's post barrier transitions it to PRESENT_SRC.
     auto drawHud = [&](vk::CommandBuffer& cb, VkImage dstImage) {
-        const VkImage hudImage = hud.image().handle();
+        if (!hud)
+            return;
+        const VkImage hudImage = hud->image().handle();
         const VkImageMemoryBarrier hudBarrier = makeBlitBarrier(hudImage,
-            hud.lastAccess(), VK_IMAGE_LAYOUT_GENERAL,
+            hud->lastAccess(), VK_IMAGE_LAYOUT_GENERAL,
             VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL);
         const VkImageMemoryBarrier dstBarrier = makeBlitBarrier(dstImage,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -483,7 +511,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         vk.df().CmdPipelineBarrier(cb.raw(),
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
             0, nullptr, 0, nullptr, 2, barriers);
-        const VkExtent2D b = hud.box();
+        const VkExtent2D b = hud->box();
         // top-right corner: ORIGIN is the inset from the right and top edges
         const VkOffset2D o{
             static_cast<int32_t>(extent.width) - static_cast<int32_t>(b.width)
@@ -511,7 +539,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         vk.df().CmdBlitImage(cb.raw(), hudImage, VK_IMAGE_LAYOUT_GENERAL,
             dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
             VK_FILTER_NEAREST);
-        hud.markRead();
+        hud->markRead();
     };
 
     // --- OUTPUT thread: the whole swapchain present path ----------------------
@@ -586,7 +614,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // hud.update submits on the queue; serialize against the input thread.
                 std::lock_guard<std::mutex> lk(submitMtx);
                 try {
-                    hud.update(std::to_string(gameFps) + "/" + std::to_string(presentedFps));
+                    if (hud)
+                        hud->update(std::to_string(gameFps) + "/" + std::to_string(presentedFps));
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk-app: hud update failed: " << e.what() << "\n";
                 }
@@ -690,12 +719,52 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (!pf)
                         pf = inbox.takeNewestWait(15);
                     if (pf) {
+                        wantDropWsi.store(false, std::memory_order_relaxed);
+                        // RE2 boot is 1920x1080. Exclusive overlay on that
+                        // stream is XIO on Xwayland :0 (isolated game dies
+                        // before 1440). Drain FRAMEs, no WSI, until 1440.
+                        const bool boot1080 = (w == 1920 && h == 1080);
+                        if (!boot1080) {
+                            ensureOverlayWsi();
+                            swapchain = g_overlay.swapchain;
+                            extent = g_overlay.extent;
+                            makeHud();
+                        }
                         cur.active = true;
                         cur.nextDest = 0;
                         cur.stagingIdx = pf->stagingIdx;
                         cur.doneFds = std::move(pf->doneFds);
                         cur.snapFd = pf->snapFd;  // -1 if no snapshot fd
+                    } else if (wantDropWsi.exchange(false, std::memory_order_relaxed)
+                            && g_overlay.wsi) {
+                        dbg("output: idle drop overlay WSI (keep IPC)");
+                        {
+                            std::lock_guard<std::mutex> lk(submitMtx);
+                            vk.df().DeviceWaitIdle(vk.dev());
+                        }
+                        if (g_overlay.swapchain != VK_NULL_HANDLE)
+                            vk.df().DestroySwapchainKHR(vk.dev(), g_overlay.swapchain,
+                                VK_NULL_HANDLE);
+                        g_overlay.swapchain = VK_NULL_HANDLE;
+                        g_overlay.swapImages.clear();
+                        g_overlay.wsi->destroy();
+                        g_overlay.wsi.reset();
+                        swapchain = VK_NULL_HANDLE;
                     }
+                }
+
+                // 1080 boot: no exclusive overlay. Consume the frame so
+                // Release already sent by input; do not Acquire/Present.
+                if (cur.active && swapchain == VK_NULL_HANDLE) {
+                    for (int d : cur.doneFds)
+                        if (d >= 0)
+                            ::close(d);
+                    if (cur.snapFd >= 0)
+                        ::close(cur.snapFd);
+                    cur.doneFds.clear();
+                    cur.snapFd = -1;
+                    cur.active = false;
+                    continue;
                 }
 
                 // exactly one present this vblank: GEN, REAL, or HOLD-LAST.
@@ -789,7 +858,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 maybeStats(Clock::now());
 
                 // stop on a window resize/close (processEvents returns true).
-                if (wsi->processEvents(0))
+                if (g_overlay.wsi && g_overlay.wsi->processEvents(0))
                     break;
             }
 
@@ -823,6 +892,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         vk::CommandBuffer emptyXferCb{ vk, vk.transferCmdPoolHandle() };
         vk::Fence emptyXferFence{ vk, true };
         uint64_t fidx{ 0 };
+        auto lastFrameAt = Clock::now();
+        const auto streamStart = lastFrameAt;
+        bool gotFrame{ false };
         try {
             for (;;) {
                 if (stop.load(std::memory_order_relaxed)
@@ -840,8 +912,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (stop.load(std::memory_order_relaxed)
                         || failed.load(std::memory_order_relaxed))
                     break;
-                if (pr == 0 || !(pfd.revents & POLLIN))
+                if (pr == 0 || !(pfd.revents & POLLIN)) {
+                    // Do NOT destroy overlay WSI while the game is alive —
+                    // tearing exclusive layer-shell is XIO on Xwayland :0
+                    // and the isolated game dies. Screen is released when
+                    // streams.empty() in main.cpp after the game exits.
                     continue;
+                }
+                lastFrameAt = Clock::now();
+                gotFrame = true;
                 auto msg = conn.receive(std::nullopt);
                 const auto* frame = std::get_if<ls::ipc::Frame>(&msg);
                 if (!frame)
@@ -1091,6 +1170,18 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::rethrow_exception(inputError);
     if (outputError)
         std::rethrow_exception(outputError);
+}
+
+void releaseOverlayWsi(const vk::Vulkan& vk) {
+    if (!g_overlay.wsi)
+        return;
+    dbg("release overlay WSI (no live stream)");
+    if (g_overlay.swapchain != VK_NULL_HANDLE)
+        vk.df().DestroySwapchainKHR(vk.dev(), g_overlay.swapchain, VK_NULL_HANDLE);
+    g_overlay.swapchain = VK_NULL_HANDLE;
+    g_overlay.swapImages.clear();
+    g_overlay.wsi->destroy();
+    g_overlay.wsi.reset();
 }
 
 } // namespace ls::presentation

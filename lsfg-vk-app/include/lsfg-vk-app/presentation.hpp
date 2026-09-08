@@ -43,4 +43,9 @@ namespace ls::presentation {
         const vk::Vulkan& vk, lsfgvk::backend::Instance& backend,
         const ls::GameConf& conf, std::string_view session,
         const std::atomic<bool>& stop);
+
+    /// Tear down exclusive overlay WSI if no stream is using it. Call from the
+    /// accept loop when streams.empty() so a dead game cannot leave layer-shell
+    /// covering the output (Alt+Tab steal).
+    void releaseOverlayWsi(const vk::Vulkan& vk);
 }

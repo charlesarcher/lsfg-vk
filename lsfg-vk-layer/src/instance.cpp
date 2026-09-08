@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <exception>
 #include <functional>
@@ -270,6 +271,11 @@ void Root::modifyDeviceCreateInfo(const vk::VulkanInstanceFuncs& funcs, VkPhysic
         createInfo.enabledExtensionCount,
         requiredExtensions
     );
+    extensions.erase(std::remove_if(extensions.begin(), extensions.end(),
+        [](const char* n) {
+            return std::strcmp(n, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0
+                || std::strcmp(n, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0;
+        }), extensions.end());
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();
 

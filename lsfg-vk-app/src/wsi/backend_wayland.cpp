@@ -579,7 +579,15 @@ public:
         // toplevels and is never focusable, so the game keeps keyboard focus
         // without any user action. The xdg_toplevel remains as the fallback
         // for compositors without layer-shell.
-        if (mGlobals.layerShell != nullptr) {
+        // Isolated overlay used layer-shell OVERLAY which KWin keeps above
+        // every toplevel. Alt+Tab / Steam-stop cannot get past it. Isolated
+        // game has no scanout, so the old xdg_toplevel flicker (two FS
+        // windows fighting) does not apply. Default: xdg_toplevel so the
+        // user can Alt+Tab. LSFGVK_LAYER_SHELL=1 restores the trap.
+        const bool useLayerShell = mGlobals.layerShell != nullptr
+            && std::getenv("LSFGVK_LAYER_SHELL") != nullptr
+            && std::getenv("LSFGVK_LAYER_SHELL")[0] == '1';
+        if (useLayerShell) {
             mLayerSurface = zwlr_layer_shell_v1_get_layer_surface(
                 mGlobals.layerShell, mSurface,
                 target->wlOutput,  // null (no xdg-output) = default output
@@ -655,7 +663,7 @@ public:
             } else {
                 dbg("fullscreen SKIPPED (LSFGVK_APP_NO_FS set)");
             }
-            dbg("window type: xdg_toplevel (no layer-shell global)");
+            dbg("window type: xdg_toplevel (Alt+Tab-able; layer-shell off)");
 
             // Commit initial surface state
             wl_surface_commit(mSurface);
