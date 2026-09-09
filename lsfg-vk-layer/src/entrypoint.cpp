@@ -8,6 +8,7 @@
 #include "swapchain.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstddef>
@@ -15,6 +16,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -64,7 +66,8 @@ namespace {
     // global layer info initialized at layer negotiation
     struct LayerInfo {
         std::unordered_map<std::string, PFN_vkVoidFunction> map; //!< function pointer override map
-        PFN_vkGetInstanceProcAddr GetInstanceProcAddr;
+        PFN_vkGetInstanceProcAddr GetInstanceProcAddr{};
+        PFN_GetPhysicalDeviceProcAddr GetPhysicalDeviceProcAddr{};
 
         Root root;
     }* layer_info; // NOLINT (global variable)
@@ -104,6 +107,7 @@ namespace {
         }
 
         layer_info->GetInstanceProcAddr = linkInfo->pfnNextGetInstanceProcAddr;
+        layer_info->GetPhysicalDeviceProcAddr = linkInfo->pfnNextGetPhysicalDeviceProcAddr;
         if (!layer_info->GetInstanceProcAddr) {
             std::cerr << "lsfg-vk: next layer's vkGetInstanceProcAddr is null, "
                 "the previous layer does not follow spec\n";
@@ -152,10 +156,19 @@ namespace {
     // thunk64 +0x2a2f5) does `mov (%rax)` on info->swapchain, treating
     // VkSwapchainKHR as a pointer to a wine object. Isolated handles are
     // 0x5af5xxxx integers, not wine objects → 0xc0000005 in the thunk
-    // BEFORE our stub runs. Hide the extensions so DXVK never calls it.
+    // BEFORE our stub runs. Hide timing EXTs.
+    // Isolated handles are 0x5af5xxxx, not wine objects. Wine's
+    // WaitForPresentKHR thunk never reaches our SUCCESS stub
+    // (0 calls when these were advertised; 1080 died after ~3
+    // presents). ICD CreateSwapchain was reverted. Hide wait/id
+    // so vkd3d cannot arm KHR_present_wait latency=3 on a fake handle.
     bool hideDeviceExt(const char* name) {
         return std::strcmp(name, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0
-            || std::strcmp(name, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0;
+            || std::strcmp(name, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0
+            || std::strcmp(name, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0
+            || std::strcmp(name, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) == 0
+            || std::strcmp(name, VK_KHR_PRESENT_WAIT_EXTENSION_NAME) == 0
+            || std::strcmp(name, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME) == 0;
     }
 
     VkResult myvkEnumerateDeviceExtensionProperties(
@@ -356,6 +369,17 @@ namespace {
         return layer_info->GetInstanceProcAddr(instance, name);
     }
 
+    PFN_vkVoidFunction myvkGetPhysicalDeviceProcAddr(VkInstance instance, const char* name) {
+        if (!name) return nullptr;
+        auto func = getProcAddr(name);
+        if (func) return func;
+        if (layer_info && layer_info->GetPhysicalDeviceProcAddr)
+            return layer_info->GetPhysicalDeviceProcAddr(instance, name);
+        if (layer_info && layer_info->GetInstanceProcAddr)
+            return layer_info->GetInstanceProcAddr(instance, name);
+        return nullptr;
+    }
+
     // get device-level function pointers
     PFN_vkVoidFunction myvkGetDeviceProcAddr(VkDevice device, const char* name) {
         if (!name) return nullptr;
@@ -369,6 +393,16 @@ namespace {
 }
 
 namespace {
+    struct PendingPresentWork {
+        const vk::Vulkan* vk{};
+        uint32_t height{};
+        std::vector<VkSemaphore> waits;
+        VkFence recycle{VK_NULL_HANDLE};
+        std::vector<VkFence> presentFences;
+    };
+    thread_local std::vector<PendingPresentWork> t_pendingPresentWork;
+    std::atomic<int> g_seen1440Submit2{0};
+
     VkResult myvkCreateSwapchainKHR(
             VkDevice device,
             const VkSwapchainCreateInfoKHR* info,
@@ -381,17 +415,22 @@ namespace {
         try {
             // retire old swapchain
             if (info->oldSwapchain) {
-                if (isIsolated(info->oldSwapchain))
-                    destroyIsolated(it->second, info->oldSwapchain);
-                const auto& info_mapping = instance_info->swapchainInfos.find(info->oldSwapchain);
-                if (info_mapping != instance_info->swapchainInfos.end())
-                    instance_info->swapchainInfos.erase(info_mapping);
+                // Isolated 1080→1440: vkd3d passes oldSwapchain. Destroying
+                // CaptureContext / isolated images here freezes after the
+                // first 1440 FRAME (game ntsync, overlay GEN=1). Keep the
+                // old isolated swapchain until vkDestroySwapchainKHR.
+                // ICD CreateSwapchain still sees oldSwapchain and retires WSI.
+                if (!isIsolated(info->oldSwapchain)) {
+                    const auto& info_mapping = instance_info->swapchainInfos.find(info->oldSwapchain);
+                    if (info_mapping != instance_info->swapchainInfos.end())
+                        instance_info->swapchainInfos.erase(info_mapping);
 
-                const auto& mapping = instance_info->swapchains.find(info->oldSwapchain);
-                if (mapping != instance_info->swapchains.end())
-                    instance_info->swapchains.erase(mapping);
+                    const auto& mapping = instance_info->swapchains.find(info->oldSwapchain);
+                    if (mapping != instance_info->swapchains.end())
+                        instance_info->swapchains.erase(mapping);
 
-                layer_info->root.removeSwapchainContext(info->oldSwapchain);
+                    layer_info->root.removeSwapchainContext(info->oldSwapchain);
+                }
             }
 
             layer_info->root.update(); // ensure config is up to date
@@ -514,8 +553,10 @@ namespace {
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
             std::fprintf(stderr,
-                "lsfg-vk-layer: [dbg] acquire timeout=%llu result=%d wait=%lld ms\n",
-                static_cast<unsigned long long>(timeout), res, static_cast<long long>(ms));
+                "lsfg-vk-layer: [dbg] acquire swapchain=%p timeout=%llu result=%d wait=%lld ms idx=%u\n",
+                (void*)swapchain,
+                static_cast<unsigned long long>(timeout), res, static_cast<long long>(ms),
+                pImageIndex ? *pImageIndex : 0u);
         }
         return res;
     }
@@ -586,13 +627,29 @@ namespace {
                             static_cast<unsigned>(info->pImageIndices[i]),
                             static_cast<long long>(ms));
                     }
+                    bool skipIpc = false;
                     try {
-                        result = layer_info->root.presentSwapchain(swapchain,
-                            it->second, queue,
-                            const_cast<void*>(info->pNext),
-                            info->pImageIndices[i],
-                            { waitSemaphores.begin(), waitSemaphores.end() }
-                        );
+                        if (isIsolated(swapchain)) {
+                            auto& iso = isolatedAt(swapchain);
+                            if (iso.extent.height >= 1440 && iso.presentCount < 16) {
+                                skipIpc = true;
+                                if (dbgPres)
+                                    std::fprintf(stderr,
+                                        "lsfg-vk-layer: [dbg] 1440 skip-IPC present %u\n",
+                                        iso.presentCount);
+                            }
+                            ++iso.presentCount;
+                        }
+                        if (skipIpc) {
+                            result = VK_SUCCESS;
+                        } else {
+                            result = layer_info->root.presentSwapchain(swapchain,
+                                it->second, queue,
+                                const_cast<void*>(info->pNext),
+                                info->pImageIndices[i],
+                                { waitSemaphores.begin(), waitSemaphores.end() }
+                            );
+                        }
                     } catch (const std::exception& e) {
                         // Overlay kicked the 1080 socket for a 1440 HELLO.
                         // Isolated has no scanout; still SUCCESS so DXVK
@@ -605,10 +662,28 @@ namespace {
                     if (isIsolated(swapchain) && result == VK_SUCCESS) {
                         auto& iso = isolatedAt(swapchain);
                         const uint32_t idx = info->pImageIndices[i];
-                        isolatedSignal(it->second.get(), iso.signalQueue, iso.signalQueue,
-                            VK_NULL_HANDLE, iso.recycleFences.at(idx).handle());
-                        // DXVK frame-latency latch: present fences in pNext must
-                        // signal or the game waits forever (fullscreen freeze).
+                        uint32_t fenceN = 0;
+                        if (dbgPres) {
+                            std::fprintf(stderr, "lsfg-vk-layer: [dbg] present pNext");
+                            for (const auto* n = static_cast<const VkBaseInStructure*>(info->pNext);
+                                    n != nullptr;
+                                    n = static_cast<const VkBaseInStructure*>(n->pNext))
+                                std::fprintf(stderr, " sType=%u", static_cast<unsigned>(n->sType));
+                            std::fprintf(stderr, "%s\n", info->pNext ? "" : " (null)");
+                        }
+                        PendingPresentWork work;
+                        work.vk = &it->second.get();
+                        work.height = iso.extent.height;
+                        if (iso.extent.height >= 1440) {
+                            // Nested QueueSubmit during QueuePresent races
+                            // vkd3d's QueueSubmit2. Defer dedicated work.
+                            if (skipIpc)
+                                work.waits = waitSemaphores;
+                            work.recycle = iso.recycleFences.at(idx).handle();
+                        } else {
+                            isolatedSignal(it->second.get(), iso.signalQueue, iso.signalQueue,
+                                VK_NULL_HANDLE, iso.recycleFences.at(idx).handle());
+                        }
                         for (const auto* n = static_cast<const VkBaseInStructure*>(info->pNext);
                                 n != nullptr;
                                 n = static_cast<const VkBaseInStructure*>(n->pNext)) {
@@ -616,11 +691,19 @@ namespace {
                                 continue;
                             const auto* fi = reinterpret_cast<const VkSwapchainPresentFenceInfoKHR*>(n);
                             for (uint32_t k = 0; k < fi->swapchainCount; ++k) {
-                                if (fi->pFences && fi->pFences[k] != VK_NULL_HANDLE)
-                                    isolatedSignal(it->second.get(), iso.signalQueue, queue,
-                                        VK_NULL_HANDLE, fi->pFences[k]);
+                                if (fi->pFences && fi->pFences[k] != VK_NULL_HANDLE) {
+                                    work.presentFences.push_back(fi->pFences[k]);
+                                    ++fenceN;
+                                }
                             }
                         }
+                        if (!work.presentFences.empty() || work.recycle != VK_NULL_HANDLE
+                                || !work.waits.empty()) {
+                            t_pendingPresentWork.push_back(std::move(work));
+                        }
+                        if (dbgPres)
+                            std::fprintf(stderr,
+                                "lsfg-vk-layer: [dbg] present fences signaled=%u\n", fenceN);
                     }
                     const auto d = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
@@ -648,7 +731,11 @@ namespace {
                 result = VK_ERROR_UNKNOWN;
             }
 
-            if (result != VK_SUCCESS && info->pResults)
+            // vkd3d QueuePresent always passes pResults. Leaving it
+            // uninitialized on SUCCESS made present_iteration treat
+            // garbage as OUT_OF_DATE/DEVICE_LOST and destroy the 1440
+            // swapchain after FRAME 0 — matches the intermittent hang.
+            if (info->pResults)
                 info->pResults[i] = result;
         }
 
@@ -656,11 +743,110 @@ namespace {
 #pragma clang diagnostic pop
     }
 
+    VkResult myvkQueueSubmit2(VkQueue queue, uint32_t submitCount,
+            const VkSubmitInfo2* pSubmits, VkFence fence) {
+        std::vector<PendingPresentWork> pending;
+        pending.swap(t_pendingPresentWork);
+        static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        bool is1440 = false;
+        for (const auto& p : pending)
+            if (p.height >= 1440)
+                is1440 = true;
+        if (dbg && is1440)
+            std::fprintf(stderr,
+                "lsfg-vk-layer: [dbg] Submit2 ENTER 1440 pending=%zu\n",
+                pending.size());
+        if (!pending.empty()) {
+            uint32_t fam = 0, qidx = 0;
+            const bool haveQ = getIsolatedSignalQueue(fam, qidx);
+            for (const auto& p : pending) {
+                if (!p.vk)
+                    continue;
+                VkQueue q = VK_NULL_HANDLE;
+                if (haveQ)
+                    p.vk->df().GetDeviceQueue(p.vk->dev(), fam, qidx, &q);
+                if (q == VK_NULL_HANDLE)
+                    q = p.vk->queue();
+                if (!p.waits.empty()) {
+                    std::vector<VkPipelineStageFlags> stages(
+                        p.waits.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                    const VkSubmitInfo si{
+                        .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                        .waitSemaphoreCount = static_cast<uint32_t>(p.waits.size()),
+                        .pWaitSemaphores = p.waits.data(),
+                        .pWaitDstStageMask = stages.data(),
+                    };
+                    (void)p.vk->df().QueueSubmit(q, 1, &si, VK_NULL_HANDLE);
+                }
+                try {
+                    if (p.recycle != VK_NULL_HANDLE)
+                        isolatedSignal(*p.vk, q, q, VK_NULL_HANDLE, p.recycle);
+                    for (VkFence f : p.presentFences)
+                        isolatedSignal(*p.vk, q, q, VK_NULL_HANDLE, f);
+                } catch (const std::exception&) {}
+            }
+            if (dbg && is1440)
+                std::fprintf(stderr, "lsfg-vk-layer: [dbg] Submit2 deferred-work done 1440\n");
+        }
+        if (!instance_info || instance_info->devices.empty())
+            return VK_ERROR_INITIALIZATION_FAILED;
+        const auto& devVk = instance_info->devices.begin()->second;
+        PFN_vkQueueSubmit2 next = devVk.df().QueueSubmit2;
+        if (!next || next == myvkQueueSubmit2) {
+            next = reinterpret_cast<PFN_vkQueueSubmit2>(
+                instance_info->funcs.GetDeviceProcAddr(
+                    instance_info->devices.begin()->first, "vkQueueSubmit2"));
+        }
+        if (!next || next == myvkQueueSubmit2)
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        if (dbg && is1440)
+            std::fprintf(stderr, "lsfg-vk-layer: [dbg] Submit2 ICD 1440\n");
+        const VkResult sr = next(queue, submitCount, pSubmits, fence);
+        if (dbg && is1440)
+            std::fprintf(stderr, "lsfg-vk-layer: [dbg] Submit2 EXIT 1440 result=%d\n",
+                static_cast<int>(sr));
+        if (is1440)
+            g_seen1440Submit2.store(1, std::memory_order_release);
+        return sr;
+    }
+
     VkResult myvkAcquireNextImage2KHR(VkDevice device,
             const VkAcquireNextImageInfoKHR* info, uint32_t* pImageIndex) {
         if (!info) return VK_ERROR_INITIALIZATION_FAILED;
         return myvkAcquireNextImageKHR(device, info->swapchain, info->timeout,
             info->semaphore, info->fence, pImageIndex);
+    }
+
+    // Isolated present signals VkSwapchainPresentFenceInfoKHR via ICD
+    // QueueSubmit. If DXVK then vkWaitForFences on that fence, this hook
+    // sees it. ENTER is logged before the wait: a UINT64_MAX hang has
+    // ENTER and no EXIT.
+    VkResult myvkWaitForFences(VkDevice device, uint32_t fenceCount,
+            const VkFence* pFences, VkBool32 waitAll, uint64_t timeout) {
+        const auto& it = instance_info->devices.find(device);
+        if (it == instance_info->devices.end())
+            return VK_ERROR_INITIALIZATION_FAILED;
+        static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        if (dbg)
+            std::fprintf(stderr,
+                "lsfg-vk-layer: [dbg] WaitForFences ENTER n=%u timeout=%llu fence0=%p\n",
+                fenceCount, static_cast<unsigned long long>(timeout),
+                (void*)(pFences && fenceCount ? pFences[0] : VK_NULL_HANDLE));
+        const auto t0 = std::chrono::steady_clock::now();
+        const VkResult res = it->second.df().WaitForFences(
+            device, fenceCount, pFences, waitAll, timeout);
+        if (dbg) {
+            const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            std::fprintf(stderr,
+                "lsfg-vk-layer: [dbg] WaitForFences n=%u waitAll=%u timeout=%llu "
+                "result=%d wait=%lld ms fence0=%p\n",
+                fenceCount, static_cast<unsigned>(waitAll),
+                static_cast<unsigned long long>(timeout), static_cast<int>(res),
+                static_cast<long long>(ms),
+                (void*)(pFences && fenceCount ? pFences[0] : VK_NULL_HANDLE));
+        }
+        return res;
     }
 
     VkResult myvkWaitForPresent2KHR(VkDevice, VkSwapchainKHR, const VkPresentWait2InfoKHR*) {
@@ -758,6 +944,9 @@ namespace {
     }
 
     VkResult myvkWaitForPresentKHR(VkDevice, VkSwapchainKHR, uint64_t, uint64_t) {
+        static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        if (dbg)
+            std::fprintf(stderr, "lsfg-vk-layer: [dbg] WaitForPresentKHR -> SUCCESS\n");
         return VK_SUCCESS; // isolated presents complete when QueuePresent returns
     }
 
@@ -773,6 +962,19 @@ namespace {
         if (it == instance_info->devices.end())
             return;
 
+        // vkd3d recreates inside present_callback: Destroy 1080 then
+        // Create 1440 then Present 1440 on the same thread. Tearing down
+        // isolated images / CaptureContext here is the 1080→1440 freeze.
+        // Tombstone: later Destroy is a no-op; leak until process exit.
+        if (isIsolated(swapchain) || isIsolatedTombstone(swapchain)) {
+            static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+            if (dbg)
+                std::fprintf(stderr,
+                    "lsfg-vk-layer: [dbg] isolated Destroy keep %p\n",
+                    (void*)swapchain);
+            return;
+        }
+
         const auto& info_mapping = instance_info->swapchainInfos.find(swapchain);
         if (info_mapping != instance_info->swapchainInfos.end())
             instance_info->swapchainInfos.erase(info_mapping);
@@ -782,14 +984,6 @@ namespace {
             instance_info->swapchains.erase(mapping);
 
         layer_info->root.removeSwapchainContext(swapchain);
-
-        if (isIsolated(swapchain) || isIsolatedTombstone(swapchain)) {
-            if (isIsolated(swapchain))
-                destroyIsolated(it->second, swapchain);
-            return;
-        }
-
-        // destroy swapchain
         it->second.df().DestroySwapchainKHR(device, swapchain, alloc);
     }
 }
@@ -806,7 +1000,7 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
     // if the layer has already been initialized, skip
     if (layer_info) {
         pVersionStruct->loaderLayerInterfaceVersion = 2;
-        pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
+        pVersionStruct->pfnGetPhysicalDeviceProcAddr = myvkGetPhysicalDeviceProcAddr;
         pVersionStruct->pfnGetDeviceProcAddr = myvkGetDeviceProcAddr;
         pVersionStruct->pfnGetInstanceProcAddr = myvkGetInstanceProcAddr;
         return VK_SUCCESS;
@@ -826,6 +1020,7 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkGetSwapchainImagesKHR", VKPTR(myvkGetSwapchainImagesKHR) },
                 { "vkAcquireNextImageKHR", VKPTR(myvkAcquireNextImageKHR) },
                 { "vkAcquireNextImage2KHR", VKPTR(myvkAcquireNextImage2KHR) },
+                { "vkWaitForFences", VKPTR(myvkWaitForFences) },
                 { "vkWaitForPresentKHR", VKPTR(myvkWaitForPresentKHR) },
                 { "vkWaitForPresent2KHR", VKPTR(myvkWaitForPresent2KHR) },
                 { "vkGetSwapchainStatusKHR", VKPTR(myvkGetSwapchainStatusKHR) },
@@ -846,6 +1041,8 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkSetLatencyMarkerNV", VKPTR(myvkSetLatencyMarkerNV) },
                 { "vkCreateSharedSwapchainsKHR", VKPTR(myvkCreateSharedSwapchainsKHR) },
                 { "vkQueuePresentKHR", VKPTR(myvkQueuePresentKHR) },
+                { "vkQueueSubmit2", VKPTR(myvkQueueSubmit2) },
+                { "vkQueueSubmit2KHR", VKPTR(myvkQueueSubmit2) },
                 { "vkDestroySwapchainKHR", VKPTR(myvkDestroySwapchainKHR) }
 #undef VKPTR
             },
@@ -867,7 +1064,7 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
 
     // emplace function pointers/version
     pVersionStruct->loaderLayerInterfaceVersion = 2;
-    pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
+    pVersionStruct->pfnGetPhysicalDeviceProcAddr = myvkGetPhysicalDeviceProcAddr;
     pVersionStruct->pfnGetDeviceProcAddr = myvkGetDeviceProcAddr;
     pVersionStruct->pfnGetInstanceProcAddr = myvkGetInstanceProcAddr;
     std::atexit(dryRunPrint);

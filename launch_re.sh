@@ -40,4 +40,7 @@ export VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation
 export MESA_VK_DEVICE_SELECT=1002:7550
 export LSFGVK_LAYER_DBG=1
 export PROTON_LOG=1
+# Fossilize SEGV in vkCreateGraphicsPipelines (0xc0000005) killed 1080 boot.
+export DISABLE_VK_LAYER_VALVE_steam_fossilize=1
+export DISABLE_VK_LAYER_VALVE_steam_overlay=1
 env -u LD_LIBRARY_PATH mangohud --dlsym "$@"

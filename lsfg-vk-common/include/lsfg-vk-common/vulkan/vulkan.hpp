@@ -88,6 +88,7 @@ namespace vk {
         PFN_vkCmdWriteTimestamp CmdWriteTimestamp;
         PFN_vkCmdResetQueryPool CmdResetQueryPool;
         PFN_vkQueueSubmit QueueSubmit;
+        PFN_vkQueueSubmit2 QueueSubmit2;
         PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
         PFN_vkFreeDescriptorSets FreeDescriptorSets;
         PFN_vkUpdateDescriptorSets UpdateDescriptorSets;

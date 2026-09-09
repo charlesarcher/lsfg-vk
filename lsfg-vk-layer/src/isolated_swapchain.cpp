@@ -57,10 +57,12 @@ IsolatedSwapchain& isolatedAt(VkSwapchainKHR handle) {
     return g_isolated.at(handle);
 }
 
-void destroyIsolated(const vk::Vulkan& /*vk*/, VkSwapchainKHR handle) {
+void destroyIsolated(const vk::Vulkan& vk, VkSwapchainKHR handle) {
     auto it = g_isolated.find(handle);
     if (it == g_isolated.end())
         return;
+    if (it->second.icdAcqSem != VK_NULL_HANDLE)
+        vk.df().DestroySemaphore(vk.dev(), it->second.icdAcqSem, nullptr);
     g_isolated.erase(it);
     g_tombstones.insert(handle);
 }
@@ -94,6 +96,11 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
     if (g_signalNoted)
         vk.df().GetDeviceQueue(vk.dev(), g_signalFamily, g_signalIndex, &q);
     iso.signalQueue = q;
+    const VkSemaphoreCreateInfo sci{
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+    };
+    if (vk.df().CreateSemaphore(vk.dev(), &sci, nullptr, &iso.icdAcqSem) != VK_SUCCESS)
+        iso.icdAcqSem = VK_NULL_HANDLE;
     const bool dedicated = q != VK_NULL_HANDLE && q != vk.queue();
     if (!dedicated)
         std::cerr << "lsfg-vk: isolated swapchain " << count << " images "

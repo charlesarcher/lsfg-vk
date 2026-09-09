@@ -26,8 +26,11 @@ struct IsolatedSwapchain {
     std::vector<vk::Fence> recycleFences; // SIGNALED at create; acquire waits
     uint32_t next{};
     VkQueue signalQueue{VK_NULL_HANDLE};  // dedicated; empty submits only
+    VkSemaphore icdAcqSem{VK_NULL_HANDLE}; // ICD acquire for wine-visible present
     VkFormat format{};
     VkExtent2D extent{};
+    uint32_t presentCount{};
+    bool ipcReady{false};
 };
 
 VkSwapchainKHR allocIsolatedHandle();

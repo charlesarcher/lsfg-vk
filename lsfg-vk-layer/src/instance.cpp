@@ -274,7 +274,11 @@ void Root::modifyDeviceCreateInfo(const vk::VulkanInstanceFuncs& funcs, VkPhysic
     extensions.erase(std::remove_if(extensions.begin(), extensions.end(),
         [](const char* n) {
             return std::strcmp(n, VK_EXT_PRESENT_TIMING_EXTENSION_NAME) == 0
-                || std::strcmp(n, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0;
+                || std::strcmp(n, VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME) == 0
+                || std::strcmp(n, VK_KHR_PRESENT_ID_EXTENSION_NAME) == 0
+                || std::strcmp(n, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) == 0
+                || std::strcmp(n, VK_KHR_PRESENT_WAIT_EXTENSION_NAME) == 0
+                || std::strcmp(n, VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME) == 0;
         }), extensions.end());
     createInfo.enabledExtensionCount = static_cast<uint32_t>(extensions.size());
     createInfo.ppEnabledExtensionNames = extensions.data();

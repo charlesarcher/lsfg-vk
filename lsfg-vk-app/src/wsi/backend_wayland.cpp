@@ -584,6 +584,8 @@ public:
         // game has no scanout, so the old xdg_toplevel flicker (two FS
         // windows fighting) does not apply. Default: xdg_toplevel so the
         // user can Alt+Tab. LSFGVK_LAYER_SHELL=1 restores the trap.
+        // RE2 1440 FRAME-0 ntsync stall reproduces on xdg, layer TOP, and
+        // OVERLAY — stacking is not sufficient.
         const bool useLayerShell = mGlobals.layerShell != nullptr
             && std::getenv("LSFGVK_LAYER_SHELL") != nullptr
             && std::getenv("LSFGVK_LAYER_SHELL")[0] == '1';
@@ -619,7 +621,7 @@ public:
                 mLayerSurface,
                 ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
             wl_surface_commit(mSurface);
-            dbg("window type: layer-shell overlay on %s (wl_output %p)",
+            dbg("window type: layer-shell OVERLAY on %s (wl_output %p)",
                 target->geom.name.c_str(), (void*)target->wlOutput);
         } else {
             // Fallback: xdg_toplevel (compositor without layer-shell)
@@ -827,8 +829,8 @@ public:
         if (mResizePending) {
             mResizePending = false;
             if (dbgEnabled())
-                std::fprintf(stderr, "lsfg-vk-app: [dbg] processEvents exit: resize\n");
-            return true;
+                std::fprintf(stderr, "lsfg-vk-app: [dbg] processEvents resize (ignored, keep presenting)\n");
+            return false;
         }
 
         // Check for close

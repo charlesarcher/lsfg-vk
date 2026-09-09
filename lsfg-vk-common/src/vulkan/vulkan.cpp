@@ -563,6 +563,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .CmdWriteTimestamp = dpa<PFN_vkCmdWriteTimestamp>(f, d, "vkCmdWriteTimestamp"),
         .CmdResetQueryPool = dpa<PFN_vkCmdResetQueryPool>(f, d, "vkCmdResetQueryPool"),
         .QueueSubmit = dpa<PFN_vkQueueSubmit>(f, d, "vkQueueSubmit"),
+        .QueueSubmit2 = dpa_optional<PFN_vkQueueSubmit2>(f, d, "vkQueueSubmit2"),
         .AllocateDescriptorSets = dpa<PFN_vkAllocateDescriptorSets>(f, d,
             "vkAllocateDescriptorSets"),
         .FreeDescriptorSets = dpa<PFN_vkFreeDescriptorSets>(f, d, "vkFreeDescriptorSets"),

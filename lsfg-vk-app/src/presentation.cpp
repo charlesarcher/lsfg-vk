@@ -339,10 +339,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     g_overlay.imageFormat = ci.imageFormat;
     g_overlay.swapImages = std::move(swapImages);
     g_overlay.modeName = modeName;
-    };
+    }; // ensureOverlayWsi
+    const bool noFs = std::getenv("LSFGVK_APP_NO_FS") != nullptr;
+    const bool boot1080 = (w == 1920 && h == 1080) && !noFs;
+    const bool noWsi = std::getenv("LSFGVK_NO_OVERLAY_WSI")
+        && std::getenv("LSFGVK_NO_OVERLAY_WSI")[0] == '1';
     if (g_overlay.wsi) {
         dbg("reusing overlay WSI %ux%u (stream %ux%u)",
             g_overlay.extent.width, g_overlay.extent.height, w, h);
+    } else if (boot1080 || noWsi) {
+        dbg("defer overlay WSI (boot1080=%d noWsi=%d stream %ux%u)",
+            boot1080 ? 1 : 0, noWsi ? 1 : 0, w, h);
     } else {
         dbg("defer overlay WSI until first FRAME (stream %ux%u)", w, h);
     }
@@ -721,10 +728,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (pf) {
                         wantDropWsi.store(false, std::memory_order_relaxed);
                         // RE2 boot is 1920x1080. Exclusive overlay on that
-                        // stream is XIO on Xwayland :0 (isolated game dies
-                        // before 1440). Drain FRAMEs, no WSI, until 1440.
-                        const bool boot1080 = (w == 1920 && h == 1080);
-                        if (!boot1080) {
+                        // stream is XIO on Xwayland :0. LSFGVK_APP_NO_FS: take
+                        // WSI on 1080 as a window so the game never creates
+                        // 1440 (FRAME-0 ntsync).
+                        const bool noFs = std::getenv("LSFGVK_APP_NO_FS") != nullptr;
+                        const bool boot1080 = (w == 1920 && h == 1080) && !noFs;
+                        if (!boot1080 && !noWsi) {
                             ensureOverlayWsi();
                             swapchain = g_overlay.swapchain;
                             extent = g_overlay.extent;
@@ -858,8 +867,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 maybeStats(Clock::now());
 
                 // stop on a window resize/close (processEvents returns true).
-                if (g_overlay.wsi && g_overlay.wsi->processEvents(0))
+                // Close ends the loop. Resize/configure must NOT — xdg_toplevel
+                // sends extra configures after the first present (activated).
+                // Treating that as fatal stops GEN/REAL after FRAME 0 and the
+                // game's next blocking FRAME send never returns.
+                // 1080 boot must not pump/present the 1440 overlay WSI.
+                // Concurrent runPresent shares g_overlay; two output threads
+                // on one swapchain is FRAME 0 then hang.
+                if (!boot1080 && g_overlay.wsi && g_overlay.wsi->processEvents(0)) {
+                    dbg("output: processEvents requested stop (close)");
                     break;
+                }
             }
 
             // drain frames left in the inbox / cur so no fd leaks at teardown.
@@ -984,6 +1002,27 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     std::memcpy(state.hostPtrs.at(sidx), state.shmMaps.at(sidx),
                         state.shmBytes);
                     dbg("input: posix-shm memcpy slot %u", sidx);
+                    if (false && w >= 2560 && state.hostPtrs.at(sidx)
+                            && (fidx == 80 || fidx == 250 || (fidx > 0 && fidx % 400 == 0))) {
+                        char path[128];
+                        std::snprintf(path, sizeof(path),
+                            "/tmp/lsfg-re2-ingame/dump-fidx%llu.ppm",
+                            (unsigned long long)fidx);
+                        if (FILE* out = std::fopen(path, "wb")) {
+                            std::fprintf(out, "P6\n%u %u\n255\n", w, h);
+                            const auto* px = static_cast<const uint8_t*>(state.hostPtrs.at(sidx));
+                            const size_t npx = static_cast<size_t>(w) * h;
+                            std::vector<uint8_t> rgb(npx * 3);
+                            for (size_t i = 0; i < npx; ++i) {
+                                rgb[i * 3 + 0] = px[i * 4 + 0];
+                                rgb[i * 3 + 1] = px[i * 4 + 1];
+                                rgb[i * 3 + 2] = px[i * 4 + 2];
+                            }
+                            std::fwrite(rgb.data(), 1, rgb.size(), out);
+                            std::fclose(out);
+                            dbg("dumped %s", path);
+                        }
+                    }
                 } else if (captureFd >= 0 && !state.aImports.at(sidx).has_value()) {
                     try {
                         const vk::ImageLayout aLayout{
