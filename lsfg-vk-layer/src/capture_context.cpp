@@ -19,6 +19,7 @@
 #include <cstring>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <iostream>
 #include <mutex>
 #include <queue>
@@ -306,8 +307,8 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 || (!this->fake && !(std::getenv("LSFGVK_NO_IMPORT")
                     && std::getenv("LSFGVK_NO_IMPORT")[0] == '1'));
             if (!importStaging) {
-                static const bool posixShm = !(std::getenv("LSFGVK_POSIX_SHM")
-                    && std::getenv("LSFGVK_POSIX_SHM")[0] == '0');
+                static const bool posixShm = std::getenv("LSFGVK_POSIX_SHM")
+                    && std::getenv("LSFGVK_POSIX_SHM")[0] == '1';
                 if (!posixShm) {
                     ::close(fd);
                     continue;
@@ -399,6 +400,8 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             const VkImageUsageFlags localUsage =
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                 | VK_IMAGE_USAGE_SAMPLED_BIT;
+            this->exchangeLayout.hostVisible = true;
+            this->dmaBufSent.fill(false);
             for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
                 this->localImages.emplace_back(vk, this->info.extent,
                     VK_FORMAT_R8G8B8A8_UNORM, localUsage,
@@ -411,14 +414,14 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 auto pr = vk.df().GetMemoryFdPropertiesKHR(vk.dev(),
                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
                     exp.fd, &fp);
-                std::cerr << "lsfg-vk: 9070 dma-buf slot " << i
+                std::cerr << "lsfg-vk: render dma-buf slot " << i
                     << " fd=" << exp.fd << " props=" << pr
                     << " types=0x" << std::hex << fp.memoryTypeBits << std::dec
                     << " pitch=" << exp.rowPitch
                     << " size=" << exp.allocationSize << "\n";
             }
             if (this->localCopyOnly)
-                std::cerr << "lsfg-vk: capture dst=9070-owned dma-buf\n";
+                std::cerr << "lsfg-vk: capture dst=render-owned dma-buf\n";
         }
         if (this->fake && this->hostImages.empty() && this->shmMaps.at(0)) {
             const VkDeviceSize hostSize = this->hostAllocSize
@@ -978,12 +981,28 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                     << " slot=" << slot << "\n";
             }
         } else if (this->fake && this->localCopyOnly
-                && slot < this->localExportFds.size()
-                && this->localExportFds.at(slot) >= 0) {
-            sendFd = ::dup(this->localExportFds.at(slot));
-            if (sendFd < 0)
-                sendFd = syncFd;
-            else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+                && slot < this->localImages.size()) {
+            if (!this->dmaBufSent.at(slot)) {
+                auto exp = this->localImages.at(slot).exportDmaBuf(vk);
+                sendFd = exp.fd;
+                if (sendFd < 0)
+                    sendFd = syncFd;
+                else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+                this->dmaBufSent.at(slot) = true;
+                {
+                    char link[80]{};
+                    (void)::readlink((std::string("/proc/self/fd/") + std::to_string(sendFd)).c_str(),
+                        link, sizeof(link) - 1);
+                    std::cerr << "lsfg-vk: FRAME carries render-dmabuf slot="
+                        << slot << " fd=" << sendFd << " link=" << link << "\n";
+                }
+            } else {
+                static bool loggedS = false;
+                if (!loggedS) {
+                    loggedS = true;
+                    std::cerr << "lsfg-vk: FRAME carries render-sync_fd\n";
+                }
+            }
         }
         this->ipcConn->attachFd(sendFd);
         this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot) });

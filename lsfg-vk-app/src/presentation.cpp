@@ -25,13 +25,19 @@
 #include "lsfg-vk-app/wsi/surface_backend.hpp"
 
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-app/swizzle_spv.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
+#include "lsfg-vk-common/vulkan/descriptor_pool.hpp"
+#include "lsfg-vk-common/vulkan/descriptor_set.hpp"
 #include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
+#include "lsfg-vk-common/vulkan/sampler.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
+#include "lsfg-vk-common/vulkan/shader.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -43,6 +49,7 @@
 #include <cstdlib>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -54,8 +61,15 @@
 #include <poll.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <dirent.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <cerrno>
+#include <time.h>
+#include <linux/dma-buf.h>
 #include <xf86drm.h>
+#include <drm/amdgpu_drm.h>
 #include <vulkan/vulkan_core.h>
 
 namespace ls::presentation {
@@ -91,15 +105,17 @@ void dbg(const char* fmt, ...) {
     /// build a single VkImageMemoryBarrier for a blit pass: a layout transition
     /// on a single-color image (mirrors the layer's barrierHelper).
     VkImageMemoryBarrier makeBlitBarrier(VkImage image, VkAccessFlags oldAccess,
-            VkImageLayout oldLayout, VkAccessFlags newAccess, VkImageLayout newLayout) {
+            VkImageLayout oldLayout, VkAccessFlags newAccess, VkImageLayout newLayout,
+            uint32_t srcQueueFamily = VK_QUEUE_FAMILY_IGNORED,
+            uint32_t dstQueueFamily = VK_QUEUE_FAMILY_IGNORED) {
         VkImageMemoryBarrier b{};
         b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
         b.srcAccessMask = oldAccess;
         b.dstAccessMask = newAccess;
         b.oldLayout = oldLayout;
         b.newLayout = newLayout;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.srcQueueFamilyIndex = srcQueueFamily;
+        b.dstQueueFamilyIndex = dstQueueFamily;
         b.image = image;
         b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         b.subresourceRange.baseMipLevel = 0;
@@ -109,15 +125,13 @@ void dbg(const char* fmt, ...) {
         return b;
     }
 
-    /// 9060 Vulkan rejects 9070 dma-bufs (GetMemoryFdPropertiesKHR
-    /// INVALID_EXTERNAL_HANDLE). Re-export through the 9060 DRM node so
-    /// Vulkan sees a local GEM handle.
-    int primeReexportOn9060(int foreignFd) {
+    int existingRenderFd();
+
+    /// Fallback if Vulkan import of the render GPU dma-buf fails.
+    int primeReexportOnOffload(int foreignFd) {
         static int drmFd = -2;
-        if (drmFd == -2) {
-            drmFd = ::open("/dev/dri/renderD130", O_RDWR | O_CLOEXEC);
-            dbg("prime open renderD130 fd=%d errno=%d", drmFd, drmFd < 0 ? errno : 0);
-        }
+        if (drmFd == -2)
+            drmFd = existingRenderFd();
         if (drmFd < 0 || foreignFd < 0)
             return -1;
         uint32_t handle = 0;
@@ -134,6 +148,95 @@ void dbg(const char* fmt, ...) {
         (void)drmCloseBufferHandle(drmFd, handle);
         dbg("prime reexport foreign=%d -> local=%d handle=%u", foreignFd, localFd, handle);
         return localFd;
+    }
+
+    int existingRenderFd() {
+        DIR* dir = ::opendir("/proc/self/fd");
+        if (!dir)
+            return -1;
+        int found = -1;
+        while (dirent* e = ::readdir(dir)) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
+            char link[128]{};
+            const ssize_t n = ::readlink(path, link, sizeof(link) - 1);
+            if (n > 0 && std::strstr(link, "renderD") != nullptr) {
+                found = std::atoi(e->d_name);
+                if (found > 2)
+                    break;
+            }
+        }
+        ::closedir(dir);
+        return found;
+    }
+
+    // Keep the offload import in GTT so each DMA does not re-place the buffer.
+    // Uses this process's existing render node (same GEM the Vulkan device imported).
+    void pinImportedGtt(int dmaFd) {
+        if (dmaFd < 0)
+            return;
+        const int drm = existingRenderFd();
+        if (drm < 0) {
+            dbg("pin gtt: no render node fd in this process");
+            return;
+        }
+        drm_prime_handle ph{};
+        ph.fd = dmaFd;
+        if (::ioctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
+            dbg("pin gtt: FD_TO_HANDLE errno=%d drm=%d", errno, drm);
+            return;
+        }
+        drm_amdgpu_gem_op op{};
+        op.handle = ph.handle;
+        op.op = AMDGPU_GEM_OP_SET_PLACEMENT;
+        op.value = AMDGPU_GEM_DOMAIN_GTT;
+        const int pr = ::ioctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
+        drm_amdgpu_gem_create_in info{};
+        drm_amdgpu_gem_op q{};
+        q.handle = ph.handle;
+        q.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
+        q.value = reinterpret_cast<uint64_t>(&info);
+        const int ir = ::ioctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &q);
+        dbg("pin gtt drm=%d handle=%u set=%d errno=%d get=%d domains=0x%llx flags=0x%llx explicit=%d",
+            drm, ph.handle, pr, pr != 0 ? errno : 0, ir,
+            static_cast<unsigned long long>(info.domains),
+            static_cast<unsigned long long>(info.domain_flags),
+            !!(info.domain_flags & AMDGPU_GEM_CREATE_EXPLICIT_SYNC));
+        // Do not GEM_CLOSE: this handle is RADV's.
+    }
+
+    void logDmaGemFlags(int dmaFd) {
+        static bool once{false};
+        if (once || dmaFd < 0)
+            return;
+        once = true;
+        const int drm = existingRenderFd();
+        if (drm < 0) {
+            dbg("gem flags: no render node fd in this process");
+            return;
+        }
+        drm_prime_handle ph{};
+        ph.fd = dmaFd;
+        if (::ioctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
+            dbg("gem flags: FD_TO_HANDLE errno=%d", errno);
+            ::close(drm);
+            return;
+        }
+        drm_amdgpu_gem_create_in info{};
+        drm_amdgpu_gem_op op{};
+        op.handle = ph.handle;
+        op.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
+        op.value = reinterpret_cast<uint64_t>(&info);
+        const int ir = ::ioctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
+        dbg("gem flags rc=%d domains=0x%llx flags=0x%llx explicit=%d uncached=%d coherent=%d uswc=%d",
+            ir,
+            static_cast<unsigned long long>(info.domains),
+            static_cast<unsigned long long>(info.domain_flags),
+            !!(info.domain_flags & AMDGPU_GEM_CREATE_EXPLICIT_SYNC),
+            !!(info.domain_flags & AMDGPU_GEM_CREATE_UNCACHED),
+            !!(info.domain_flags & AMDGPU_GEM_CREATE_COHERENT),
+            !!(info.domain_flags & AMDGPU_GEM_CREATE_CPU_GTT_USWC));
+        // Do not GEM_CLOSE or close(drm): this is the Vulkan device's fd.
     }
 
     /// import a sync fd into a binary semaphore as a temporary payload. on
@@ -158,6 +261,147 @@ void dbg(const char* fmt, ...) {
     /// LSFGVK_APP_VERBOSE when -v is passed, since runPresent carries no flag).
     bool verboseEnabled() {
         return std::getenv("LSFGVK_APP_VERBOSE") != nullptr;
+    }
+
+    bool ensureDmaIn(ls::ipc::StreamState& state, const vk::Vulkan& presentVk) {
+        if (state.dmaVk)
+            return true;
+        try {
+            const auto want = presentVk.deviceUUID();
+            auto select = [want](const vk::VulkanInstanceFuncs& fi,
+                    const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
+                for (auto pd : devs) {
+                    VkPhysicalDeviceIDProperties id{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
+                    };
+                    VkPhysicalDeviceProperties2 p{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                        .pNext = &id
+                    };
+                    fi.GetPhysicalDeviceProperties2(pd, &p);
+                    std::array<uint8_t, 16> uuid{};
+                    std::memcpy(uuid.data(), id.deviceUUID, 16);
+                    if (uuid == want)
+                        return pd;
+                }
+                throw ls::error("dma-in device: offload GPU not found");
+            };
+            ::setenv("DISABLE_VK_LAYER_LSFGVK_frame_generation", "1", 1);
+            state.dmaVk = std::make_unique<vk::Vulkan>(
+                "lsfg-dma-in", vk::version{2, 0, 0},
+                "lsfg-dma-in", vk::version{2, 0, 0},
+                select, false, std::nullopt, std::nullopt, true, true);
+            ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
+            auto& dvk = *state.dmaVk;
+            const VkCommandPool pool = dvk.hasTransferQueue()
+                ? dvk.transferCmdPoolHandle() : VK_NULL_HANDLE;
+            state.dmaCb.emplace(dvk, pool);
+            state.dmaFence.emplace(dvk, true);
+            dbg("dma-in device ready (no gfx)");
+            return true;
+        } catch (const std::exception& e) {
+            ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
+            dbg("dma-in device failed: %s", e.what());
+            state.dmaVk.reset();
+            return false;
+        }
+    }
+
+    /// 9070 share → offload VRAM on a device with no gfx. returns dma-buf of
+    /// that VRAM image for the present device to sample. -1 on failure.
+    int hopShareToOffload(ls::ipc::StreamState& state, uint32_t sidx, int shareFd) {
+        if (!state.dmaVk || shareFd < 0)
+            return -1;
+        {
+            dma_buf_export_sync_file exp{};
+            exp.flags = DMA_BUF_SYNC_WRITE;
+            exp.fd = -1;
+            const auto tSync0 = Clock::now();
+            if (::ioctl(shareFd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) == 0 && exp.fd >= 0) {
+                pollfd pfd{};
+                pfd.fd = exp.fd;
+                pfd.events = POLLIN;
+                const int pr = ::poll(&pfd, 1, 50);
+                static int nSync = 0;
+                if (nSync < 8) {
+                    dbg("dma-in dest-write-sync slot %u poll=%d wall %.3f ms",
+                        sidx, pr, elapsedUs(tSync0, Clock::now()) / 1000.0);
+                    ++nSync;
+                }
+                ::close(exp.fd);
+            }
+        }
+        auto& dvk = *state.dmaVk;
+        const VkExtent2D ext{ state.width, state.height };
+        const vk::ImageLayout shareLay{
+            .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
+                ? vk::ImageMode::Linear : vk::ImageMode::DrmModifier,
+            .drmModifier = state.negotiatedModifier,
+            .rowPitch = state.rowPitch,
+        };
+        for (auto& img : state.dmaSrc)
+            img.reset();
+        {
+            const int imp = ::dup(shareFd);
+            if (imp < 0)
+                return -1;
+            try {
+                state.dmaSrc.at(sidx).emplace(dvk, ext, state.captureFormat,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT, imp, std::nullopt, shareLay);
+            } catch (const std::exception& e) {
+                dbg("dma-in import share failed: %s", e.what());
+                return -1;
+            }
+        }
+        if (!state.dmaDst.at(sidx)) {
+            try {
+                const vk::ImageLayout vramLay{ .mode = vk::ImageMode::Linear };
+                state.dmaDst.at(sidx).emplace(dvk, ext, state.captureFormat,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    std::nullopt, std::nullopt, vramLay);
+                auto exp = state.dmaDst.at(sidx)->exportDmaBuf(dvk);
+                state.dmaDstFds.at(sidx) = exp.fd;
+            } catch (const std::exception& e) {
+                dbg("dma-in vram dest failed: %s", e.what());
+                return -1;
+            }
+        }
+        if (!state.dmaCb || !state.dmaFence)
+            return -1;
+        if (!state.dmaFence->wait(dvk, 0))
+            return -1;
+        state.dmaFence->reset(dvk);
+        auto& cb = *state.dmaCb;
+        const uint32_t dstQ = dvk.hasTransferQueue()
+            ? dvk.transferQueueFamilyIndex() : dvk.queueFamilyIndex();
+        cb.begin(dvk);
+        cb.copyImage(dvk,
+            {
+                makeBlitBarrier(state.dmaSrc.at(sidx)->handle(),
+                    VK_ACCESS_NONE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_QUEUE_FAMILY_EXTERNAL, dstQ),
+                makeBlitBarrier(state.dmaDst.at(sidx)->handle(),
+                    VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+            },
+            { state.dmaSrc.at(sidx)->handle(), state.dmaDst.at(sidx)->handle() },
+            ext,
+            {});
+        cb.end(dvk);
+        VkQueue q = dvk.hasTransferQueue() ? dvk.transferQueueHandle() : dvk.queue();
+        cb.submit(dvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
+            state.dmaFence->handle(), q);
+        const auto t0 = Clock::now();
+        (void)state.dmaFence->wait(dvk, 50ULL * 1000 * 1000);
+        static int nHop = 0;
+        if (nHop < 24) {
+            dbg("dma-in hop slot %u wall %.3f ms", sidx,
+                elapsedUs(t0, Clock::now()) / 1000.0);
+            ++nHop;
+        }
+        state.dmaSrc.at(sidx).reset();
+        return state.dmaDstFds.at(sidx);
     }
 
     // Process-lifetime overlay. Recreating exclusive layer-shell on every
@@ -366,6 +610,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // --- early-release snapshot path -----------------------------------------
     vk::Semaphore snapshotSem{vk, std::nullopt,
         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+    vk::Semaphore frameReadySem{vk, std::nullopt,
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT};
+    vk::Semaphore copyDone{ vk };
 
     std::unique_ptr<ls::hud::Hud> hud;
     auto makeHud = [&] {
@@ -904,12 +1151,37 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // --- INPUT thread: receive -> schedule -> snapshot -> release -> enqueue --
     auto inputLoop = [&] {
         vk::CommandBuffer cb{ vk, vk.transferCmdPoolHandle() };
+        vk::CommandBuffer gfxCb{ vk };
+        vk::CommandBuffer computeCb{ vk, vk.transferCmdPoolHandle() };
+        std::optional<vk::Shader> swizzleShader;
+        std::optional<vk::Sampler> swizzleSampler;
+        std::optional<vk::DescriptorPool> swizzlePool;
+        std::array<std::optional<vk::DescriptorSet>, ls::ipc::STAGING_RING_DEPTH> swizzleSets;
+        std::array<std::optional<vk::Image>, ls::ipc::STAGING_RING_DEPTH> swizzleMid;
         vk::Fence snapCbFence{ vk, true };
+        int pendingDmaRelease = -1;
         vk::CommandBuffer emptyGenCb{ vk };
         vk::Fence emptyGenFence{ vk, true };
         vk::CommandBuffer emptyXferCb{ vk, vk.transferCmdPoolHandle() };
         vk::Fence emptyXferFence{ vk, true };
+        VkQueryPool tsPool = VK_NULL_HANDLE;
+        float tsPeriod = 1.0f;
+        {
+            VkPhysicalDeviceProperties2 props{
+                .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            };
+            vk.fi().GetPhysicalDeviceProperties2(vk.physdev(), &props);
+            tsPeriod = props.properties.limits.timestampPeriod;
+            const VkQueryPoolCreateInfo qi{
+                .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                .queryCount = 2,
+            };
+            (void)vk.df().CreateQueryPool(vk.dev(), &qi, VK_NULL_HANDLE, &tsPool);
+        }
+        uint32_t tsLogged{ 0 };
         uint64_t fidx{ 0 };
+        uint64_t lastDumpFidx{ 0 };
         auto lastFrameAt = Clock::now();
         const auto streamStart = lastFrameAt;
         bool gotFrame{ false };
@@ -945,6 +1217,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     continue;
 
                 int captureFd = conn.takeReceivedFd();
+                static bool loggedCap = false;
+                if (!loggedCap && captureFd >= 0) {
+                    loggedCap = true;
+                    char link[64]{};
+                    (void)::readlink(("/proc/self/fd/" + std::to_string(captureFd)).c_str(),
+                        link, sizeof(link) - 1);
+                    dbg("input: FRAME fd=%d link=%s", captureFd, link);
+                }
                 static const bool dropGen = std::getenv("LSFGVK_DROP_GEN")
                     && std::getenv("LSFGVK_DROP_GEN")[0] == '1';
                 if (dropGen) {
@@ -956,9 +1236,54 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     continue;
                 }
 
-                conn.send(ls::ipc::Release{ frame->stagingIdx });
-                dbg("input: Release first (slot %u) (fidx %llu)",
-                    frame->stagingIdx, (unsigned long long)fidx);
+                // CPU copy: 9070 already finished into shm, so Release first is
+                // safe. dma-buf still points at the 9070 buffer — Release first
+                // lets the 9070 rewrite it while the 9060 copies (36 ms fight).
+                const bool dmaHop = (state.shmBytes == 0);
+                if (!dmaHop) {
+                    conn.send(ls::ipc::Release{ frame->stagingIdx });
+                    dbg("input: Release first (slot %u) (fidx %llu)",
+                        frame->stagingIdx, (unsigned long long)fidx);
+                }
+
+                const uint32_t sidxEarly = frame->stagingIdx;
+                if (dmaHop && sidxEarly < ls::ipc::STAGING_RING_DEPTH && captureFd >= 0) {
+                    char link[64]{};
+                    char path[64]{};
+                    std::snprintf(path, sizeof(path), "/proc/self/fd/%d", captureFd);
+                    const ssize_t nlink = ::readlink(path, link, sizeof(link) - 1);
+                    if (nlink > 0)
+                        link[nlink] = '\0';
+                    // Protocol: first fd for a slot is the share. Do not require
+                    // the word "dmabuf" in readlink (that miss skipped the hop).
+                    const bool needShare = state.dmaFds.at(sidxEarly) < 0;
+                    static uint32_t fdKindLogged{ 0 };
+                    if (fdKindLogged < 8) {
+                        ++fdKindLogged;
+                        dbg("input: FRAME fd slot %u link='%s' needShare=%d",
+                            sidxEarly, nlink > 0 ? link : "?", needShare);
+                    }
+                    const bool isShare = nlink > 0 && std::strstr(link, "dmabuf") != nullptr;
+                    if (needShare && isShare) {
+                        int keepFd = ::dup(captureFd);
+                        if (keepFd < 0)
+                            throw ls::error("dup() failed before render dma-buf keep");
+                        state.dmaFds.at(sidxEarly) = keepFd;
+                        if (sidxEarly < state.aImports.size())
+                            state.aImports.at(sidxEarly).reset();
+                        dbg("input: keep render dma-buf slot %u link='%s'",
+                            sidxEarly, nlink > 0 ? link : "?");
+                        ::close(captureFd);
+                        captureFd = -1;
+                    }
+                }
+                if (dmaHop && captureFd < 0) {
+                    conn.send(ls::ipc::Release{ frame->stagingIdx });
+                    dbg("input: dma-buf keep, hop on capture-done (slot %u)",
+                        frame->stagingIdx);
+                    ++fidx;
+                    continue;
+                }
 
                 static const bool skipSnap = (std::getenv("LSFGVK_SKIP_SNAP")
                     && std::getenv("LSFGVK_SKIP_SNAP")[0] == '1')
@@ -970,13 +1295,78 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (!skipSnap) {
                 if (!snapCbFence.wait(vk, 0)) {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
+                    // Overlay did not sample this write. Free it unless it is
+                    // the slot the in-flight 9060 copy is still reading.
+                    if (dmaHop
+                            && static_cast<int>(frame->stagingIdx) != pendingDmaRelease)
+                        conn.send(ls::ipc::Release{ frame->stagingIdx });
                     dbg("input: snapshot skip (cb busy) (fidx %llu)",
                         (unsigned long long)fidx);
                 } else {
                 snapCbFence.reset(vk);
+                if (dmaHop && pendingDmaRelease >= 0) {
+                    const uint32_t done = static_cast<uint32_t>(pendingDmaRelease);
+                    if (done < state.aImports.size() && state.aImports.at(done).has_value())
+                        state.aImports.at(done).reset();
+                    conn.send(ls::ipc::Release{ done });
+                    dbg("input: drop import then Release slot %u", done);
+                    pendingDmaRelease = -1;
+                }
                 const uint32_t sidx = frame->stagingIdx;
+                bool waitWriteDone = false;
                 if (sidx >= ls::ipc::STAGING_RING_DEPTH)
                     throw ls::error("FRAME stagingIdx out of range");
+                if (captureFd >= 0 && !state.shmBytes) {
+                    pollfd pfd{};
+                    pfd.fd = captureFd;
+                    pfd.events = POLLIN;
+                    const auto tPoll0 = Clock::now();
+                    const int pr = ::poll(&pfd, 1, 50);
+                    static uint32_t pollLogged{ 0 };
+                    if (pollLogged < 8) {
+                        ++pollLogged;
+                        dbg("input: poll write-complete %d revents=%d wall %.3f ms",
+                            pr, pfd.revents, elapsedUs(tPoll0, Clock::now()) / 1000.0);
+                    }
+                    importSyncFd(vk, frameReadySem.handle(), captureFd);
+                    captureFd = -1;
+                    waitWriteDone = true;
+                }
+                if (dmaHop && !state.aImports.at(sidx).has_value()) {
+                    static const bool noHop = std::getenv("LSFGVK_NO_HOP")
+                        && std::getenv("LSFGVK_NO_HOP")[0] == '1';
+                    int srcFd = noHop ? -1 : state.dmaFds.at(sidx);
+                    if (srcFd >= 0 && ensureDmaIn(state, vk)) {
+                        const int hopFd = hopShareToOffload(state, sidx, srcFd);
+                        if (hopFd >= 0)
+                            srcFd = hopFd;
+                    }
+                    if (srcFd >= 0) {
+                        try {
+                            const vk::ImageLayout aLayout{
+                                .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
+                                    ? vk::ImageMode::Linear : vk::ImageMode::DrmModifier,
+                                .drmModifier = state.negotiatedModifier,
+                                .rowPitch = state.rowPitch,
+                            };
+                            const std::vector<uint32_t> families{
+                                vk.transferQueueFamilyIndex()
+                            };
+                            int tryFd = ::dup(srcFd);
+                            if (tryFd < 0)
+                                throw ls::error("dup() failed before render dma-buf import");
+                            state.aImports.at(sidx).emplace(vk,
+                                VkExtent2D{ state.width, state.height },
+                                state.captureFormat, VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                tryFd, std::nullopt, aLayout,
+                                VK_SHARING_MODE_EXCLUSIVE, families);
+                            dbg("input: import render dma-buf slot %u (copy)", sidx);
+                        } catch (const std::exception& e) {
+                            dbg("input: render dma-buf import failed slot %u: %s",
+                                sidx, e.what());
+                        }
+                    }
+                }
                 if (state.shmBytes && sidx < state.shmMaps.size()
                         && state.shmMaps.at(sidx) && state.hostPtrs.at(sidx)) {
                     if (captureFd >= 0) {
@@ -1023,75 +1413,165 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             dbg("dumped %s", path);
                         }
                     }
-                } else if (captureFd >= 0 && !state.aImports.at(sidx).has_value()) {
-                    try {
-                        const vk::ImageLayout aLayout{
-                            .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
-                                ? vk::ImageMode::Linear : vk::ImageMode::DrmModifier,
-                            .drmModifier = state.negotiatedModifier,
-                            .rowPitch = state.rowPitch,
-                        };
-                        const std::vector<uint32_t> families{
-                            vk.queueFamilyIndex(), vk.transferQueueFamilyIndex()
-                        };
-                        const VkSharingMode share = vk.hasTransferQueue()
-                            ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
-                        const VkImageUsageFlags aUsage =
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                            | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                            | VK_IMAGE_USAGE_SAMPLED_BIT;
-                        auto importOne = [&](int fd) {
-                            state.aImports.at(sidx).emplace(vk,
-                                VkExtent2D{ state.width, state.height },
-                                state.sourceFormat, aUsage,
-                                fd, std::nullopt, aLayout, share, families);
-                        };
-                        int tryFd = ::dup(captureFd);
-                        if (tryFd < 0)
-                            throw ls::error("dup() failed before 9070 import");
-                        try {
-                            importOne(tryFd);
-                            tryFd = -1;
-                            ::close(captureFd); captureFd = -1;
-                            dbg("input: imported 9070 capture slot %u", sidx);
-                        } catch (const std::exception& e1) {
-                            dbg("input: direct import failed slot %u: %s",
-                                sidx, e1.what());
-                            const int localFd = primeReexportOn9060(captureFd);
-                            if (localFd < 0)
-                                throw;
-                            try {
-                                importOne(localFd);
-                                dbg("input: PRIME-imported 9070 capture slot %u", sidx);
-                            } catch (...) {
-                                ::close(localFd);
-                                throw;
-                            }
-                            if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
-                        }
-                    } catch (const std::exception& e) {
-                        dbg("input: 9070 dma-buf import failed slot %u: %s",
-                            sidx, e.what());
-                        if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
-                    }
                 } else if (captureFd >= 0) {
-                    ::close(captureFd);
+                    pollfd pfd{};
+                    pfd.fd = captureFd;
+                    pfd.events = POLLIN;
+                    const int pr = ::poll(&pfd, 1, 0);
+                    static uint32_t pollLogged{ 0 };
+                    if (pollLogged < 8) {
+                        ++pollLogged;
+                        dbg("input: poll frame-ready %d revents=%d", pr, pfd.revents);
+                    }
+                    if (sidx < state.dmaFds.size() && state.dmaFds.at(sidx) >= 0) {
+                        dma_buf_import_sync_file imp{};
+                        imp.flags = DMA_BUF_SYNC_WRITE;
+                        imp.fd = captureFd;
+                        if (::ioctl(state.dmaFds.at(sidx), DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &imp) != 0) {
+                            static int nImp = 0;
+                            if (nImp < 4) {
+                                dbg("input: IMPORT_SYNC_FILE WRITE errno=%d", errno);
+                                ++nImp;
+                            }
+                        } else {
+                            static bool impOk = false;
+                            if (!impOk) {
+                                dbg("input: IMPORT_SYNC_FILE WRITE ok slot %u", sidx);
+                                impOk = true;
+                            }
+                        }
+                    }
+                    importSyncFd(vk, frameReadySem.handle(), captureFd);
                     captureFd = -1;
+                    waitWriteDone = true;
                 }
                 auto& srcLazy = state.aImports.at(sidx).has_value()
                     ? state.aImports.at(sidx)
                     : state.sourceImages.at(sidx);
                 auto& snapLazy = state.genSources.at(sidx);
-                const VkImageLayout srcOld = state.shmBytes
-                    ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
-                const VkImageLayout srcNew = state.shmBytes
-                    ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                const bool fromA = state.aImports.at(sidx).has_value();
+                const bool swizzleBlit = fromA
+                    && state.captureFormat != state.sourceFormat
+                    && state.sourceImages.at(sidx).has_value();
+                const bool hostDma = sidx < state.dmaMaps.size()
+                    && state.dmaMaps.at(sidx) != nullptr;
+                const VkImageLayout srcOld = hostDma
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : (fromA
+                    ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                    : (state.shmBytes ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED));
+                const VkImageLayout srcNew = hostDma
+                    ? VK_IMAGE_LAYOUT_GENERAL
+                    : (fromA
+                    ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                    : (state.shmBytes ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));
+                const uint32_t srcQ = (fromA && !hostDma) ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+                const uint32_t dstQ = (fromA && !hostDma) ? vk.transferQueueFamilyIndex() : VK_QUEUE_FAMILY_IGNORED;
+                if (swizzleBlit) {
+                    static bool loggedBlit = false;
+                    if (!loggedBlit) {
+                        loggedBlit = true;
+                        dbg("input: dma-buf hop copy+compute %u -> RGBA",
+                            static_cast<unsigned>(state.captureFormat));
+                    }
+                    if (!swizzleMid.at(sidx)) {
+                        swizzleMid.at(sidx).emplace(vk, imgExtent, state.captureFormat,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+                    }
+                    auto& mid = *swizzleMid.at(sidx);
+                    if (!swizzleShader) {
+                        swizzleShader.emplace(vk, ls::swizzleSpv(), 1, 1, 0, 1);
+                        swizzleSampler.emplace(vk,
+                            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                            VK_COMPARE_OP_NEVER, false);
+                        swizzlePool.emplace(vk, vk::Limits{
+                            .sets = 8,
+                            .uniform_buffers = 1,
+                            .samplers = 8,
+                            .sampled_images = 8,
+                            .storage_images = 8,
+                        });
+                    }
+                    if (!swizzleSets.at(sidx)) {
+                        swizzleSets.at(sidx).emplace(vk, *swizzlePool, *swizzleShader,
+                            std::vector<ls::R<const vk::Image>>{ std::cref(mid) },
+                            std::vector<ls::R<const vk::Image>>{ std::cref(snapLazy.mut()) },
+                            std::vector<ls::R<const vk::Sampler>>{ std::cref(*swizzleSampler) },
+                            std::vector<ls::R<const vk::Buffer>>{});
+                    }
+                    cb.begin(vk);
+                    if (tsPool != VK_NULL_HANDLE) {
+                        cb.resetQueryPool(vk, tsPool, 0, 2);
+                        cb.writeTimestamp(vk, tsPool, 0);
+                    }
+                    cb.copyImage(vk,
+                        {
+                            makeBlitBarrier(srcLazy.mut().handle(),
+                                VK_ACCESS_NONE, srcOld,
+                                VK_ACCESS_TRANSFER_READ_BIT, srcNew,
+                                srcQ, dstQ),
+                            makeBlitBarrier(mid.handle(),
+                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                        },
+                        { srcLazy.mut().handle(), mid.handle() },
+                        imgExtent,
+                        {
+                            makeBlitBarrier(mid.handle(),
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                        });
+                    if (tsPool != VK_NULL_HANDLE)
+                        cb.writeTimestamp(vk, tsPool, 1);
+                    cb.end(vk);
+                    computeCb.begin(vk);
+                    computeCb.pipelineBarrier(vk,
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        {
+                            makeBlitBarrier(mid.handle(),
+                                VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                            makeBlitBarrier(snapLazy.mut().handle(),
+                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                        });
+                    const uint32_t gx = (w + 15u) / 16u;
+                    const uint32_t gy = (h + 15u) / 16u;
+                    computeCb.dispatch(vk, *swizzleShader, *swizzleSets.at(sidx),
+                        {}, gx, gy, 1);
+                    computeCb.pipelineBarrier(vk,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                        {
+                            makeBlitBarrier(snapLazy.mut().handle(),
+                                VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                        });
+                    computeCb.end(vk);
+                    {
+                        std::lock_guard<std::mutex> lk(submitMtx);
+                        cb.submit(vk,
+                            waitWriteDone
+                                ? std::vector<VkSemaphore>{ frameReadySem.handle() }
+                                : std::vector<VkSemaphore>{}, VK_NULL_HANDLE, 0,
+                            {}, copyDone.handle(), 0,
+                            snapCbFence.handle(),
+                            vk.dmaQueueHandle());
+                        computeCb.submit(vk,
+                            std::vector<VkSemaphore>{ copyDone.handle() }, VK_NULL_HANDLE, 0,
+                            {}, snapshotSem.handle(), 0,
+                            VK_NULL_HANDLE,
+                            vk.transferQueueHandle());
+                    }
+                } else {
                 cb.begin(vk);
                 cb.copyImage(vk,
                     {
                         makeBlitBarrier(srcLazy.mut().handle(),
                             VK_ACCESS_NONE, srcOld,
-                            VK_ACCESS_TRANSFER_READ_BIT, srcNew),
+                            VK_ACCESS_TRANSFER_READ_BIT, srcNew,
+                            srcQ, dstQ),
                         makeBlitBarrier(snapLazy.mut().handle(),
                             VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
                             VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
@@ -1108,18 +1588,109 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 {
                     std::lock_guard<std::mutex> lk(submitMtx);
                     cb.submit(vk,
-                        std::vector<VkSemaphore>{}, VK_NULL_HANDLE, 0,
+                        waitWriteDone
+                            ? std::vector<VkSemaphore>{ frameReadySem.handle() }
+                            : std::vector<VkSemaphore>{}, VK_NULL_HANDLE, 0,
                         {}, snapshotSem.handle(), 0,
                         snapCbFence.handle(),
-                        vk.transferQueueHandle());
+                        vk.dmaQueueHandle());
+                }
                 }
                 snapFd = snapshotSem.exportFd(vk);
-                dbg("input: snapshot submitted xferQ=%d (fidx %llu)",
+                dbg("input: snapshot submitted xferQ=%d sameAsGfx=%d (fidx %llu)",
                     vk.transferQueueHandle() != VK_NULL_HANDLE,
+                    vk.transferQueueHandle() == vk.queue() ? 1 : 0,
                     (unsigned long long)fidx);
+                if (dmaHop) {
+                    pendingDmaRelease = static_cast<int>(frame->stagingIdx);
+                    dbg("input: hold Release until copy-done slot %u",
+                        frame->stagingIdx);
+                    const auto tWait0 = Clock::now();
+                    (void)snapCbFence.wait(vk, 50ULL * 1000 * 1000);
+                    if (sidx < state.aImports.size() && state.aImports.at(sidx).has_value())
+                        state.aImports.at(sidx).reset();
+                    conn.send(ls::ipc::Release{ frame->stagingIdx });
+                    pendingDmaRelease = -1;
+                    if (tsLogged < 8) {
+                        dbg("input: drop import + Release after copy-done slot %u wall %.3f ms",
+                            frame->stagingIdx, elapsedUs(tWait0, Clock::now()) / 1000.0);
+                        ++tsLogged;
+                    }
+                }
+                if (fidx >= 80 && fidx - lastDumpFidx >= 400
+                        && state.genSources.at(sidx).has_value()
+                        && std::getenv("LSFGVK_DUMP_PPM")
+                        && std::getenv("LSFGVK_DUMP_PPM")[0] == '1') {
+                    lastDumpFidx = fidx;
+                    (void)snapCbFence.wait(vk, 50ULL * 1000 * 1000);
+                    const size_t npx = static_cast<size_t>(w) * h;
+                    const size_t nb = npx * 4;
+                    void* p = nullptr;
+                    if (::posix_memalign(&p, 4096, nb) == 0) {
+                        std::memset(p, 0, nb);
+                        try {
+                            vk::Image dumpImg(vk, imgExtent, VK_FORMAT_R8G8B8A8_UNORM,
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                p, nb);
+                            cb.begin(vk);
+                            cb.copyImage(vk,
+                                {
+                                    makeBlitBarrier(state.genSources.at(sidx).mut().handle(),
+                                        VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                        VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                                    makeBlitBarrier(dumpImg.handle(),
+                                        VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                                },
+                                { state.genSources.at(sidx).mut().handle(), dumpImg.handle() },
+                                imgExtent,
+                                {});
+                            cb.end(vk);
+                            snapCbFence.reset(vk);
+                            cb.submit(vk,
+                                std::vector<VkSemaphore>{}, VK_NULL_HANDLE, 0,
+                                {}, VK_NULL_HANDLE, 0,
+                                snapCbFence.handle(),
+                                vk.transferQueueHandle());
+                            (void)snapCbFence.wait(vk, 50ULL * 1000 * 1000);
+                            uint64_t rs = 0, gs = 0, bs = 0;
+                            auto* px = static_cast<const uint8_t*>(p);
+                            char named[128];
+                            std::snprintf(named, sizeof(named),
+                                "/tmp/lsfg-re2-ingame/dump-fidx%llu.ppm",
+                                (unsigned long long)fidx);
+                            if (FILE* out = std::fopen("/tmp/lsfg-capture.ppm", "wb")) {
+                                std::fprintf(out, "P6\n%u %u\n255\n", w, h);
+                                std::vector<uint8_t> rgb(npx * 3);
+                                for (size_t i = 0; i < npx; ++i) {
+                                    rgb[i * 3 + 0] = px[i * 4 + 0];
+                                    rgb[i * 3 + 1] = px[i * 4 + 1];
+                                    rgb[i * 3 + 2] = px[i * 4 + 2];
+                                    rs += px[i * 4 + 0];
+                                    gs += px[i * 4 + 1];
+                                    bs += px[i * 4 + 2];
+                                }
+                                std::fwrite(rgb.data(), 1, rgb.size(), out);
+                                std::fclose(out);
+                                if (FILE* out2 = std::fopen(named, "wb")) {
+                                    std::fprintf(out2, "P6\n%u %u\n255\n", w, h);
+                                    std::fwrite(rgb.data(), 1, rgb.size(), out2);
+                                    std::fclose(out2);
+                                }
+                            }
+                            std::cerr << "lsfg-vk-app: dump /tmp/lsfg-capture.ppm mean RGB "
+                                << (rs / npx) << " " << (gs / npx) << " " << (bs / npx) << "\n";
+                        } catch (const std::exception& e) {
+                            std::cerr << "lsfg-vk-app: dump fail " << e.what() << "\n";
+                        }
+                        ::free(p);
+                    }
+                }
                 }
                 } else {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
+                    if (dmaHop)
+                        conn.send(ls::ipc::Release{ frame->stagingIdx });
                 }
 
                 static const bool emptyGen = std::getenv("LSFGVK_EMPTY_GEN")
@@ -1187,6 +1758,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 inputError = std::current_exception();
             failed.store(true, std::memory_order_relaxed);
         }
+        if (tsPool != VK_NULL_HANDLE)
+            vk.df().DestroyQueryPool(vk.dev(), tsPool, VK_NULL_HANDLE);
     };
 
     // --- run both until stop/failure, then join and tear down cleanly --------

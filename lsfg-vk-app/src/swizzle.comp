@@ -1,0 +1,14 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(set = 0, binding = 16) uniform sampler samp;
+layout(set = 0, binding = 32) uniform texture2D srcTex;
+layout(set = 0, binding = 48, rgba8) uniform writeonly image2D dstImg;
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    const ivec2 sz = imageSize(dstImg);
+    if (p.x >= sz.x || p.y >= sz.y)
+        return;
+    const vec4 c = texture(sampler2D(srcTex, samp), (vec2(p) + vec2(0.5)) / vec2(sz));
+    imageStore(dstImg, p, c);
+}

@@ -6,11 +6,15 @@
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
+#include "lsfg-vk-common/vulkan/command_buffer.hpp"
+#include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <vector>
 
 namespace ls::ipc {
@@ -40,11 +44,21 @@ namespace ls::ipc {
         std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> genSources{};
         /// 9070-owned capture images imported on B for the snapshot only.
         std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> aImports{};
+        /// Offload DMA-in device (no gfx). 9070 share is imported here only.
+        std::unique_ptr<vk::Vulkan> dmaVk;
+        std::optional<vk::CommandBuffer> dmaCb;
+        std::optional<vk::Fence> dmaFence;
+        std::array<std::optional<vk::Image>, STAGING_RING_DEPTH> dmaSrc{};
+        std::array<std::optional<vk::Image>, STAGING_RING_DEPTH> dmaDst{};
+        std::array<int, STAGING_RING_DEPTH> dmaDstFds{};
         uint32_t rowPitch{0};
         /// POSIX memfd maps (not Vulkan). Layer memcpy capture here; we memcpy
         /// into hostPtrs (9060 malloc import) then GPU-copy to genSources.
         std::array<void*, STAGING_RING_DEPTH> shmMaps{};
         std::array<void*, STAGING_RING_DEPTH> hostPtrs{};
+        std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> hostImages{};
+        std::array<void*, STAGING_RING_DEPTH> dmaMaps{};
+        std::array<int, STAGING_RING_DEPTH> dmaFds{};
         std::array<uint32_t*, STAGING_RING_DEPTH> shmSeq{};
         std::array<uint32_t, STAGING_RING_DEPTH> shmSeen{};
         size_t shmBytes{0};
@@ -77,6 +91,8 @@ namespace ls::ipc {
         /// early-release path (the real present reads the snapshot, not the
         /// live source, so the slot can be released before the display present)
         VkFormat sourceFormat{VK_FORMAT_R8G8B8A8_UNORM};
+        /// game swapchain format (HELLO). 9070 dma-buf import must match this.
+        VkFormat captureFormat{VK_FORMAT_R8G8B8A8_UNORM};
         /// motion-flow factor handed to openContext (1/flow_scale)
         float flow{1.0F};
         /// performance-mode flag handed to openContext
@@ -84,7 +100,7 @@ namespace ls::ipc {
 
         // move-only: user-declared move ops keep std::map<int,StreamState>
         // emplace/erase by value working (copy stays implicitly deleted).
-        StreamState() = default;
+        StreamState() { dmaFds.fill(-1); dmaDstFds.fill(-1); }
         ~StreamState();
         StreamState(StreamState&&) = default;
         StreamState& operator=(StreamState&&) = default;

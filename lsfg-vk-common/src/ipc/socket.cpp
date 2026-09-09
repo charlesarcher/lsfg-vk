@@ -149,11 +149,6 @@ namespace ls::ipc {
                 mh.msg_controllen = ctrl.size();
 
                 const ssize_t n = recvmsg(fd, &mh, MSG_NOSIGNAL | MSG_CMSG_CLOEXEC);
-                // SESSION 13.21 debug: fd loss hunt (MSG_CTRUNC seen on FRAME)
-                if (n > 0)
-                    std::fprintf(stderr, "lsfg-ipc: [dbg] recvmsg n=%zd ctrl_size=%zu controllen=%zu flags=0x%x fds=%zu fd=%d\n",
-                        n, ctrl.size(), mh.msg_controllen, mh.msg_flags, fds.size(),
-                        fds.empty() ? -1 : fds.back());
                 if (n < 0) {
                     if (errno == EINTR) continue;
                     throw socket_error("recvmsg() on ipc socket", errno);
@@ -172,6 +167,20 @@ namespace ls::ipc {
                     int dupFd{-1};
                     std::memcpy(&dupFd, CMSG_DATA(cmsg), sizeof(int));
                     fds.push_back(dupFd);
+                    if (mh.msg_flags & MSG_CTRUNC)
+                        std::fprintf(stderr, "lsfg-ipc: MSG_CTRUNC fd=%d\n", dupFd);
+                    else {
+                        static int nlog = 0;
+                        if (nlog < 8) {
+                            char link[80]{};
+                            const ssize_t nl = ::readlink(
+                                (std::string("/proc/self/fd/") + std::to_string(dupFd)).c_str(),
+                                link, sizeof(link) - 1);
+                            std::fprintf(stderr, "lsfg-ipc: SCM_RIGHTS fd=%d link='%s'\n",
+                                dupFd, nl > 0 ? link : "?");
+                            ++nlog;
+                        }
+                    }
                 }
 
                 remaining = remaining.subspan(static_cast<size_t>(n));

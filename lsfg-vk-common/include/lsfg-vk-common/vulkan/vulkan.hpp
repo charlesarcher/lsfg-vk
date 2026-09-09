@@ -265,6 +265,13 @@ namespace vk {
         /// @return the queue handle, or VK_NULL_HANDLE if not created
         [[nodiscard]] VkQueue transferQueueHandle() const { return this->transferQueue; }
 
+        /// DMA-in uses the existing transfer queue. Do not request a second
+        /// queue in that family (that hung the offload GPU).
+        [[nodiscard]] VkQueue dmaQueueHandle() const {
+            return this->transferQueue != VK_NULL_HANDLE
+                ? this->transferQueue : this->computeQueue;
+        }
+
         /// get the transfer command pool
         /// @return the command pool handle, or VK_NULL_HANDLE if not created
         [[nodiscard]] VkCommandPool transferCmdPoolHandle() const {

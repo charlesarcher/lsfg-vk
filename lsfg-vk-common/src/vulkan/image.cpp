@@ -61,6 +61,7 @@ namespace {
     uint32_t exchangeTexelBlockSize(VkFormat format) {
         switch (format) {
             case VK_FORMAT_R8G8B8A8_UNORM: return 4;
+            case VK_FORMAT_B8G8R8A8_UNORM: return 4;
             case VK_FORMAT_R16G16B16A16_SFLOAT: return 8;
             default:
                 throw ls::vulkan_error("unsupported dma-buf exchange format");
@@ -208,10 +209,13 @@ namespace {
             }
             mti = findImportMemoryTypeIndex(vk, candidates);
         } else {
+            const bool wantHost = layout.hostVisible;
             mti = vk.findMemoryTypeIndex(
                 reqs.memoryTypeBits,
-                false
+                wantHost
             );
+            if (!mti.has_value() && wantHost)
+                mti = vk.findMemoryTypeIndex(reqs.memoryTypeBits, false);
         }
         if (!mti.has_value())
             throw ls::vulkan_error("no suitable memory type found for image");

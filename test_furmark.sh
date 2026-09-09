@@ -80,7 +80,7 @@ start_app() {
   # doubled FurMark run intercepts the overlay swapchain, opens a second
   # stream on the 9060, and kills IPC (timeline import -13 / FRAME EPIPE).
   env -u VK_LAYER_PATH -u VK_INSTANCE_LAYERS -u VK_LOADER_LAYERS_ENABLE \
-    -u MESA_VK_DEVICE_SELECT \
+    -u MESA_VK_DEVICE_SELECT -u LD_PRELOAD \
     LSFGVK_APP_DBG=1 LSFGVK_CONFIG="$HOME/.config/lsfg-vk/conf.toml" \
     LSFGVK_APP_SOCK="$SOCK" \
     LSFGVK_SKIP_SNAP="${LSFGVK_SKIP_SNAP:-}" \

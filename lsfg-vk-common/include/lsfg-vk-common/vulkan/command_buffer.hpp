@@ -75,6 +75,11 @@ namespace vk {
         void insertBarriers(const vk::Vulkan& vk,
             const std::vector<vk::Barrier>& barriers) const;
 
+        /// image barrier with explicit pipeline stages
+        void pipelineBarrier(const vk::Vulkan& vk,
+            VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+            const std::vector<vk::Barrier>& barriers) const;
+
         /// dispatch a compute shader
         /// @param vk the vulkan instance
         /// @param shader the compute shader

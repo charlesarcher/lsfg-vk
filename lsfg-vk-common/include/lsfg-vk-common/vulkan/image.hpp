@@ -37,6 +37,9 @@ namespace vk {
         /// which case the natural pitch (width * texel block size) is used
         /// and exportDmaBuf() reports it to importers verbatim
         uint32_t rowPitch{};
+        /// prefer HOST_VISIBLE GTT for the allocation (cross-device share
+        /// without P2P: importer sees type GTT, exporter writes system pages)
+        bool hostVisible{false};
     };
 
     /// dma-buf export descriptor of an image

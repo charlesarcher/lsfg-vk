@@ -215,6 +215,10 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     state.negotiatedModifier = neg.modifier;
     state.width = w; state.height = h; state.gameUuid = hello->gameUuid;
     state.sourceFormat = fmt;
+    state.captureFormat = static_cast<VkFormat>(hello->vkFormat);
+    if (state.captureFormat != VK_FORMAT_B8G8R8A8_UNORM
+            && state.captureFormat != VK_FORMAT_R8G8B8A8_UNORM)
+        state.captureFormat = VK_FORMAT_R8G8B8A8_UNORM;
     state.rowPitch = rowPitch;
     conn.send(ls::ipc::Negotiated{
         .modifier = neg.modifier,
@@ -229,7 +233,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         .rowPitch = rowPitch
     };
     const VkImageUsageFlags imgUsage =
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+        | VK_IMAGE_USAGE_SAMPLED_BIT;
 
     // 3. STAGING_RING_DEPTH STAGING messages: create the staging images LOCALLY
     //    on B at the negotiated layout, self-export each as dma-buf, and hand
@@ -288,8 +293,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         const uint64_t bytes = (static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull;
         static const bool posixShm =
             conf.presentation == ls::Presentation::External
-            && !(std::getenv("LSFGVK_POSIX_SHM")
-                && std::getenv("LSFGVK_POSIX_SHM")[0] == '0');
+            && std::getenv("LSFGVK_POSIX_SHM")
+            && std::getenv("LSFGVK_POSIX_SHM")[0] == '1';
         if (posixShm) {
         const uint64_t mapBytes = bytes + 4096ull;
         const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", MFD_CLOEXEC));
@@ -329,7 +334,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         dbg("posix-shm staging slot %zu size=%llu", i, (unsigned long long)bytes);
         continue;
         }
-        state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt, imgUsage,
+        state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },
+            state.captureFormat, imgUsage,
             std::nullopt /*importFd*/, std::nullopt /*exportFd*/, layout,
             sourceSharing, concurrentFamilies);
         auto exp = state.sourceImages.at(i).mut().exportDmaBuf(vk);

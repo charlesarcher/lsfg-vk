@@ -69,8 +69,16 @@ void CommandBuffer::begin(const vk::Vulkan& vk) const {
 
 void CommandBuffer::insertBarriers(const vk::Vulkan& vk,
         const std::vector<vk::Barrier>& barriers) const {
-    vk.df().CmdPipelineBarrier(*this->commandBuffer,
+    pipelineBarrier(vk,
         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+        barriers);
+}
+
+void CommandBuffer::pipelineBarrier(const vk::Vulkan& vk,
+        VkPipelineStageFlags srcStage, VkPipelineStageFlags dstStage,
+        const std::vector<vk::Barrier>& barriers) const {
+    vk.df().CmdPipelineBarrier(*this->commandBuffer,
+        srcStage, dstStage,
         0,
         0, VK_NULL_HANDLE,
         0, VK_NULL_HANDLE,

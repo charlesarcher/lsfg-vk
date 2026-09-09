@@ -103,6 +103,7 @@ namespace lsfgvk::layer {
         std::optional<vk::Fence> bEmptyFence;
         vk::ImageLayout exchangeLayout{};     // negotiated LINEAR/DRM layout for localImages
         std::array<int, ls::ipc::STAGING_RING_DEPTH> localExportFds{};
+        std::array<bool, ls::ipc::STAGING_RING_DEPTH> dmaBufSent{};
         bool localCopyOnly{false};
         std::vector<vk::Semaphore> captureSemaphores; // recreated per cycle in present(), behind the fence gate
         std::vector<vk::Semaphore> leakCaptureSems;   // LSFGVK_LEAK_SEM=1: never DestroySemaphore
