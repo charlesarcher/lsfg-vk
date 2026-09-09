@@ -312,25 +312,10 @@ void dbg(const char* fmt, ...) {
     int hopShareToOffload(ls::ipc::StreamState& state, uint32_t sidx, int shareFd) {
         if (!state.dmaVk || shareFd < 0)
             return -1;
-        {
-            dma_buf_export_sync_file exp{};
-            exp.flags = DMA_BUF_SYNC_WRITE;
-            exp.fd = -1;
-            const auto tSync0 = Clock::now();
-            if (::ioctl(shareFd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) == 0 && exp.fd >= 0) {
-                pollfd pfd{};
-                pfd.fd = exp.fd;
-                pfd.events = POLLIN;
-                const int pr = ::poll(&pfd, 1, 50);
-                static int nSync = 0;
-                if (nSync < 8) {
-                    dbg("dma-in dest-write-sync slot %u poll=%d wall %.3f ms",
-                        sidx, pr, elapsedUs(tSync0, Clock::now()) / 1000.0);
-                    ++nSync;
-                }
-                ::close(exp.fd);
-            }
-        }
+        logDmaGemFlags(shareFd);
+        // Capture-done fd was already polled by the caller. Do not also poll
+        // DMA_BUF_IOCTL_EXPORT_SYNC_FILE WRITE here: that wait is extra gfx
+        // fences on the share (~31 ms) and couples DMA-in to render-GPU gfx.
         auto& dvk = *state.dmaVk;
         const VkExtent2D ext{ state.width, state.height };
         const vk::ImageLayout shareLay{
