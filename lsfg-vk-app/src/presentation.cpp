@@ -182,7 +182,7 @@ void dbg(const char* fmt, ...) {
         }
         drm_prime_handle ph{};
         ph.fd = dmaFd;
-        if (::ioctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
+        if (::drmIoctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
             dbg("pin gtt: FD_TO_HANDLE errno=%d drm=%d", errno, drm);
             return;
         }
@@ -190,13 +190,13 @@ void dbg(const char* fmt, ...) {
         op.handle = ph.handle;
         op.op = AMDGPU_GEM_OP_SET_PLACEMENT;
         op.value = AMDGPU_GEM_DOMAIN_GTT;
-        const int pr = ::ioctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
+        const int pr = ::drmIoctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
         drm_amdgpu_gem_create_in info{};
         drm_amdgpu_gem_op q{};
         q.handle = ph.handle;
         q.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
         q.value = reinterpret_cast<uint64_t>(&info);
-        const int ir = ::ioctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &q);
+        const int ir = ::drmIoctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &q);
         dbg("pin gtt drm=%d handle=%u set=%d errno=%d get=%d domains=0x%llx flags=0x%llx explicit=%d",
             drm, ph.handle, pr, pr != 0 ? errno : 0, ir,
             static_cast<unsigned long long>(info.domains),
@@ -217,9 +217,8 @@ void dbg(const char* fmt, ...) {
         }
         drm_prime_handle ph{};
         ph.fd = dmaFd;
-        if (::ioctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
+        if (::drmIoctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
             dbg("gem flags: FD_TO_HANDLE errno=%d", errno);
-            ::close(drm);
             return;
         }
         drm_amdgpu_gem_create_in info{};
@@ -227,7 +226,7 @@ void dbg(const char* fmt, ...) {
         op.handle = ph.handle;
         op.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
         op.value = reinterpret_cast<uint64_t>(&info);
-        const int ir = ::ioctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
+        const int ir = ::drmIoctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
         dbg("gem flags rc=%d domains=0x%llx flags=0x%llx explicit=%d uncached=%d coherent=%d uswc=%d",
             ir,
             static_cast<unsigned long long>(info.domains),
