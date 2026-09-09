@@ -324,9 +324,7 @@ void dbg(const char* fmt, ...) {
             .drmModifier = state.negotiatedModifier,
             .rowPitch = state.rowPitch,
         };
-        for (auto& img : state.dmaSrc)
-            img.reset();
-        {
+        if (!state.dmaSrc.at(sidx)) {
             const int imp = ::dup(shareFd);
             if (imp < 0)
                 return -1;
@@ -385,7 +383,6 @@ void dbg(const char* fmt, ...) {
                 elapsedUs(t0, Clock::now()) / 1000.0);
             ++nHop;
         }
-        state.dmaSrc.at(sidx).reset();
         return state.dmaDstFds.at(sidx);
     }
 
@@ -1291,10 +1288,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 snapCbFence.reset(vk);
                 if (dmaHop && pendingDmaRelease >= 0) {
                     const uint32_t done = static_cast<uint32_t>(pendingDmaRelease);
-                    if (done < state.aImports.size() && state.aImports.at(done).has_value())
-                        state.aImports.at(done).reset();
                     conn.send(ls::ipc::Release{ done });
-                    dbg("input: drop import then Release slot %u", done);
+                    dbg("input: Release slot %u", done);
                     pendingDmaRelease = -1;
                 }
                 const uint32_t sidx = frame->stagingIdx;
@@ -1317,16 +1312,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     captureFd = -1;
                     waitWriteDone = true;
                 }
-                if (dmaHop && !state.aImports.at(sidx).has_value()) {
+                if (dmaHop) {
+                    int srcFd = state.dmaFds.at(sidx);
                     static const bool noHop = std::getenv("LSFGVK_NO_HOP")
                         && std::getenv("LSFGVK_NO_HOP")[0] == '1';
-                    int srcFd = noHop ? -1 : state.dmaFds.at(sidx);
-                    if (srcFd >= 0 && ensureDmaIn(state, vk)) {
+                    if (srcFd >= 0 && !noHop && ensureDmaIn(state, vk)) {
                         const int hopFd = hopShareToOffload(state, sidx, srcFd);
                         if (hopFd >= 0)
                             srcFd = hopFd;
                     }
-                    if (srcFd >= 0) {
+                    if (srcFd >= 0 && !state.aImports.at(sidx).has_value()) {
                         try {
                             const vk::ImageLayout aLayout{
                                 .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
@@ -1592,12 +1587,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         frame->stagingIdx);
                     const auto tWait0 = Clock::now();
                     (void)snapCbFence.wait(vk, 50ULL * 1000 * 1000);
-                    if (sidx < state.aImports.size() && state.aImports.at(sidx).has_value())
-                        state.aImports.at(sidx).reset();
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
                     pendingDmaRelease = -1;
                     if (tsLogged < 8) {
-                        dbg("input: drop import + Release after copy-done slot %u wall %.3f ms",
+                        dbg("input: Release after copy-done slot %u wall %.3f ms",
                             frame->stagingIdx, elapsedUs(tWait0, Clock::now()) / 1000.0);
                         ++tsLogged;
                     }
