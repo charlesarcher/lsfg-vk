@@ -37,7 +37,7 @@ namespace ls::ipc {
     /// MUST be identical on both processes (layer and app) — they exchange
     /// staging fds and Release acks indexed by slot < this value. Product ring
     /// is 2: skip this frame if both slots are busy, never wait, never overwrite.
-    inline constexpr size_t STAGING_RING_DEPTH = 8;
+    inline constexpr size_t STAGING_RING_DEPTH = 4;
 
     /// message types on the wire (the u8 following the magic)
     enum class MsgType : uint8_t {
