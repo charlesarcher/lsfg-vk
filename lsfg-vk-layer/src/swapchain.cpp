@@ -135,7 +135,9 @@ void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint3
             if (maxImages && createInfo.minImageCount > maxImages)
                 createInfo.minImageCount = maxImages;
 
-            createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+            if (std::getenv("LSFGVK_FIFO")) {
+                createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+            }
             break;
     }
 }
@@ -397,7 +399,7 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
     }
 
     // update present mode when not using pacing
-    if (this->profile.pacing == ls::Pacing::None) {
+    if (this->profile.pacing == ls::Pacing::None && std::getenv("LSFGVK_FIFO")) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-warning-option"
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
