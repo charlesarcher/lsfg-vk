@@ -35,8 +35,6 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <linux/memfd.h>
-#include <libdrm/amdgpu.h>
-#include <libdrm/amdgpu_drm.h>
 
 using namespace ls::ipc;
 
@@ -69,37 +67,6 @@ namespace {
         const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - g_dbgT0).count();
         std::fprintf(stderr, "lsfg-vk-app: [dbg] %s (t+%lld ms)\n", buf, ms);
-    }
-
-    int allocExplicitDmaBuf(uint64_t size) {
-        static amdgpu_device_handle adev = nullptr;
-        if (!adev) {
-            const int dfd = ::open("/dev/dri/renderD130", O_RDWR | O_CLOEXEC);
-            if (dfd < 0)
-                throw ls::error("open renderD130 for explicit-sync BO failed");
-            uint32_t maj = 0, min = 0;
-            if (amdgpu_device_initialize(dfd, &maj, &min, &adev) != 0)
-                throw ls::error("amdgpu_device_initialize failed");
-        }
-        amdgpu_bo_alloc_request req{};
-        req.alloc_size = size;
-        req.phys_alignment = 256;
-        req.preferred_heap = AMDGPU_GEM_DOMAIN_VRAM;
-        req.flags = AMDGPU_GEM_CREATE_EXPLICIT_SYNC
-            | AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
-        amdgpu_bo_handle bo{};
-        int r = amdgpu_bo_alloc(adev, &req, &bo);
-        if (r != 0) {
-            req.preferred_heap = AMDGPU_GEM_DOMAIN_GTT;
-            r = amdgpu_bo_alloc(adev, &req, &bo);
-        }
-        if (r != 0)
-            throw ls::error("amdgpu_bo_alloc EXPLICIT_SYNC failed");
-        uint32_t rawFd = 0;
-        r = amdgpu_bo_export(bo, amdgpu_bo_handle_type_dma_buf_fd, &rawFd);
-        if (r != 0)
-            throw ls::error("amdgpu_bo_export dma-buf failed");
-        return static_cast<int>(rawFd);
     }
 
     /// bound the blocking recv() so a SIGINT (EINTR) or a silent peer can never
@@ -312,7 +279,7 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         if (::posix_memalign(&host, 4096, static_cast<size_t>(bytes)) != 0) {
             ::munmap(map, static_cast<size_t>(mapBytes));
             ::close(memfd);
-            throw ls::error("posix_memalign 9060 staging failed");
+            throw ls::error("posix_memalign staging failed");
         }
         ::memset(host, 0, static_cast<size_t>(bytes));
         state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt,

@@ -11,6 +11,10 @@
 #include <iostream>
 #include <thread>
 #include <chrono>
+#include <climits>
+#include <unistd.h>
+#include <dlfcn.h>
+#include <vulkan/vulkan.h>
 
 namespace lsfgvk::gui {
 
@@ -28,19 +32,29 @@ namespace lsfgvk::gui {
         }
     }
 
+    static std::string getSelfExePath() {
+        char buf[PATH_MAX]{};
+        const ssize_t len = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (len > 0) {
+            buf[len] = '\0';
+            return std::string(buf);
+        }
+        return "lsfg-vk-app";
+    }
+
     void startServerWorker(const std::string& profileName, const std::string& sessionMode) {
         stopServerWorker();
         g_serverStop.store(false);
         g_guiState.serviceRunning.store(true);
-        g_serverThread = std::thread([profileName, sessionMode]() {
+        const std::string exe = getSelfExePath();
+        g_serverThread = std::thread([exe, profileName, sessionMode]() {
             try {
                 // Run headless server instance in background thread
-                std::string cmd = "/home/archerc/code/lsfg-vk/build/lsfg-vk-app/lsfg-vk-app -p \"" + profileName + "\"";
+                std::string cmd = "\"" + exe + "\" --profile \"" + profileName + "\"";
                 if (!sessionMode.empty() && sessionMode != "auto") {
-                    cmd += " -s " + sessionMode;
+                    cmd += " --session " + sessionMode;
                 }
                 std::cerr << "lsfg-vk-gui: starting server: " << cmd << "\n";
-                // When g_serverStop fires or process exits, update flag
                 FILE* pipe = popen(cmd.c_str(), "r");
                 if (pipe) {
                     char buf[256];
@@ -118,13 +132,69 @@ namespace lsfgvk::gui {
             }
         } catch (...) {}
 
-        // Known home-lab devices on kennykiller
+        // Discover available Vulkan devices dynamically
         std::lock_guard<std::mutex> lk(g_guiState.mtx);
-        g_guiState.availableGpus = {
-            {"AMD Radeon RX 9060 XT (RADV GFX1200)", "0000:08:00.0 (renderD130)"},
-            {"Intel(R) Graphics (ARL)", "0000:00:02.0 (renderD128)"},
-            {"AMD Radeon RX 9070 XT (RADV GFX1201)", "0000:04:00.0 (renderD129)"},
-        };
+        g_guiState.availableGpus.clear();
+
+        void* lib = ::dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (!lib) lib = ::dlopen("libvulkan.so", RTLD_NOW | RTLD_LOCAL);
+        if (lib) {
+            auto vkGetInstanceProcAddr = reinterpret_cast<PFN_vkGetInstanceProcAddr>(::dlsym(lib, "vkGetInstanceProcAddr"));
+            if (vkGetInstanceProcAddr) {
+                auto vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance"));
+                if (vkCreateInstance) {
+                    VkApplicationInfo appInfo{
+                        .sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+                        .pApplicationName = "lsfg-vk-gui-probe",
+                        .applicationVersion = VK_MAKE_VERSION(1, 0, 0),
+                        .apiVersion = VK_API_VERSION_1_2,
+                    };
+                    VkInstanceCreateInfo createInfo{
+                        .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+                        .pApplicationInfo = &appInfo,
+                    };
+                    VkInstance instance = VK_NULL_HANDLE;
+                    if (vkCreateInstance(&createInfo, nullptr, &instance) == VK_SUCCESS && instance) {
+                        auto vkEnumeratePhysicalDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+                            vkGetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices"));
+                        auto vkGetPhysicalDeviceProperties2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                            vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2"));
+                        auto vkDestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(
+                            vkGetInstanceProcAddr(instance, "vkDestroyInstance"));
+
+                        if (vkEnumeratePhysicalDevices && vkGetPhysicalDeviceProperties2) {
+                            uint32_t count = 0;
+                            vkEnumeratePhysicalDevices(instance, &count, nullptr);
+                            if (count > 0) {
+                                std::vector<VkPhysicalDevice> devs(count);
+                                vkEnumeratePhysicalDevices(instance, &count, devs.data());
+                                for (auto dev : devs) {
+                                    VkPhysicalDeviceProperties2 props{
+                                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                    };
+                                    vkGetPhysicalDeviceProperties2(dev, &props);
+                                    char idBuf[64];
+                                    std::snprintf(idBuf, sizeof(idBuf), "0x%04x:0x%04x (dev %u)",
+                                        props.properties.vendorID, props.properties.deviceID, props.properties.deviceID);
+                                    g_guiState.availableGpus.push_back({
+                                        std::string(props.properties.deviceName),
+                                        std::string(idBuf),
+                                    });
+                                }
+                            }
+                        }
+                        if (vkDestroyInstance) {
+                            vkDestroyInstance(instance, nullptr);
+                        }
+                    }
+                }
+            }
+            ::dlclose(lib);
+        }
+
+        if (g_guiState.availableGpus.empty()) {
+            g_guiState.availableGpus.push_back({"Default / Auto-detect", "auto"});
+        }
     }
 
     int runGui(int argc, char** argv) {

@@ -475,7 +475,7 @@ void dbg(const char* fmt, ...) {
         }
     }
 
-    /// 9070 share → offload VRAM on a device with no gfx. returns dma-buf of
+    /// primary render GPU share → offload VRAM on a device with no gfx. returns dma-buf of
     /// that VRAM image for the present device to sample. -1 on failure.
     int hopShareToOffload(ls::ipc::StreamState& state, uint32_t sidx, int shareFd) {
         if (!state.dmaVk || shareFd < 0)
@@ -704,8 +704,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     }
 
     // Overlay present must not be FIFO-paced at compositor-throttled ~20 Hz.
-    // MAILBOX (else IMMEDIATE) matches Windows LS: the 9060 presents as fast
-    // as GEN+REAL are ready, toward 240 Hz. FIFO stays the fallback.
+    // MAILBOX (else IMMEDIATE) matches Windows LS: the secondary GPU presents as fast
+    // as GEN+REAL are ready, toward high refresh rates. FIFO stays the fallback.
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
     const char* modeName = "MAILBOX";
     PFN_vkGetPhysicalDeviceSurfacePresentModesKHR getModes =
@@ -1390,11 +1390,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     dbg("output: REAL present (slot %u)", cur.stagingIdx);
                 } else if (lastShownStagingIdx >= 0) {
                     // --- HOLD-LAST: nothing newer to show ---------------------
-                    // Session 13.13: the last REAL present is still on screen;
-                    // re-blitting at 240 Hz burns the 9060 XT. Session 13.21:
-                    // do NOT consume anything here - the loop top's blocking
-                    // take fills cur the instant a frame arrives. Just pump
-                    // WSI events non-blockingly and continue.
+                    // The last REAL present is still on screen; re-blitting
+                    // repeatedly burns GPU compute unnecessarily. Do NOT consume
+                    // anything here - the loop top's blocking take fills cur the
+                    // instant a frame arrives. Just pump WSI events non-blockingly and continue.
                 } else {
                     // first frame not shown yet: loop top's takeNewestWait
                     // blocks for it; nothing to do here.
@@ -1530,9 +1529,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     continue;
                 }
 
-                // CPU copy / dual-host: 9070 already finished, so Release first is
-                // safe. dma-buf still points at the 9070 buffer — Release first
-                // lets the 9070 rewrite it while the 9060 copies (36 ms fight).
+                // CPU copy / dual-host: render GPU already finished, so Release first is
+                // safe. dma-buf still points at the render GPU buffer — Release first
+                // lets the render GPU rewrite it while the secondary GPU copies.
                 const bool dmaHop = (state.shmBytes == 0 && std::getenv("LSFGVK_DUAL_HOST") != nullptr
                     && std::getenv("LSFGVK_DUAL_HOST")[0] == '0');
                 if (!dmaHop) {
@@ -1597,7 +1596,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (!snapCbFence.wait(vk, 0)) {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
                     // Overlay did not sample this write. Free it unless it is
-                    // the slot the in-flight 9060 copy is still reading.
+                    // the slot the in-flight coprocessor copy is still reading.
                     if (dmaHop
                             && static_cast<int>(frame->stagingIdx) != pendingDmaRelease)
                         conn.send(ls::ipc::Release{ frame->stagingIdx });
