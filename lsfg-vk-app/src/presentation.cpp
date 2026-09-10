@@ -875,6 +875,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::vector<int> doneFds;   // one per destination (already produced)
         int snapFd{ -1 };           // sync_fd semaphore for the snapshot copy; -1 if no snapshot
         uint32_t stagingIdx{ 0 };
+        uint64_t captureTsNs{ 0 };
     };
     struct Inbox {
         std::mutex m;
@@ -1042,6 +1043,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             uint32_t stagingIdx{ 0 };
             std::vector<int> doneFds;  // produced gen fds; -1 once imported
             int snapFd{ -1 };          // snapshot sync_fd sem for REAL blit
+            uint64_t captureTsNs{ 0 };
         } cur;
         int lastShownStagingIdx{ -1 }; // newest real frame actually shown (HOLD-LAST)
         uint64_t presentIdx{ 0 };      // rolling index into the signal pool
@@ -1073,7 +1075,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
         // present one swapchain image that blits the private snapshot of the
         // given real frame into it (used for REAL presents and HOLD-LAST).
-        auto presentReal = [&](int stagingIdx, int snapFd) -> bool {
+        auto presentReal = [&](int stagingIdx, int snapFd, uint64_t capTsNs = 0) -> bool {
             uint32_t idx{};
             const auto tReal0 = Clock::now();
             if (!acquireImage(idx)) {
@@ -1147,6 +1149,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
+            if (capTsNs > 0) {
+                const uint64_t nowNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch()).count());
+                const double latMs = (nowNs > capTsNs) ? (nowNs - capTsNs) / 1e6 : 0.0;
+                dbg("MEASURED LATENCY: REAL present slot %d latency %.2f ms", stagingIdx, latMs);
+            }
             ++presentIdx;
             ++presentedFrames;
             static uint32_t totalPresentCount = 0;
@@ -1241,6 +1250,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         cur.stagingIdx = pf->stagingIdx;
                         cur.doneFds = std::move(pf->doneFds);
                         cur.snapFd = pf->snapFd;  // -1 if no snapshot fd
+                        cur.captureTsNs = pf->captureTsNs;
                     } else if (wantDropWsi.exchange(false, std::memory_order_relaxed)
                             && g_overlay.wsi) {
                         dbg("output: idle drop overlay WSI (keep IPC)");
@@ -1334,6 +1344,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
                     if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                         throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
+                    if (cur.captureTsNs > 0) {
+                        const uint64_t nowNs = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                Clock::now().time_since_epoch()).count());
+                        const double latMs = (nowNs > cur.captureTsNs) ? (nowNs - cur.captureTsNs) / 1e6 : 0.0;
+                        dbg("MEASURED LATENCY: GEN present slot %u latency %.2f ms", cur.stagingIdx, latMs);
+                    }
                     ++presentIdx;
                     ++presentedFrames;
                     ++cur.nextDest;
@@ -1341,7 +1358,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         i, destCount, cur.stagingIdx);
                 } else if (cur.active) {
                     // --- REAL present: this frame's private snapshot -----------
-                    if (!presentReal(cur.stagingIdx, cur.snapFd >= 0 ? cur.snapFd : -1))
+                    if (!presentReal(cur.stagingIdx, cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs))
                         break;
                     lastShownStagingIdx = static_cast<int>(cur.stagingIdx);
                     for (int d : cur.doneFds)   // close any never-imported gen fds
@@ -1998,7 +2015,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 dbg("input: scheduleFrames took %lld us (fidx %llu)",
                     elapsedUs(tSched0, Clock::now()), (unsigned long long)fidx);
 
-                inbox.push(PendingFrame{ std::move(doneFds), snapFd, frame->stagingIdx });
+                inbox.push(PendingFrame{ std::move(doneFds), snapFd, frame->stagingIdx, frame->captureTsNs });
                 ++frameCount;
                 ++fidx;
             }

@@ -309,18 +309,21 @@ namespace ls::ipc {
 
     std::vector<std::byte> encodePayload(const Frame& frame) {
         std::vector<std::byte> out{};
-        out.reserve(4);
+        out.reserve(12);
         putU32(out, frame.stagingIdx);
+        putU64(out, frame.captureTsNs);
         return out;
     }
 
     Frame decodeFrame(const std::span<const std::byte> payload) {
-        if (payload.size() != 4)
+        if (payload.size() != 4 && payload.size() != 12)
             throw ls::error("malformed FRAME payload: wrong size ("
                 + std::to_string(payload.size()) + " bytes)");
         std::span<const std::byte> cur = payload;
         Frame frame{};
         frame.stagingIdx = getU32(cur);
+        if (payload.size() >= 12)
+            frame.captureTsNs = getU64(cur);
         return frame;
     }
 

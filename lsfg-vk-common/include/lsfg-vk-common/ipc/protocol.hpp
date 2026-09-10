@@ -123,6 +123,8 @@ namespace ls::ipc {
         /// index of the staging slot this frame was captured into
         /// (0 .. STAGING_RING_DEPTH-1)
         uint32_t stagingIdx;
+        /// monotonic timestamp (nanoseconds) when frame was captured on the game GPU
+        uint64_t captureTsNs{0};
     };
 
     /// A→C backpressure ack; the app will not read this slot again until

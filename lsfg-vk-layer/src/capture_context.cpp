@@ -652,44 +652,6 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                     << " pitch=" << exp.rowPitch
                     << " size=" << exp.allocationSize << "\n";
             }
-            {
-                FILE* hf = std::fopen("/tmp/lsfg_dest_fds", "w");
-                FILE* hh = std::fopen("/tmp/lsfg_dest_handles", "w");
-                if (hf) {
-                    for (size_t si = 0; si < STAGING_RING_DEPTH; ++si)
-                        std::fprintf(hf, "%d\n", this->localExportFds.at(si));
-                    std::fclose(hf);
-                }
-                /* GEM handles are per drm fd. Prime dest onto every live render
-                 * node fd so csstrip can match the CS ioctl fd later. */
-                if (hh) {
-                    DIR* dir = ::opendir("/proc/self/fd");
-                    if (dir) {
-                        while (dirent* e = ::readdir(dir)) {
-                            char path[64];
-                            std::snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
-                            char link[128]{};
-                            const ssize_t n = ::readlink(path, link, sizeof(link) - 1);
-                            if (n <= 0 || std::strstr(link, "renderD") == nullptr)
-                                continue;
-                            const int drm = std::atoi(e->d_name);
-                            if (drm < 3)
-                                continue;
-                            for (size_t si = 0; si < STAGING_RING_DEPTH; ++si) {
-                                drm_prime_handle ph{};
-                                ph.fd = this->localExportFds.at(si);
-                                if (ph.fd < 0)
-                                    continue;
-                                if (::drmIoctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0)
-                                    continue;
-                                std::fprintf(hh, "%zu %d %u\n", si, drm, ph.handle);
-                            }
-                        }
-                        ::closedir(dir);
-                    }
-                    std::fclose(hh);
-                }
-            }
             if (this->localCopyOnly)
                 std::cerr << "lsfg-vk: capture dst=render-owned dma-buf\n";
             if (rawDmaBufOn() && !this->shmMaps.at(0) && this->rawExportFds.at(0) < 0) {
@@ -1456,8 +1418,11 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 }
             }
         }
+        const uint64_t capTs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
         this->ipcConn->attachFd(sendFd);
-        this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot) });
+        this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot), capTs });
         sendFd = -1;
         syncFd = -1;
     } catch (const std::exception& e) {
