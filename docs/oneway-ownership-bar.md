@@ -1,6 +1,7 @@
 # One-way dual-GPU: ownership bar
 
-Milestone tag: `working_with_memcpy` (commit on `feat/dual-gpu-oneway`).
+Milestone: Decoupled Zero-Copy PCIe DMA (commit `3fccd54`, `72be460`, `399c1c4` on `feat/dual-gpu-oneway`).
+Prior tag: `working_with_memcpy` (POSIX memfd fallback).
 Host: kennykiller. Render 9070 XT (`1002:7550`, Vulkan gpu-index 1). Overlay 9060 XT (`1002:7590`). Panel DP-7 2560x1440 @ 240 Hz.
 Push: `fork` = `github.com:charlesarcher/lsfg-vk.git`. Do **not** push `origin` (PancakeTAS).
 
@@ -8,22 +9,46 @@ Push: `fork` = `github.com:charlesarcher/lsfg-vk.git`. Do **not** push `origin` 
 
 The 9070 keeps doing the game. The 9060 is a display coprocessor. Native scene rate stays almost untouched, then the panel sees about 2× that, toward 240 Hz. Same ownership as Windows Lossless Scaling on this hardware: the game never writes GPU-B resources.
 
-FurMark **bound** (2560x1440 MSAA4, mangohud): native ~141. Bar: 9070 ≥134 (≤5% hit), overlay ~2×.
+FurMark **bound** (2560x1440 MSAA4, mangohud): native ~141. Bar: 9070 ≥134 (≤5% hit), overlay ~2×. **Met** (136/140/143 vs 138/141/145).
 
-RE2 in-game at **Mizoil** (not title): native **173 fps**. 95% = **164**. Overlay native/doubled ~2×. Title ~250/500 is menus.
+RE2 in-game at **Mizoil** (not title): native **173 fps**. 95% = **164**. Overlay native/doubled ~2×. Title ~250/500 is menus. **Met** (MangoHud 168–169 fps, overlay 330 REAL + 332 GEN = 662 presents/s, 0 skips).
 
-## What this milestone is
+## Current Architecture: Decoupled Zero-Copy PCIe DMA
 
-Working **one-way hop is POSIX memfd + CPU memcpy** (CopyHop BGRA→RGBA swizzle), not dma-buf.
+The production hop eliminates the CPU copy and kernel dma-buf coupling entirely:
 
-- Isolated swapchain default-on for `presentation = "external"`.
-- Capture `copyImage` on extra compute queue fam=1 idx=0, submit fence NULL. No blit (DEVICE_LOST).
-- Dest: 9070-owned host malloc. Do not import B staging.
-- CopyHop off the game thread. FRAME send stays on the game present thread.
-- Overlay MAILBOX, xdg_toplevel (not layer-shell OVERLAY). Gap 0.
-- Isolated `vkDestroySwapchainKHR` is a **no-op keep** (leak until process exit). vkd3d Destroy+Create+Present 1440 on the present thread; tearing down 1080 CaptureContext hung RE2 after 1440 present 0 (ntsync). Log `isolated Destroy keep`.
-- Fake handles `0x5af5xxxx`. Hide present_timing + present_id/wait. Do not hide swapchain_maintenance1.
-- Always write isolated `pResults[i]` on SUCCESS. Defer 1440 QueueSubmit out of QueuePresent into QueueSubmit2 (device dispatch). Do not QueueSubmit on gfx present queue inside QueuePresent.
+1. **Host-Visible Allocations (`posix_memalign`)**:
+   - Bound via `VK_EXT_external_memory_host` (userptr).
+   - Card A writes via PCIe DMA (~1.98 ms).
+   - Card B reads via PCIe DMA (~1.98 ms).
+   - No CPU framebuffer memcpy (CPU utilization drops to ~4%).
+2. **Zero Kernel Hacks & No CS-Strip**:
+   - Standard Vulkan submission; no ioctl monkey-patching.
+   - Eliminates kernel `dma_resv` implicit sync stalls naturally by avoiding cross-device GEM sharing.
+3. **Single `VkDevice` in Game Process**:
+   - Game process (`re2.exe`) stays strictly on Card A (9070 XT).
+   - Card B DMA ingestion runs exclusively in `lsfg-vk-app` to prevent `vkd3d-proton` device lost (`VK_ERROR_DEVICE_LOST -8`).
+4. **Optimal Staging Ring Depth**:
+   - `STAGING_RING_DEPTH = 4` achieves 99.2% throughput with minimal input latency.
+
+## Measured End-to-End Latency
+
+Hardware monotonic timestamping from Card A capture to Card B present (`vkQueuePresentKHR`):
+
+| Frame Type | Metric | CPU Memcpy Method | Decoupled Zero-Copy DMA | Delta |
+| :--- | :--- | :--- | :--- | :--- |
+| **REAL Frames** | p50 Median | 6.80 ms | **4.52 ms** | **-2.28 ms** (33.5% faster) |
+| | Mean | 6.97 ms | **5.74 ms** | **-1.24 ms** |
+| | p10–p90 | 6.51 – 7.27 ms | **4.33 – 4.85 ms** | Tight consistent window |
+| **GEN Frames** | p50 Median | 2.61 ms | **0.50 ms** | **-2.11 ms** (80.8% faster) |
+| | Mean | 2.83 ms | **1.74 ms** | **-1.08 ms** |
+| | p10–p90 | 2.40 – 3.12 ms | **0.29 – 0.80 ms** | Near-instant display |
+
+## Last Measured (RE2 Live Gameplay & FurMark)
+
+- **FurMark Bound (2560x1440 MSAA4)**: 1,102 sent / 9 skip (99.2% transfer efficiency), 138 FPS game rate, 277.7 GEN/s (~555 presents/s, locked 2×).
+- **RE2 Mizoil (2560x1440)**: 330 REAL + 332 GEN presents/s = 662 presents/s total, 0 skips, MangoHud flat at 5.9 ms / 169 FPS.
+- **Visual Inspection**: Verified clean single outline for Leon under active WASD movement; no double head, no edge outline separation or halos.
 
 ## dma-buf (measured, this pair)
 
