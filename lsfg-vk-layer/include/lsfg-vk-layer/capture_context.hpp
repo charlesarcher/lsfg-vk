@@ -103,6 +103,12 @@ namespace lsfgvk::layer {
         std::optional<vk::Fence> bEmptyFence;
         vk::ImageLayout exchangeLayout{};     // negotiated LINEAR/DRM layout for localImages
         std::array<int, ls::ipc::STAGING_RING_DEPTH> localExportFds{};
+        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawExportFds{};
+        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawMemFds{};
+        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawReadyFds{};
+        std::array<void*, ls::ipc::STAGING_RING_DEPTH> destMaps{};
+        std::array<void*, ls::ipc::STAGING_RING_DEPTH> rawMaps{};
+        VkDeviceSize rawBytes{0};
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> dmaBufSent{};
         bool localCopyOnly{false};
         std::vector<vk::Semaphore> captureSemaphores; // recreated per cycle in present(), behind the fence gate

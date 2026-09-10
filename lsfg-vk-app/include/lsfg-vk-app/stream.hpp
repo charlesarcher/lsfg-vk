@@ -46,8 +46,8 @@ namespace ls::ipc {
         std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> aImports{};
         /// Offload DMA-in device (no gfx). 9070 share is imported here only.
         std::unique_ptr<vk::Vulkan> dmaVk;
-        std::optional<vk::CommandBuffer> dmaCb;
-        std::optional<vk::Fence> dmaFence;
+        std::array<std::optional<vk::CommandBuffer>, STAGING_RING_DEPTH> dmaCbs{};
+        std::array<std::optional<vk::Fence>, STAGING_RING_DEPTH> dmaFences{};
         std::array<std::optional<vk::Image>, STAGING_RING_DEPTH> dmaSrc{};
         std::array<std::optional<vk::Image>, STAGING_RING_DEPTH> dmaDst{};
         std::array<int, STAGING_RING_DEPTH> dmaDstFds{};

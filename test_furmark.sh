@@ -93,6 +93,8 @@ start_app() {
     LSFGVK_APP_VERBOSE="${LSFGVK_APP_VERBOSE:-}" \
     LSFGVK_POSIX_SHM="${LSFGVK_POSIX_SHM:-}" \
     LSFGVK_OVERLAY_GAP="${LSFGVK_OVERLAY_GAP:-}" \
+    LSFGVK_DUMP_PPM="${LSFGVK_DUMP_PPM:-}" \
+    LSFGVK_DUMP_PRESENT="${LSFGVK_DUMP_PRESENT:-}" \
     "$APP" --profile app-oneway --session wayland \
     >"$OUT/app.log" 2>&1 &
   APP_PID=$!
@@ -125,6 +127,10 @@ run_furmark() {
     export LSFGVK_APP_SOCK="$SOCK"
     export LSFGVK_LAYER_DBG=1
     export LSFGVK_PROFILE=furmark-oneway
+    if [[ "${LSFGVK_CSSTRIP:-}" == 1 ]]; then
+      export LD_PRELOAD="$LAYER_DIR/liblsfg-vk-csstrip.so${LD_PRELOAD:+:$LD_PRELOAD}"
+      echo "FurMark LD_PRELOAD csstrip=$LD_PRELOAD"
+    fi
     # LSFGVK_TIMING is opt-in: CmdResetQueryPool on the copy CB was left
     # on from session 13.53 and may stall the 9070. Do not default it.
     # Do NOT set MESA_VK_DEVICE_SELECT here: it collapses FurMark's Vulkan

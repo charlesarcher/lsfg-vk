@@ -37,3 +37,12 @@ install(TARGETS lsfg-vk-layer
     LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/VkLayer_LSFGVK_frame_generation.json"
     DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/vulkan/implicit_layer.d")
+
+add_library(lsfg-vk-csstrip SHARED src/csstrip.c)
+target_include_directories(lsfg-vk-csstrip PRIVATE
+    ${LIBDRM_INCLUDE_DIRS})
+target_link_libraries(lsfg-vk-csstrip PRIVATE ${LIBDRM_LIBRARIES} ${CMAKE_DL_LIBS})
+set_target_properties(lsfg-vk-csstrip PROPERTIES
+    PREFIX "lib")
+install(TARGETS lsfg-vk-csstrip
+    LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")

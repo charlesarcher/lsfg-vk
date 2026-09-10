@@ -290,12 +290,13 @@ void dbg(const char* fmt, ...) {
     template<typename Record>
     void submitDmaTimed(ls::ipc::StreamState& state, const char* tag, Record&& record) {
         auto& dvk = *state.dmaVk;
-        auto& cb = *state.dmaCb;
-        if (!state.dmaFence->wait(dvk, 50ULL * 1000 * 1000)) {
+        auto& cb = *state.dmaCbs.at(0);
+        auto& fence = *state.dmaFences.at(0);
+        if (!fence.wait(dvk, 50ULL * 1000 * 1000)) {
             dbg("dma-in probe %s: fence wait failed before submit", tag);
             return;
         }
-        state.dmaFence->reset(dvk);
+        fence.reset(dvk);
         cb.begin(dvk);
         if (g_dmaHopTs.pool != VK_NULL_HANDLE)
             cb.resetQueryPool(dvk, g_dmaHopTs.pool, 0, 2);
@@ -309,11 +310,11 @@ void dbg(const char* fmt, ...) {
         cb.end(dvk);
         VkQueue q = dvk.hasTransferQueue() ? dvk.transferQueueHandle() : dvk.queue();
         cb.submit(dvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
-            state.dmaFence->handle(), q);
+            fence.handle(), q);
         const auto t0 = Clock::now();
         uint64_t calDev0 = 0;
         const bool haveCal0 = sampleCalDevice(dvk, calDev0);
-        (void)state.dmaFence->wait(dvk, 50ULL * 1000 * 1000);
+        (void)fence.wait(dvk, 50ULL * 1000 * 1000);
         const auto t1 = Clock::now();
         uint64_t qv[2] = {0, 0};
         bool haveQ = false;
@@ -437,8 +438,10 @@ void dbg(const char* fmt, ...) {
             auto& dvk = *state.dmaVk;
             const VkCommandPool pool = dvk.hasTransferQueue()
                 ? dvk.transferCmdPoolHandle() : VK_NULL_HANDLE;
-            state.dmaCb.emplace(dvk, pool);
-            state.dmaFence.emplace(dvk, true);
+            for (size_t i = 0; i < ls::ipc::STAGING_RING_DEPTH; ++i) {
+                state.dmaCbs.at(i).emplace(dvk, pool);
+                state.dmaFences.at(i).emplace(dvk, true);
+            }
             {
                 VkPhysicalDeviceProperties2 props{
                     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
@@ -518,12 +521,13 @@ void dbg(const char* fmt, ...) {
                 return -1;
             }
         }
-        if (!state.dmaCb || !state.dmaFence)
+        if (!state.dmaCbs.at(sidx) || !state.dmaFences.at(sidx))
             return -1;
-        if (!state.dmaFence->wait(dvk, 0))
+        auto& cb = *state.dmaCbs.at(sidx);
+        auto& fence = *state.dmaFences.at(sidx);
+        if (!fence.wait(dvk, 0))
             return -1;
-        state.dmaFence->reset(dvk);
-        auto& cb = *state.dmaCb;
+        fence.reset(dvk);
         const uint32_t dstQ = dvk.hasTransferQueue()
             ? dvk.transferQueueFamilyIndex() : dvk.queueFamilyIndex();
         cb.begin(dvk);
@@ -551,11 +555,11 @@ void dbg(const char* fmt, ...) {
         cb.end(dvk);
         VkQueue q = dvk.hasTransferQueue() ? dvk.transferQueueHandle() : dvk.queue();
         cb.submit(dvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
-            state.dmaFence->handle(), q);
+            fence.handle(), q);
         const auto t0 = Clock::now();
         uint64_t calDev0 = 0;
         const bool haveCal0 = sampleCalDevice(dvk, calDev0);
-        (void)state.dmaFence->wait(dvk, 50ULL * 1000 * 1000);
+        (void)fence.wait(dvk, 50ULL * 1000 * 1000);
         const auto t1 = Clock::now();
         uint64_t calDev1 = 0;
         const bool haveCal1 = sampleCalDevice(dvk, calDev1);
@@ -1145,6 +1149,62 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
             ++presentIdx;
             ++presentedFrames;
+            static uint32_t totalPresentCount = 0;
+            ++totalPresentCount;
+            static bool dumpedPresent = false;
+            if (!dumpedPresent && totalPresentCount >= 100 && std::getenv("LSFGVK_DUMP_PRESENT")) {
+                dumpedPresent = true;
+                cbFences.at((cbIdx + cbRingSize - 1) % cbRingSize).wait(vk, UINT64_MAX);
+                const size_t nb = static_cast<size_t>(extent.width) * extent.height * 4;
+                void* p = nullptr;
+                if (::posix_memalign(&p, 4096, nb) == 0) {
+                    try {
+                        vk::Image dumpImg(vk, extent, VK_FORMAT_R8G8B8A8_UNORM,
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            p, nb);
+                        vk::CommandBuffer dcb(vk);
+                        dcb.begin(vk);
+                        dcb.copyImage(vk,
+                            {
+                                makeBlitBarrier(dstImage,
+                                    VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                    VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                                makeBlitBarrier(dumpImg.handle(),
+                                    VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                            },
+                            { dstImage, dumpImg.handle() },
+                            extent,
+                            {
+                                makeBlitBarrier(dstImage,
+                                    VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                            });
+                        dcb.end(vk);
+                        vk::Fence df(vk, true);
+                        df.reset(vk);
+                        dcb.submit(vk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0, df.handle());
+                        df.wait(vk, UINT64_MAX);
+                        if (FILE* out = std::fopen("/tmp/lsfg-doubler-presentation.ppm", "wb")) {
+                            std::fprintf(out, "P6\n%u %u\n255\n", extent.width, extent.height);
+                            const auto* px = static_cast<const uint8_t*>(p);
+                            const size_t npx = static_cast<size_t>(extent.width) * extent.height;
+                            std::vector<uint8_t> rgb(npx * 3);
+                            for (size_t i = 0; i < npx; ++i) {
+                                rgb[i * 3 + 0] = px[i * 4 + 0];
+                                rgb[i * 3 + 1] = px[i * 4 + 1];
+                                rgb[i * 3 + 2] = px[i * 4 + 2];
+                            }
+                            std::fwrite(rgb.data(), 1, rgb.size(), out);
+                            std::fclose(out);
+                            std::cerr << "lsfg-vk-app: dumped full presentation swapchain image with HUD to /tmp/lsfg-doubler-presentation.ppm\n";
+                        }
+                    } catch (const std::exception& e) {
+                        std::cerr << "lsfg-vk-app: present dump failed: " << e.what() << "\n";
+                    }
+                    ::free(p);
+                }
+            }
             return true;
         };
 
@@ -1340,15 +1400,20 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
     // --- INPUT thread: receive -> schedule -> snapshot -> release -> enqueue --
     auto inputLoop = [&] {
-        vk::CommandBuffer cb{ vk, vk.transferCmdPoolHandle() };
+        std::vector<vk::CommandBuffer> snapCbs;
+        std::vector<vk::CommandBuffer> computeCbs;
+        std::vector<vk::Fence> snapFences;
+        for (size_t i = 0; i < ls::ipc::STAGING_RING_DEPTH; ++i) {
+            snapCbs.emplace_back(vk, vk.transferCmdPoolHandle());
+            computeCbs.emplace_back(vk, vk.transferCmdPoolHandle());
+            snapFences.emplace_back(vk, true);
+        }
         vk::CommandBuffer gfxCb{ vk };
-        vk::CommandBuffer computeCb{ vk, vk.transferCmdPoolHandle() };
         std::optional<vk::Shader> swizzleShader;
         std::optional<vk::Sampler> swizzleSampler;
         std::optional<vk::DescriptorPool> swizzlePool;
         std::array<std::optional<vk::DescriptorSet>, ls::ipc::STAGING_RING_DEPTH> swizzleSets;
         std::array<std::optional<vk::Image>, ls::ipc::STAGING_RING_DEPTH> swizzleMid;
-        vk::Fence snapCbFence{ vk, true };
         int pendingDmaRelease = -1;
         vk::CommandBuffer emptyGenCb{ vk };
         vk::Fence emptyGenFence{ vk, true };
@@ -1483,6 +1548,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         && std::getenv("LSFGVK_EMPTY_XFER")[0] == '1');
                 int snapFd = -1;
                 if (!skipSnap) {
+                const uint32_t sidx = frame->stagingIdx;
+                if (sidx >= ls::ipc::STAGING_RING_DEPTH)
+                    throw ls::error("FRAME stagingIdx out of range");
+                auto& snapCbFence = snapFences.at(sidx);
+                auto& cb = snapCbs.at(sidx);
+                auto& computeCb = computeCbs.at(sidx);
                 if (!snapCbFence.wait(vk, 0)) {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
                     // Overlay did not sample this write. Free it unless it is
@@ -1500,10 +1571,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     dbg("input: Release slot %u", done);
                     pendingDmaRelease = -1;
                 }
-                const uint32_t sidx = frame->stagingIdx;
                 bool waitWriteDone = false;
-                if (sidx >= ls::ipc::STAGING_RING_DEPTH)
-                    throw ls::error("FRAME stagingIdx out of range");
                 if (captureFd >= 0 && !state.shmBytes) {
                     pollfd pfd{};
                     pfd.fd = captureFd;
@@ -1516,9 +1584,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         dbg("input: poll write-complete %d revents=%d wall %.3f ms",
                             pr, pfd.revents, elapsedUs(tPoll0, Clock::now()) / 1000.0);
                     }
-                    importSyncFd(vk, frameReadySem.handle(), captureFd);
+                    ::close(captureFd);
                     captureFd = -1;
-                    waitWriteDone = true;
+                    waitWriteDone = false;
                 }
                 if (dmaHop) {
                     int srcFd = state.dmaFds.at(sidx);
@@ -1526,8 +1594,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         && std::getenv("LSFGVK_NO_HOP")[0] == '1';
                     if (srcFd >= 0 && !noHop && ensureDmaIn(state, vk)) {
                         const int hopFd = hopShareToOffload(state, sidx, srcFd);
-                        if (hopFd >= 0)
+                        if (hopFd >= 0) {
                             srcFd = hopFd;
+                            // Dest data is safely in offload VRAM. Release render
+                            // slot immediately so the game can capture next frame.
+                            conn.send(ls::ipc::Release{ sidx });
+                            dbg("input: Release immediate after dma-in slot %u", sidx);
+                        }
                     }
                     if (srcFd >= 0 && !state.aImports.at(sidx).has_value()) {
                         try {
@@ -1790,20 +1863,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     vk.transferQueueHandle() == vk.queue() ? 1 : 0,
                     (unsigned long long)fidx);
                 if (dmaHop) {
-                    pendingDmaRelease = static_cast<int>(frame->stagingIdx);
-                    dbg("input: hold Release until copy-done slot %u",
-                        frame->stagingIdx);
-                    const auto tWait0 = Clock::now();
-                    (void)snapCbFence.wait(vk, 50ULL * 1000 * 1000);
-                    conn.send(ls::ipc::Release{ frame->stagingIdx });
+                    /* Release was already sent immediately after hopShareToOffload */
                     pendingDmaRelease = -1;
-                    if (tsLogged < 8) {
-                        dbg("input: Release after copy-done slot %u wall %.3f ms",
-                            frame->stagingIdx, elapsedUs(tWait0, Clock::now()) / 1000.0);
-                        ++tsLogged;
-                    }
                 }
-                if (fidx >= 80 && fidx - lastDumpFidx >= 400
+                if (fidx >= 20 && fidx - lastDumpFidx >= 40
                         && state.genSources.at(sidx).has_value()
                         && std::getenv("LSFGVK_DUMP_PPM")
                         && std::getenv("LSFGVK_DUMP_PPM")[0] == '1') {
@@ -1843,7 +1906,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             auto* px = static_cast<const uint8_t*>(p);
                             char named[128];
                             std::snprintf(named, sizeof(named),
-                                "/tmp/lsfg-re2-ingame/dump-fidx%llu.ppm",
+                                "/tmp/lsfg-dump-fidx%llu.ppm",
                                 (unsigned long long)fidx);
                             if (FILE* out = std::fopen("/tmp/lsfg-capture.ppm", "wb")) {
                                 std::fprintf(out, "P6\n%u %u\n255\n", w, h);

@@ -35,9 +35,9 @@ namespace ls::ipc {
     /// ring lets the game run ahead of the (slower, ~one-cycle-behind) app and
     /// avoids stalling the game present on the app's frame-gen + present cycle.
     /// MUST be identical on both processes (layer and app) — they exchange
-    /// staging fds and Release acks indexed by slot < this value. raised from 2
-    /// to give the game headroom against the app cycle.
-    inline constexpr size_t STAGING_RING_DEPTH = 4;
+    /// staging fds and Release acks indexed by slot < this value. Product ring
+    /// is 2: skip this frame if both slots are busy, never wait, never overwrite.
+    inline constexpr size_t STAGING_RING_DEPTH = 8;
 
     /// message types on the wire (the u8 following the magic)
     enum class MsgType : uint8_t {

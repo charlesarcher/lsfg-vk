@@ -532,12 +532,14 @@ namespace {
         VkResult res = VK_SUCCESS;
         if (isIsolated(swapchain)) {
             auto& iso = isolatedAt(swapchain);
-            const uint32_t idx = iso.next % static_cast<uint32_t>(iso.recycleFences.size());
-            // Never UINT64_MAX: a stuck recycle fence under exclusive overlay
-            // is an untabbable black screen. 8 ms then hand out the image.
-            constexpr uint64_t kCapNs = 8ull * 1000ull * 1000ull;
-            const uint64_t ns = (timeout == UINT64_MAX || timeout > kCapNs) ? kCapNs : timeout;
-            (void)iso.recycleFences.at(idx).wait(swIt->second.get(), ns);
+            uint32_t idx = iso.next % static_cast<uint32_t>(iso.recycleFences.size());
+            for (size_t tries = 0; tries < iso.recycleFences.size(); ++tries) {
+                const uint32_t tryIdx = (iso.next + tries) % static_cast<uint32_t>(iso.recycleFences.size());
+                if (iso.recycleFences.at(tryIdx).wait(swIt->second.get(), 0)) {
+                    idx = tryIdx;
+                    break;
+                }
+            }
             iso.recycleFences.at(idx).reset(swIt->second.get());
             iso.next = idx + 1;
             *pImageIndex = idx;
@@ -679,8 +681,9 @@ namespace {
                             // vkd3d's QueueSubmit2. Defer dedicated work.
                             if (skipIpc)
                                 work.waits = waitSemaphores;
-                            work.recycle = iso.recycleFences.at(idx).handle();
-                        } else {
+                            if (skipIpc)
+                                work.recycle = iso.recycleFences.at(idx).handle();
+                        } else if (skipIpc) {
                             isolatedSignal(it->second.get(), iso.signalQueue, iso.signalQueue,
                                 VK_NULL_HANDLE, iso.recycleFences.at(idx).handle());
                         }

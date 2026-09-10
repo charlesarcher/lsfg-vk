@@ -30,6 +30,11 @@
 #include <cerrno>
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
+#include <linux/memfd.h>
+#include <linux/udmabuf.h>
+#include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <poll.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -38,7 +43,6 @@
 #include <xf86drm.h>
 #include <libdrm/amdgpu.h>
 #include <libdrm/amdgpu_drm.h>
-#include <linux/dma-buf.h>
 #include <sys/ioctl.h>
 #include <vulkan/vulkan_core.h>
 
@@ -49,6 +53,50 @@ namespace {
 bool exportIsolatedOn() {
     const char* e = std::getenv("LSFGVK_EXPORT_ISOLATED");
     return e && e[0] == '1';
+}
+bool rawDmaBufOn() {
+    const char* e = std::getenv("LSFGVK_RAW_DMABUF");
+    return e && e[0] == '1';
+}
+int createRawDmaBuf(size_t bytes, void** mapOut) {
+    *mapOut = nullptr;
+    const int mfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-raw",
+        static_cast<long>(MFD_CLOEXEC | MFD_ALLOW_SEALING)));
+    if (mfd < 0)
+        return -1;
+    if (::ftruncate(mfd, static_cast<off_t>(bytes)) != 0) {
+        ::close(mfd);
+        return -1;
+    }
+    if (::fcntl(mfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+        ::close(mfd);
+        return -1;
+    }
+    const int ufd = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+    if (ufd < 0) {
+        ::close(mfd);
+        return -1;
+    }
+    udmabuf_create cr{};
+    cr.memfd = static_cast<__u32>(mfd);
+    cr.flags = UDMABUF_FLAGS_CLOEXEC;
+    cr.offset = 0;
+    cr.size = bytes;
+    const int dfd = ::ioctl(ufd, UDMABUF_CREATE, &cr);
+    const int err = errno;
+    ::close(ufd);
+    ::close(mfd);
+    if (dfd < 0) {
+        errno = err;
+        return -1;
+    }
+    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, 0);
+    if (p == MAP_FAILED) {
+        ::close(dfd);
+        return -1;
+    }
+    *mapOut = p;
+    return dfd;
 }
 int existingRenderFd() {
     DIR* dir = ::opendir("/proc/self/fd");
@@ -180,6 +228,8 @@ struct lsfgvk::layer::CopyHop {
         void* dst{nullptr};
         size_t n{0};
         int fd{-1};
+        int destFd{-1};
+        int readyFd{-1};
         uint32_t* seq{nullptr};
     };
     std::mutex mx;
@@ -230,6 +280,11 @@ struct lsfgvk::layer::CopyHop {
                 ::close(j.fd);
                 j.fd = -1;
             }
+            if (j.destFd >= 0) {
+                dma_buf_sync st{};
+                st.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+                (void)::ioctl(j.destFd, DMA_BUF_IOCTL_SYNC, &st);
+            }
             if (j.src && j.dst && j.n) {
                 // Game swapchain is B8G8R8A8_UNORM; FG/overlay want RGBA.
                 // copyImage is bit-preserving (R/B swap). Capture queue is
@@ -243,6 +298,15 @@ struct lsfgvk::layer::CopyHop {
                         | ((v & 0xFFu) << 16)
                         | ((v >> 16) & 0xFFu);
                 }
+            }
+            if (j.destFd >= 0) {
+                dma_buf_sync en{};
+                en.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+                (void)::ioctl(j.destFd, DMA_BUF_IOCTL_SYNC, &en);
+            }
+            if (j.readyFd >= 0) {
+                const uint64_t one = 1;
+                (void)::write(j.readyFd, &one, sizeof(one));
             }
             if (j.seq)
                 __atomic_add_fetch(j.seq, 1u, __ATOMIC_RELEASE);
@@ -309,6 +373,9 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     // reusable from frame 1)
     this->slotFree.fill(true);
     this->localExportFds.fill(-1);
+    this->rawExportFds.fill(-1);
+    this->rawMemFds.fill(-1);
+    this->rawReadyFds.fill(-1);
     this->bExportFds.fill(-1);
 
     // --- IPC handshake (2 s deadline on the NEGOTIATED reply) --------------
@@ -513,7 +580,9 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         // Session 13.17: capture ring - render thread never blocks on the
         // previous blit (fences created signaled so first uses pass freely)
         uint32_t extraFam = 0, extraIdx = 0;
-        if (this->fake && getIsolatedSignalQueue(extraFam, extraIdx)) {
+        static const bool noExtraQ = std::getenv("LSFGVK_NO_EXTRA_Q")
+            && std::getenv("LSFGVK_NO_EXTRA_Q")[0] == '1';
+        if (!noExtraQ && this->fake && getIsolatedSignalQueue(extraFam, extraIdx)) {
             vk.df().GetDeviceQueue(vk.dev(), extraFam, extraIdx, &this->captureQ);
             const VkCommandPoolCreateInfo poolInfo{
                 .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -585,14 +654,80 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             }
             {
                 FILE* hf = std::fopen("/tmp/lsfg_dest_fds", "w");
+                FILE* hh = std::fopen("/tmp/lsfg_dest_handles", "w");
                 if (hf) {
                     for (size_t si = 0; si < STAGING_RING_DEPTH; ++si)
                         std::fprintf(hf, "%d\n", this->localExportFds.at(si));
                     std::fclose(hf);
                 }
+                /* GEM handles are per drm fd. Prime dest onto every live render
+                 * node fd so csstrip can match the CS ioctl fd later. */
+                if (hh) {
+                    DIR* dir = ::opendir("/proc/self/fd");
+                    if (dir) {
+                        while (dirent* e = ::readdir(dir)) {
+                            char path[64];
+                            std::snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
+                            char link[128]{};
+                            const ssize_t n = ::readlink(path, link, sizeof(link) - 1);
+                            if (n <= 0 || std::strstr(link, "renderD") == nullptr)
+                                continue;
+                            const int drm = std::atoi(e->d_name);
+                            if (drm < 3)
+                                continue;
+                            for (size_t si = 0; si < STAGING_RING_DEPTH; ++si) {
+                                drm_prime_handle ph{};
+                                ph.fd = this->localExportFds.at(si);
+                                if (ph.fd < 0)
+                                    continue;
+                                if (::drmIoctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0)
+                                    continue;
+                                std::fprintf(hh, "%zu %d %u\n", si, drm, ph.handle);
+                            }
+                        }
+                        ::closedir(dir);
+                    }
+                    std::fclose(hh);
+                }
             }
             if (this->localCopyOnly)
                 std::cerr << "lsfg-vk: capture dst=render-owned dma-buf\n";
+            if (rawDmaBufOn() && !this->shmMaps.at(0) && this->rawExportFds.at(0) < 0) {
+                this->rawBytes = gemBytes;
+                for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+                    const int dfd = this->localExportFds.at(i);
+                    if (dfd < 0)
+                        continue;
+                    void* dm = ::mmap(nullptr, static_cast<size_t>(gemBytes),
+                        PROT_READ, MAP_SHARED, dfd, 0);
+                    if (dm == MAP_FAILED) {
+                        std::cerr << "lsfg-vk: dest mmap failed slot " << i
+                            << " errno=" << errno << "\n";
+                        continue;
+                    }
+                    this->destMaps.at(i) = dm;
+                    void* rm = nullptr;
+                    const int rfd = createRawDmaBuf(static_cast<size_t>(gemBytes), &rm);
+                    if (rfd < 0) {
+                        std::cerr << "lsfg-vk: raw dma-buf create failed slot " << i
+                            << " errno=" << errno << "\n";
+                        ::munmap(dm, static_cast<size_t>(gemBytes));
+                        this->destMaps.at(i) = nullptr;
+                        continue;
+                    }
+                    this->rawExportFds.at(i) = rfd;
+                    this->rawMaps.at(i) = rm;
+                    this->rawReadyFds.at(i) = ::eventfd(0,
+                        EFD_CLOEXEC | EFD_SEMAPHORE | EFD_NONBLOCK);
+                    if (this->rawReadyFds.at(i) < 0) {
+                        std::cerr << "lsfg-vk: raw ready eventfd failed slot " << i
+                            << " errno=" << errno << "\n";
+                    }
+                }
+                if (!this->copyHop)
+                    this->copyHop = std::make_unique<CopyHop>();
+                std::cerr << "lsfg-vk: raw dma-buf re-export size=" << gemBytes << "\n";
+            }
         }
         if (this->fake && exportIsolatedOn()) {
             this->dmaBufSent.fill(false);
@@ -725,6 +860,25 @@ CaptureContext::~CaptureContext() {
         }
     }
     for (int& fd : this->localExportFds) {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    for (size_t i = 0; i < this->destMaps.size(); ++i) {
+        if (this->destMaps.at(i)) {
+            ::munmap(this->destMaps.at(i), static_cast<size_t>(this->rawBytes));
+            this->destMaps.at(i) = nullptr;
+        }
+        if (this->rawMaps.at(i)) {
+            ::munmap(this->rawMaps.at(i), static_cast<size_t>(this->rawBytes));
+            this->rawMaps.at(i) = nullptr;
+        }
+    }
+    for (int& fd : this->rawExportFds) {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    for (int& fd : this->rawMemFds) {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+    }
+    for (int& fd : this->rawReadyFds) {
         if (fd >= 0) { ::close(fd); fd = -1; }
     }
     for (int& fd : this->bExportFds) {
@@ -1062,10 +1216,19 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // the present wait to block forever on some drivers.
     try {
         std::vector<VkSemaphore> waitSems = semaphores;
-        std::vector<VkSemaphore> signalSems = { sigSem.handle(), presentSem.handle() };
+        std::vector<VkSemaphore> signalSems = this->fake
+            ? std::vector<VkSemaphore>{ sigSem.handle() }
+            : std::vector<VkSemaphore>{ sigSem.handle(), presentSem.handle() };
         std::vector<VkPipelineStageFlags> stages(waitSems.size(),
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         VkCommandBuffer rawBuf = cmdbuf.raw();
+        {
+            FILE* sf = std::fopen("/tmp/lsfg_capture_slot", "w");
+            if (sf) {
+                std::fprintf(sf, "%zu\n", slot);
+                std::fclose(sf);
+            }
+        }
         const VkSubmitInfo submitInfo{
             .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
             .waitSemaphoreCount = static_cast<uint32_t>(waitSems.size()),
@@ -1076,9 +1239,15 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             .signalSemaphoreCount = static_cast<uint32_t>(signalSems.size()),
             .pSignalSemaphores = signalSems.data()
         };
+        VkFence sigFence = VK_NULL_HANDLE;
+        if (isIsolated(swapchain)) {
+            auto& iso = isolatedAt(swapchain);
+            if (imageIdx < iso.recycleFences.size())
+                sigFence = iso.recycleFences.at(imageIdx).handle();
+        }
         auto res = vk.df().QueueSubmit(
             this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue,
-            1, &submitInfo, VK_NULL_HANDLE);
+            1, &submitInfo, sigFence);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkQueueSubmit() failed");
         this->fenceSubmitted = true;
@@ -1162,17 +1331,35 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
         throw ls::error(std::string("lsfg-vk: external stream error: export sync fd failed: ") + e.what(), e);
     }
-    if (this->copyHop && slot < this->shmMaps.size() && this->shmMaps.at(slot)
-            && this->hostPtrsA.at(slot) && this->hostAllocSize > 0 && syncFd >= 0) {
-        const int hopFd = ::dup(syncFd);
-        if (hopFd >= 0) {
-            this->copyHop->push(CopyHop::Job{
-                this->hostPtrsA.at(slot),
-                this->shmMaps.at(slot),
-                static_cast<size_t>(this->hostAllocSize),
-                hopFd,
-                this->shmSeq.at(slot)
-            });
+    if (this->copyHop && syncFd >= 0) {
+        if (slot < this->shmMaps.size() && this->shmMaps.at(slot)
+                && this->hostPtrsA.at(slot) && this->hostAllocSize > 0) {
+            const int hopFd = ::dup(syncFd);
+            if (hopFd >= 0) {
+                this->copyHop->push(CopyHop::Job{
+                    this->hostPtrsA.at(slot),
+                    this->shmMaps.at(slot),
+                    static_cast<size_t>(this->hostAllocSize),
+                    hopFd,
+                    -1,
+                    -1,
+                    this->shmSeq.at(slot)
+                });
+            }
+        } else if (slot < this->rawMaps.size() && this->rawMaps.at(slot)
+                && this->destMaps.at(slot) && this->rawBytes > 0) {
+            const int hopFd = ::dup(syncFd);
+            if (hopFd >= 0) {
+                this->copyHop->push(CopyHop::Job{
+                    this->destMaps.at(slot),
+                    this->rawMaps.at(slot),
+                    static_cast<size_t>(this->rawBytes),
+                    hopFd,
+                    this->localExportFds.at(slot),
+                    this->rawReadyFds.at(slot),
+                    nullptr
+                });
+            }
         }
     }
 
@@ -1217,6 +1404,22 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             }
         } else if (this->shmMaps.at(0)) {
             // POSIX shm already has the pixels; keep the 9070 capture sync-fd
+        } else if (slot < this->rawExportFds.size()
+                && this->rawExportFds.at(slot) >= 0) {
+            if (!this->dmaBufSent.at(slot)) {
+                sendFd = ::dup(this->rawExportFds.at(slot));
+                if (sendFd < 0)
+                    sendFd = syncFd;
+                else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+                this->dmaBufSent.at(slot) = true;
+                std::cerr << "lsfg-vk: FRAME carries raw dma-buf slot="
+                    << slot << " fd=" << sendFd << "\n";
+            } else if (this->rawReadyFds.at(slot) >= 0) {
+                sendFd = ::dup(this->rawReadyFds.at(slot));
+                if (sendFd < 0)
+                    sendFd = syncFd;
+                else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+            }
         } else if (this->fake && slot < this->bExportFds.size()
                 && this->bExportFds.at(slot) >= 0) {
             sendFd = ::dup(this->bExportFds.at(slot));
