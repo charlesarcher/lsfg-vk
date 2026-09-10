@@ -262,6 +262,149 @@ void dbg(const char* fmt, ...) {
         return std::getenv("LSFGVK_APP_VERBOSE") != nullptr;
     }
 
+    struct DmaHopTs {
+        VkQueryPool pool{VK_NULL_HANDLE};
+        float periodNs{1.0f};
+        PFN_vkGetCalibratedTimestampsEXT getCal{nullptr};
+    };
+    DmaHopTs g_dmaHopTs{};
+
+    bool sampleCalDevice(const vk::Vulkan& dvk, uint64_t& deviceTs) {
+        if (!g_dmaHopTs.getCal)
+            return false;
+        const VkCalibratedTimestampInfoEXT info{
+            .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT,
+            .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT,
+        };
+        uint64_t ts = 0;
+        uint64_t maxDev = 0;
+        const VkResult r = g_dmaHopTs.getCal(dvk.dev(), 1, &info, &ts, &maxDev);
+        if (r != VK_SUCCESS)
+            return false;
+        deviceTs = ts;
+        return true;
+    }
+
+    /// Record TOP/BOTTOM timestamps around `record`, submit on the dma-in
+    /// queue, log wall / copy / park. Fence must be signaled on entry.
+    template<typename Record>
+    void submitDmaTimed(ls::ipc::StreamState& state, const char* tag, Record&& record) {
+        auto& dvk = *state.dmaVk;
+        auto& cb = *state.dmaCb;
+        if (!state.dmaFence->wait(dvk, 50ULL * 1000 * 1000)) {
+            dbg("dma-in probe %s: fence wait failed before submit", tag);
+            return;
+        }
+        state.dmaFence->reset(dvk);
+        cb.begin(dvk);
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
+            cb.resetQueryPool(dvk, g_dmaHopTs.pool, 0, 2);
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
+            dvk.df().CmdWriteTimestamp(cb.handle(),
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_dmaHopTs.pool, 0);
+        record(dvk, cb);
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
+            dvk.df().CmdWriteTimestamp(cb.handle(),
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_dmaHopTs.pool, 1);
+        cb.end(dvk);
+        VkQueue q = dvk.hasTransferQueue() ? dvk.transferQueueHandle() : dvk.queue();
+        cb.submit(dvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
+            state.dmaFence->handle(), q);
+        const auto t0 = Clock::now();
+        uint64_t calDev0 = 0;
+        const bool haveCal0 = sampleCalDevice(dvk, calDev0);
+        (void)state.dmaFence->wait(dvk, 50ULL * 1000 * 1000);
+        const auto t1 = Clock::now();
+        uint64_t qv[2] = {0, 0};
+        bool haveQ = false;
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE) {
+            try {
+                haveQ = cb.getQueryPoolResults(dvk, g_dmaHopTs.pool, 0, 2, qv, true);
+            } catch (const std::exception& e) {
+                dbg("dma-in probe %s timestamp read failed: %s", tag, e.what());
+            }
+        }
+        const double wallMs = elapsedUs(t0, t1) / 1000.0;
+        double copyMs = -1.0;
+        double parkMs = -1.0;
+        if (haveQ) {
+            copyMs = (static_cast<double>(qv[1]) - static_cast<double>(qv[0]))
+                * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
+            if (haveCal0) {
+                parkMs = (static_cast<double>(qv[0]) - static_cast<double>(calDev0))
+                    * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
+            } else {
+                parkMs = wallMs - copyMs;
+            }
+        }
+        dbg("dma-in probe %s wall %.3f ms exec %.3f ms park %.3f ms cal0=%d",
+            tag, wallMs, copyMs, parkMs, haveCal0);
+    }
+
+    /// First-use discriminator on ctx=3: no imported dma-buf. Empty IB vs
+    /// local vkCmdCopyImage. If empty parks ~33 ms, the hop delay is not
+    /// the share. If empty is fast and local copy is fast, the share is.
+    void probeDmaInQueue(ls::ipc::StreamState& state, VkExtent2D ext, VkFormat fmt) {
+        auto& dvk = *state.dmaVk;
+        const uint32_t dstQ = dvk.hasTransferQueue()
+            ? dvk.transferQueueFamilyIndex() : dvk.queueFamilyIndex();
+        auto empty = [](const vk::Vulkan&, vk::CommandBuffer&) {};
+        submitDmaTimed(state, "empty-1", empty);
+        submitDmaTimed(state, "empty-2", empty);
+        submitDmaTimed(state, "empty-3", empty);
+        try {
+            const vk::ImageLayout lay{};
+            vk::Image src(dvk, {1, 1}, fmt,
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                std::nullopt, std::nullopt, lay);
+            vk::Image dst(dvk, {1, 1}, fmt,
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                std::nullopt, std::nullopt, lay);
+            auto copy1 = [&](const vk::Vulkan& vk, vk::CommandBuffer& cb) {
+                cb.copyImage(vk,
+                    {
+                        makeBlitBarrier(src.handle(),
+                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                        makeBlitBarrier(dst.handle(),
+                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                    },
+                    { src.handle(), dst.handle() },
+                    {1, 1},
+                    {});
+                (void)dstQ;
+            };
+            submitDmaTimed(state, "local-1x1-copy-1", copy1);
+            submitDmaTimed(state, "local-1x1-copy-2", copy1);
+            vk::Image srcF(dvk, ext, fmt,
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                std::nullopt, std::nullopt, lay);
+            vk::Image dstF(dvk, ext, fmt,
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                std::nullopt, std::nullopt, lay);
+            auto copyF = [&](const vk::Vulkan& vk, vk::CommandBuffer& cb) {
+                cb.copyImage(vk,
+                    {
+                        makeBlitBarrier(srcF.handle(),
+                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                        makeBlitBarrier(dstF.handle(),
+                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                    },
+                    { srcF.handle(), dstF.handle() },
+                    ext,
+                    {});
+            };
+            submitDmaTimed(state, "local-full-copy-1", copyF);
+            submitDmaTimed(state, "local-full-copy-2", copyF);
+            submitDmaTimed(state, "empty-after-local", empty);
+        } catch (const std::exception& e) {
+            dbg("dma-in probe local copy failed: %s", e.what());
+        }
+    }
+
     bool ensureDmaIn(ls::ipc::StreamState& state, const vk::Vulkan& presentVk) {
         if (state.dmaVk)
             return true;
@@ -296,6 +439,28 @@ void dbg(const char* fmt, ...) {
                 ? dvk.transferCmdPoolHandle() : VK_NULL_HANDLE;
             state.dmaCb.emplace(dvk, pool);
             state.dmaFence.emplace(dvk, true);
+            {
+                VkPhysicalDeviceProperties2 props{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                };
+                dvk.fi().GetPhysicalDeviceProperties2(dvk.physdev(), &props);
+                g_dmaHopTs.periodNs = props.properties.limits.timestampPeriod;
+                const VkQueryPoolCreateInfo qi{
+                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
+                    .queryCount = 2,
+                };
+                const auto qres = dvk.df().CreateQueryPool(dvk.dev(), &qi,
+                    VK_NULL_HANDLE, &g_dmaHopTs.pool);
+                if (qres != VK_SUCCESS)
+                    g_dmaHopTs.pool = VK_NULL_HANDLE;
+                g_dmaHopTs.getCal = reinterpret_cast<PFN_vkGetCalibratedTimestampsEXT>(
+                    dvk.fi().GetDeviceProcAddr(dvk.dev(), "vkGetCalibratedTimestampsEXT"));
+                dbg("dma-in timestamps period %.3f ns/tick pool=%d cal=%d",
+                    g_dmaHopTs.periodNs,
+                    g_dmaHopTs.pool != VK_NULL_HANDLE,
+                    g_dmaHopTs.getCal != nullptr);
+            }
             dbg("dma-in device ready (no gfx)");
             return true;
         } catch (const std::exception& e) {
@@ -317,6 +482,11 @@ void dbg(const char* fmt, ...) {
         // fences on the share (~31 ms) and couples DMA-in to render-GPU gfx.
         auto& dvk = *state.dmaVk;
         const VkExtent2D ext{ state.width, state.height };
+        static bool probed = false;
+        if (!probed) {
+            probed = true;
+            probeDmaInQueue(state, ext, state.captureFormat);
+        }
         const vk::ImageLayout shareLay{
             .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
                 ? vk::ImageMode::Linear : vk::ImageMode::DrmModifier,
@@ -357,6 +527,11 @@ void dbg(const char* fmt, ...) {
         const uint32_t dstQ = dvk.hasTransferQueue()
             ? dvk.transferQueueFamilyIndex() : dvk.queueFamilyIndex();
         cb.begin(dvk);
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
+            cb.resetQueryPool(dvk, g_dmaHopTs.pool, 0, 2);
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
+            dvk.df().CmdWriteTimestamp(cb.handle(),
+                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_dmaHopTs.pool, 0);
         cb.copyImage(dvk,
             {
                 makeBlitBarrier(state.dmaSrc.at(sidx)->handle(),
@@ -370,16 +545,50 @@ void dbg(const char* fmt, ...) {
             { state.dmaSrc.at(sidx)->handle(), state.dmaDst.at(sidx)->handle() },
             ext,
             {});
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
+            dvk.df().CmdWriteTimestamp(cb.handle(),
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_dmaHopTs.pool, 1);
         cb.end(dvk);
         VkQueue q = dvk.hasTransferQueue() ? dvk.transferQueueHandle() : dvk.queue();
         cb.submit(dvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
             state.dmaFence->handle(), q);
         const auto t0 = Clock::now();
+        uint64_t calDev0 = 0;
+        const bool haveCal0 = sampleCalDevice(dvk, calDev0);
         (void)state.dmaFence->wait(dvk, 50ULL * 1000 * 1000);
+        const auto t1 = Clock::now();
+        uint64_t calDev1 = 0;
+        const bool haveCal1 = sampleCalDevice(dvk, calDev1);
+        uint64_t qv[2] = {0, 0};
+        bool haveQ = false;
+        if (g_dmaHopTs.pool != VK_NULL_HANDLE) {
+            try {
+                haveQ = cb.getQueryPoolResults(dvk, g_dmaHopTs.pool, 0, 2, qv, true);
+            } catch (const std::exception& e) {
+                dbg("dma-in timestamp read failed: %s", e.what());
+            }
+        }
         static int nHop = 0;
         if (nHop < 24) {
-            dbg("dma-in hop slot %u wall %.3f ms", sidx,
-                elapsedUs(t0, Clock::now()) / 1000.0);
+            const double wallMs = elapsedUs(t0, t1) / 1000.0;
+            double copyMs = -1.0;
+            double parkMs = -1.0;
+            if (haveQ) {
+                copyMs = (static_cast<double>(qv[1]) - static_cast<double>(qv[0]))
+                    * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
+                if (haveCal0) {
+                    parkMs = (static_cast<double>(qv[0]) - static_cast<double>(calDev0))
+                        * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
+                } else {
+                    parkMs = wallMs - copyMs;
+                }
+            }
+            dbg("dma-in hop slot %u wall %.3f ms copy %.3f ms park %.3f ms "
+                "q0=%llu q1=%llu cal0=%d cal1=%d",
+                sidx, wallMs, copyMs, parkMs,
+                static_cast<unsigned long long>(qv[0]),
+                static_cast<unsigned long long>(qv[1]),
+                haveCal0, haveCal1);
             ++nHop;
         }
         return state.dmaDstFds.at(sidx);

@@ -322,6 +322,8 @@ namespace {
                     << queryDeviceName(fi, physdev) << "', dual-gpu mode disabled\n";
             }
         }
+        if (hasDeviceExtension(fi, physdev, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
+            requestedExtensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
         std::cerr << "lsfg-vk: enabling device extensions:";
         for (const auto* ext : requestedExtensions)
             std::cerr << ' ' << ext;

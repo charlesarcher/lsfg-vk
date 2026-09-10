@@ -2,12 +2,14 @@
 
 #include "lsfg-vk-layer/isolated_swapchain.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/ipc/protocol.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
+#include <unistd.h>
 #include <vector>
 
 namespace lsfgvk::layer {
@@ -63,6 +65,9 @@ void destroyIsolated(const vk::Vulkan& vk, VkSwapchainKHR handle) {
         return;
     if (it->second.icdAcqSem != VK_NULL_HANDLE)
         vk.df().DestroySemaphore(vk.dev(), it->second.icdAcqSem, nullptr);
+    for (int fd : it->second.exportFds)
+        if (fd >= 0)
+            ::close(fd);
     g_isolated.erase(it);
     g_tombstones.insert(handle);
 }
@@ -71,7 +76,11 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
     IsolatedSwapchain iso;
     iso.format = info.imageFormat;
     iso.extent = info.imageExtent;
-    const uint32_t count = std::max(3u, info.minImageCount + 1);
+    uint32_t count = std::max(3u, info.minImageCount + 1);
+    const bool exportIsolated = std::getenv("LSFGVK_EXPORT_ISOLATED")
+        && std::getenv("LSFGVK_EXPORT_ISOLATED")[0] == '1';
+    if (exportIsolated)
+        count = static_cast<uint32_t>(ls::ipc::STAGING_RING_DEPTH);
     const VkImageUsageFlags usage = info.imageUsage
         | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT
         | VK_IMAGE_USAGE_TRANSFER_SRC_BIT
@@ -85,11 +94,20 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
         shareFams.push_back(g_signalFamily);
     const VkSharingMode sharing = shareFams.size() > 1
         ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    vk::ImageLayout lay{};
+    if (exportIsolated) {
+        lay.mode = vk::ImageMode::Linear;
+        lay.hostVisible = true;
+    }
     for (uint32_t i = 0; i < count; ++i) {
         iso.images.emplace_back(vk, info.imageExtent, info.imageFormat, usage,
-            std::nullopt, std::nullopt, vk::ImageLayout{}, sharing, shareFams);
+            std::nullopt, std::nullopt, lay, sharing, shareFams);
         iso.handles.push_back(iso.images.back().handle());
         iso.recycleFences.emplace_back(vk, true); // SIGNALED: first acquires pass
+        if (exportIsolated) {
+            auto exp = iso.images.back().exportDmaBuf(vk);
+            iso.exportFds.push_back(exp.fd);
+        }
     }
 
     VkQueue q{VK_NULL_HANDLE};

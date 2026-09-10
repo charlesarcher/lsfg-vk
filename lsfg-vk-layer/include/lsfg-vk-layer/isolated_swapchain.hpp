@@ -31,6 +31,8 @@ struct IsolatedSwapchain {
     VkExtent2D extent{};
     uint32_t presentCount{};
     bool ipcReady{false};
+    /// dma-buf fds for isolated images when created as exchange (not Opaque).
+    std::vector<int> exportFds;
 };
 
 VkSwapchainKHR allocIsolatedHandle();

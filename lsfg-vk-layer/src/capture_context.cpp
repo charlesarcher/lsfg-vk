@@ -28,13 +28,151 @@
 #include <vector>
 
 #include <cerrno>
+#include <dirent.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <unistd.h>
+#include <xf86drm.h>
+#include <libdrm/amdgpu.h>
+#include <libdrm/amdgpu_drm.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 #include <vulkan/vulkan_core.h>
 
 using namespace lsfgvk::layer;
 using namespace ls::ipc;
+
+namespace {
+bool exportIsolatedOn() {
+    const char* e = std::getenv("LSFGVK_EXPORT_ISOLATED");
+    return e && e[0] == '1';
+}
+int existingRenderFd() {
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (!dir)
+        return -1;
+    int found = -1;
+    while (dirent* e = ::readdir(dir)) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/self/fd/%s", e->d_name);
+        char link[128]{};
+        const ssize_t n = ::readlink(path, link, sizeof(link) - 1);
+        if (n > 0 && std::strstr(link, "renderD") != nullptr) {
+            found = std::atoi(e->d_name);
+            if (found > 2)
+                break;
+        }
+    }
+    ::closedir(dir);
+    return found;
+}
+
+int openRenderFdForDevice(const vk::Vulkan& vk) {
+    VkPhysicalDeviceDrmPropertiesEXT drmProp{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT
+    };
+    VkPhysicalDeviceProperties2 props{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+        .pNext = &drmProp
+    };
+    vk.fi().GetPhysicalDeviceProperties2(vk.physdev(), &props);
+    if (!drmProp.hasRender)
+        throw ls::error("VkPhysicalDeviceDrmPropertiesEXT hasRender=0");
+    DIR* dir = ::opendir("/dev/dri");
+    if (!dir)
+        throw ls::error("opendir /dev/dri failed");
+    int out = -1;
+    std::string path;
+    while (dirent* e = ::readdir(dir)) {
+        if (std::strncmp(e->d_name, "renderD", 7) != 0)
+            continue;
+        path = std::string("/dev/dri/") + e->d_name;
+        struct stat st{};
+        if (::stat(path.c_str(), &st) != 0)
+            continue;
+        if (static_cast<int>(gnu_dev_major(st.st_rdev)) == drmProp.renderMajor
+                && static_cast<int>(gnu_dev_minor(st.st_rdev)) == drmProp.renderMinor) {
+            out = ::open(path.c_str(), O_RDWR | O_CLOEXEC);
+            break;
+        }
+    }
+    ::closedir(dir);
+    if (out < 0)
+        throw ls::error("open matching render node failed maj="
+            + std::to_string(drmProp.renderMajor) + " min="
+            + std::to_string(drmProp.renderMinor));
+    std::cerr << "lsfg-vk: explicit-sync dest node=" << path
+        << " maj=" << drmProp.renderMajor
+        << " min=" << drmProp.renderMinor << "\n";
+    return out;
+}
+
+int allocExplicitGttDmaBuf(const vk::Vulkan& vk, uint64_t size) {
+    static amdgpu_device_handle adev = nullptr;
+    if (!adev) {
+        const int dfd = openRenderFdForDevice(vk);
+        uint32_t maj = 0, min = 0;
+        const int ir = amdgpu_device_initialize(dfd, &maj, &min, &adev);
+        if (ir != 0 || !adev) {
+            const int e = errno;
+            ::close(dfd);
+            throw ls::error(std::string("amdgpu_device_initialize ir=")
+                + std::to_string(ir) + " errno=" + std::to_string(e));
+        }
+    }
+    amdgpu_bo_alloc_request req{};
+    req.alloc_size = size;
+    req.phys_alignment = 4096;
+    req.preferred_heap = AMDGPU_GEM_DOMAIN_GTT;
+    req.flags = AMDGPU_GEM_CREATE_EXPLICIT_SYNC
+        | AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED;
+    amdgpu_bo_handle bo{};
+    int r = amdgpu_bo_alloc(adev, &req, &bo);
+    if (r != 0)
+        throw ls::error("amdgpu_bo_alloc EXPLICIT_SYNC GTT failed");
+    struct amdgpu_bo_info binfo{};
+    if (amdgpu_bo_query_info(bo, &binfo) == 0) {
+        std::cerr << "lsfg-vk: dest alloc_flags=0x" << std::hex
+            << binfo.alloc_flags << std::dec
+            << " explicit="
+            << !!(binfo.alloc_flags & AMDGPU_GEM_CREATE_EXPLICIT_SYNC)
+            << "\n";
+    }
+    uint32_t rawFd = 0;
+    r = amdgpu_bo_export(bo, amdgpu_bo_handle_type_dma_buf_fd, &rawFd);
+    if (r != 0)
+        throw ls::error("amdgpu_bo_export dma-buf failed");
+    return static_cast<int>(rawFd);
+}
+
+bool gemIsExplicitSync(int dmaFd) {
+    const int drm = existingRenderFd();
+    if (drm < 0 || dmaFd < 0)
+        return false;
+    drm_prime_handle ph{};
+    ph.fd = dmaFd;
+    if (::drmIoctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
+        std::cerr << "lsfg-vk: dest GEM FD_TO_HANDLE errno=" << errno << "\n";
+        return false;
+    }
+    drm_amdgpu_gem_create_in info{};
+    drm_amdgpu_gem_op op{};
+    op.handle = ph.handle;
+    op.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
+    op.value = reinterpret_cast<uint64_t>(&info);
+    const int ir = ::drmIoctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
+    const bool expl = (ir == 0)
+        && (info.domain_flags & AMDGPU_GEM_CREATE_EXPLICIT_SYNC);
+    std::cerr << "lsfg-vk: dest GEM get=" << ir
+        << " domains=0x" << std::hex << info.domains
+        << " flags=0x" << info.domain_flags << std::dec
+        << " explicit=" << expl << "\n";
+    return expl;
+}
+}
 
 struct lsfgvk::layer::CopyHop {
     struct Job {
@@ -395,17 +533,42 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 && std::getenv("LSFGVK_LOCAL_COPY")[0] == '1')
             || (std::getenv("LSFGVK_NO_IMPORT")
                 && std::getenv("LSFGVK_NO_IMPORT")[0] == '1');
-        if (this->fake) {
+        if (this->fake && !exportIsolatedOn()) {
             this->localImages.reserve(STAGING_RING_DEPTH);
             const VkImageUsageFlags localUsage =
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                 | VK_IMAGE_USAGE_SAMPLED_BIT;
             this->exchangeLayout.hostVisible = true;
             this->dmaBufSent.fill(false);
+            if (this->exchangeLayout.rowPitch == 0)
+                this->exchangeLayout.rowPitch =
+                    (this->info.extent.width * 4u + 255u) / 256u * 256u;
+            const uint64_t gemBytes =
+                (static_cast<uint64_t>(this->exchangeLayout.rowPitch)
+                    * this->info.extent.height + 4095ull) & ~4095ull;
             for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
-                this->localImages.emplace_back(vk, this->info.extent,
-                    VK_FORMAT_R8G8B8A8_UNORM, localUsage,
-                    std::nullopt, std::nullopt, this->exchangeLayout);
+                int gemFd = -1;
+                try {
+                    gemFd = allocExplicitGttDmaBuf(vk, gemBytes);
+                } catch (const std::exception& e) {
+                    std::cerr << "lsfg-vk: explicit-sync dest alloc failed: "
+                        << e.what() << "\n";
+                }
+                if (gemFd >= 0) {
+                    (void)gemIsExplicitSync(gemFd);
+                    const int imp = ::dup(gemFd);
+                    ::close(gemFd);
+                    gemFd = -1;
+                    if (imp < 0)
+                        throw ls::error("dup() failed before dest import");
+                    this->localImages.emplace_back(vk, this->info.extent,
+                        VK_FORMAT_R8G8B8A8_UNORM, localUsage,
+                        imp, std::nullopt, this->exchangeLayout);
+                } else {
+                    this->localImages.emplace_back(vk, this->info.extent,
+                        VK_FORMAT_R8G8B8A8_UNORM, localUsage,
+                        std::nullopt, std::nullopt, this->exchangeLayout);
+                }
                 auto exp = this->localImages.back().exportDmaBuf(vk);
                 this->localExportFds.at(i) = exp.fd;
                 VkMemoryFdPropertiesKHR fp{
@@ -420,8 +583,21 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                     << " pitch=" << exp.rowPitch
                     << " size=" << exp.allocationSize << "\n";
             }
+            {
+                FILE* hf = std::fopen("/tmp/lsfg_dest_fds", "w");
+                if (hf) {
+                    for (size_t si = 0; si < STAGING_RING_DEPTH; ++si)
+                        std::fprintf(hf, "%d\n", this->localExportFds.at(si));
+                    std::fclose(hf);
+                }
+            }
             if (this->localCopyOnly)
                 std::cerr << "lsfg-vk: capture dst=render-owned dma-buf\n";
+        }
+        if (this->fake && exportIsolatedOn()) {
+            this->dmaBufSent.fill(false);
+            this->localCopyOnly = true;
+            std::cerr << "lsfg-vk: capture dst=isolated-image dma-buf (no dest)\n";
         }
         if (this->fake && this->hostImages.empty() && this->shmMaps.at(0)) {
             const VkDeviceSize hostSize = this->hostAllocSize
@@ -777,6 +953,28 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         return res;
     }
     phaseLog("slot selected");
+    if (exportIsolatedOn()) {
+        if (imageIdx >= this->slotFree.size() || !this->slotFree.at(imageIdx)) {
+            this->droppedCaptures++;
+            phaseLog("isolated-export skip (image slot busy)");
+            if (!semaphores.empty()) {
+                std::vector<VkPipelineStageFlags> stages(semaphores.size(),
+                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+                const VkSubmitInfo submit{
+                    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                    .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+                    .pWaitSemaphores = semaphores.data(),
+                    .pWaitDstStageMask = stages.data(),
+                };
+                VkQueue sig = this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue;
+                const auto res = vk.df().QueueSubmit(sig, 1, &submit, VK_NULL_HANDLE);
+                if (res != VK_SUCCESS)
+                    throw ls::vulkan_error(res, "vkQueueSubmit() failed");
+            }
+            return VK_SUCCESS;
+        }
+        slot = imageIdx;
+    }
 
     if (imageIdx >= this->info.images.size())
         throw ls::error("swapchain image index out of range");
@@ -786,10 +984,6 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         && !this->localImages.empty();
     const VkImage srcImage = dummySrc
         ? this->localImages.front().handle() : this->info.images.at(imageIdx);
-    const vk::Image& dstImage = !this->hostImages.empty()
-        ? this->hostImages.at(slot)
-        : ((this->localCopyOnly && !this->localImages.empty())
-            ? this->localImages.at(slot) : this->stagingImages.at(slot));
     const vk::Semaphore& presentSem = this->presentSemaphores.at(slot);
 
     // Empty-CB + no fence holds 141 fps. A fence on that same submit is 53.
@@ -825,7 +1019,11 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     cmdbuf.begin(vk);
     static const bool emptyFrame = std::getenv("LSFGVK_EMPTY_FRAME")
         && std::getenv("LSFGVK_EMPTY_FRAME")[0] == '1';
-    if (!emptyFrame) {
+    if (!emptyFrame && !exportIsolatedOn()) {
+    const vk::Image& dstImage = !this->hostImages.empty()
+        ? this->hostImages.at(slot)
+        : ((this->localCopyOnly && !this->localImages.empty())
+            ? this->localImages.at(slot) : this->stagingImages.at(slot));
     cmdbuf.copyImage(vk,
         {
             barrierHelper(srcImage,
@@ -889,6 +1087,30 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         throw ls::error(std::string("lsfg-vk: external stream error: capture submit failed: ") + e.what(), e);
     }
     phaseLog("blit submitted");
+    static int nIsoResv = 0;
+    if (nIsoResv < 16 && isIsolated(swapchain)) {
+        auto& iso = isolatedAt(swapchain);
+        if (imageIdx < iso.exportFds.size() && iso.exportFds.at(imageIdx) >= 0) {
+            dma_buf_export_sync_file exp{};
+            exp.flags = DMA_BUF_SYNC_WRITE;
+            exp.fd = -1;
+            if (::ioctl(iso.exportFds.at(imageIdx), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) == 0) {
+                pollfd p{};
+                p.fd = exp.fd;
+                p.events = POLLIN;
+                const int pr = ::poll(&p, 1, 0);
+                std::cerr << "lsfg-vk: isolated img " << imageIdx
+                    << " WRITE poll0=" << pr << " revents=0x" << std::hex
+                    << p.revents << std::dec << "\n";
+                ::close(exp.fd);
+                ++nIsoResv;
+            } else {
+                std::cerr << "lsfg-vk: isolated img " << imageIdx
+                    << " WRITE export errno=" << errno << "\n";
+                ++nIsoResv;
+            }
+        }
+    }
     if (this->bVk && this->bEmptyCb.has_value() && this->bEmptyFence.has_value()) {
         auto& bvk = *this->bVk;
         if (this->bEmptyFence->wait(bvk, 0)
@@ -966,7 +1188,34 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // send FRAME (owns fd on success, closes on failure path via Connection)
     try {
         int sendFd = syncFd;
-        if (this->shmMaps.at(0)) {
+        if (exportIsolatedOn() && this->fake && isIsolated(swapchain)) {
+            auto& iso = isolatedAt(swapchain);
+            if (imageIdx < iso.exportFds.size() && iso.exportFds.at(imageIdx) >= 0) {
+                if (!this->dmaBufSent.at(slot)) {
+                    sendFd = ::dup(iso.exportFds.at(imageIdx));
+                    if (sendFd < 0)
+                        sendFd = syncFd;
+                    else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+                    this->dmaBufSent.at(slot) = true;
+                    std::cerr << "lsfg-vk: FRAME carries isolated-image dma-buf slot="
+                        << slot << " img=" << imageIdx << " fd=" << sendFd << "\n";
+                } else {
+                    dma_buf_export_sync_file exp{};
+                    exp.flags = DMA_BUF_SYNC_WRITE;
+                    exp.fd = -1;
+                    if (::ioctl(iso.exportFds.at(imageIdx),
+                            DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) == 0) {
+                        sendFd = exp.fd;
+                        if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
+                    }
+                    static bool loggedW = false;
+                    if (!loggedW) {
+                        loggedW = true;
+                        std::cerr << "lsfg-vk: FRAME carries isolated WRITE fence\n";
+                    }
+                }
+            }
+        } else if (this->shmMaps.at(0)) {
             // POSIX shm already has the pixels; keep the 9070 capture sync-fd
         } else if (this->fake && slot < this->bExportFds.size()
                 && this->bExportFds.at(slot) >= 0) {
