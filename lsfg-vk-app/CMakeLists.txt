@@ -1,5 +1,6 @@
 set(APP_SOURCES
     "src/main.cpp"
+    "src/gui.cpp"
     "src/stream.cpp"
     "src/presentation.cpp"
     "src/hud.cpp"
@@ -13,7 +14,7 @@ add_executable(lsfg-vk-app ${APP_SOURCES})
 # exchange layout, import the game's staging images and open real cross-device
 # frame-generation contexts (wsi/output still belong to later tasks).
 target_link_libraries(lsfg-vk-app
-    PUBLIC lsfg-vk-common lsfg-vk-backend)
+    PUBLIC lsfg-vk-common lsfg-vk-backend imgui)
 
 # X11/xcb (task 7a): the SurfaceBackend X11 implementation links the xcb and
 # xcb-randr client libraries. Declared here so the build fails loudly if the

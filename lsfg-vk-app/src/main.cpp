@@ -14,6 +14,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lsfg-vk-app/stream.hpp"
+#include "gui.hpp"
 #include "lsfg-vk-app/presentation.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
@@ -176,10 +177,11 @@ namespace {
             std::string("lsfg-vk-app - receiving side of one-way external dual-GPU frame generation.\n\n")
             + "USAGE:\n    " + prog + " [OPTIONS]\n\n"
             + "OPTIONS:\n"
-            + "    -p, --profile <name>    REQUIRED: profile selecting the processing GPU"
-            + "    -o, --output <name>     OPTIONAL: output name for later presentation tasks"
-            + "    -s, --session <type>    OPTIONAL: WSI backend: x11, wayland, auto (default: auto)"
-            + "    -v, --verbose           Verbose per-frame logging"
+            + "    -p, --profile <name>    profile selecting the processing GPU (required in console mode)\n"
+            + "    -u, --ui                Launch graphical Dear ImGui control panel\n"
+            + "    -o, --output <name>     OPTIONAL: output name for later presentation tasks\n"
+            + "    -s, --session <type>    OPTIONAL: WSI backend: x11, wayland, auto (default: auto)\n"
+            + "    -v, --verbose           Verbose per-frame logging\n"
             + "    -h, --help              Show this help\n";
         std::cerr << text;
     }
@@ -188,25 +190,28 @@ namespace {
         std::optional<std::string> profile;
         std::optional<std::string> output;
         std::optional<std::string> session;
+        bool ui{false};
         bool verbose{false};
     };
 
-    /// parse CLI args; --profile is REQUIRED (hard-named error if absent)
+    /// parse CLI args; --profile is REQUIRED (unless --ui is specified)
     Options parseArgs(int argc, char** argv) {
         Options opts{};
 
-        const std::array<option, 5> GETOPT {{
+        const std::array<option, 6> GETOPT {{
             { "profile",   required_argument, nullptr, 'p' },
+            { "ui",        no_argument,       nullptr, 'u' },
             { "output",    required_argument, nullptr, 'o' },
             { "session",   required_argument, nullptr, 's' },
-            { "verbose",     no_argument,       nullptr, 'v' },
-            { "help",        no_argument,       nullptr, 'h' }
+            { "verbose",   no_argument,       nullptr, 'v' },
+            { "help",      no_argument,       nullptr, 'h' }
         }};
 
         int c{};
-        while ((c = getopt_long(argc, argv, "vpo:s:h", GETOPT.data(), nullptr)) != -1) {
+        while ((c = getopt_long(argc, argv, "uvpo:s:h", GETOPT.data(), nullptr)) != -1) {
             switch (c) {
                 case 'p': opts.profile.emplace(optarg); break;
+                case 'u': opts.ui = true; break;
                 case 'o': opts.output.emplace(optarg); break;
                 case 's': opts.session.emplace(optarg); break;
                 case 'v': opts.verbose = true; break;
@@ -218,8 +223,8 @@ namespace {
             }
         }
 
-        if (!opts.profile.has_value()) {
-            std::cerr << "lsfg-vk-app: --profile <name> is required\n\n";
+        if (!opts.ui && !opts.profile.has_value()) {
+            std::cerr << "lsfg-vk-app: --profile <name> is required (or use --ui for graphical mode)\n\n";
             usage(*argv);
             std::exit(EXIT_FAILURE);
         }
@@ -278,6 +283,13 @@ namespace {
 int main(int argc, char** argv) {
     try {
         const Options opts = parseArgs(argc, argv);
+
+        if (opts.ui) {
+            // Launch the Dear ImGui graphical control panel
+            std::cout << "lsfg-vk-app: launching Dear ImGui control panel\n";
+            return lsfgvk::gui::runGui(argc, argv);
+        }
+
         g_outputOverride = opts.output;
         if (opts.verbose)
             // task 8: -v surfaces the per-cycle [gen gen real] ordering log,

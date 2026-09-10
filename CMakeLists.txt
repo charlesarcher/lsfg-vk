@@ -48,6 +48,7 @@ if(LSFGVK_TESTING_RENDERDOC)
     add_compile_definitions(LSFGVK_TESTING_RENDERDOC)
 endif()
 
+add_subdirectory(thirdparty)
 add_subdirectory(lsfg-vk-common)
 add_subdirectory(lsfg-vk-backend)
 if(LSFGVK_BUILD_VK_LAYER)
