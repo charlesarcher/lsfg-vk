@@ -108,8 +108,8 @@ interpolation (see [Configuration](Configuration.md)).
 The only cross-GPU traffic is the capture: one frame per cycle, game →
 doubler, one direction. The generated frames are *made on* the doubler card
 and *presented from* the doubler card — nothing ever travels back over
-PCIe. (Two-way mode instead blits the generated frames back into the
-game's swapchain: one PCIe round trip per frame.) That is also why the
+PCIe. (The removed legacy two-way mode previously blitted generated frames back into the
+game's swapchain, suffering an expensive PCIe round trip per frame.) That is also why the
 display cable goes into the doubler card: the monitor scans out of the
 card that does the presenting. (If the monitor were on the game card, the
 compositor would silently copy the app's window to the other card — it
@@ -401,42 +401,14 @@ second. With `multiplier = 2` it reads roughly `N/2N` (e.g. `57/114`,
 - Note: the HUD is the app's own overlay in the app's window — it is *not*
   present in the game's window underneath.
 
-## Two-way mode (the alternative)
+## Legacy two-way mode (removed)
 
-`presentation = "game"` (or the key omitted) keeps presentation on the **game's
-own GPU**: frames are dma-buf-exported to the processing GPU, generated there,
-and blitted back into the game's swapchain. The `lsfg-vk-app` is not involved.
-
-**Cabling difference: the display must be plugged into the render/game GPU.**
-On this rig that means monitor → 9070 XT, which is not how the machine is
-cabled, so the only testable two-way cell here is the reverse pairing
-(game on the 9060 XT, frame generation on the 9070 XT). Verified:
-
-```toml
-[[profile]]
-name = "vkcube-twoway"
-active_in = "vkcube"
-gpu = "AMD Radeon RX 9070 XT (RADV GFX1201)"   # processing GPU (headless here)
-multiplier = 2                                  # honored in two-way mode
-```
-
-```bash
-VK_LAYER_PATH=/tmp/opencode/layer-test \
-VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation \
-LSFGVK_CONFIG=/tmp/conf-twoway.toml \
-vkcube --gpu_number 0 --present_mode fifo --wsi xcb
-```
-
-Verified log lines:
-
-```
-lsfg-vk: processing on 'AMD Radeon RX 9070 XT (RADV GFX1201)' [uuid 00000000040000000000000000000000], dma-buf: yes, drm-modifier-images: yes
-lsfg-vk: processing on '00000000040000000000000000000000' (game on 'AMD Radeon RX 9060 XT (RADV GFX1200)')
-```
-
-Two-way costs a return PCIe trip per frame (see the bandwidth table in
-[Configuration](Configuration.md)); one-way eliminates it entirely — which is
-why one-way is the mode for the 9700XT-render / 9600XT-display topology.
+The earlier experimental two-way mode (`presentation = "game"` with a secondary GPU)
+attempted to return generated frames back to the game's swapchain across PCIe.
+That architecture proved to be a performance dead end (imposing return PCIe traffic,
+implicit synchronization lockups, and high latency) and has been removed.
+Dual-GPU frame generation is exclusively one-way (`presentation = "external"`),
+while `presentation = "game"` remains strictly for single-GPU internal doubling.
 
 ## Frame-doubling a real game (Steam / Proton)
 

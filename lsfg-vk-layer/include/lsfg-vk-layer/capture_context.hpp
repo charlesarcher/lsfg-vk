@@ -86,7 +86,6 @@ namespace lsfgvk::layer {
         VkFence lastImageGateFence{VK_NULL_HANDLE}; // cb-reuse gate when fake
 
         // vulkan objects (created on the game device)
-        std::vector<vk::Image> stagingImages; // imported B staging (two-way / IMPORT_STAGING)
         std::vector<vk::Image> localImages;   // 9070-owned capture dest; dma-buf exported on FRAME
         std::vector<vk::Image> hostImages;    // LINEAR images bound to host memory
         std::unique_ptr<vk::Vulkan> bVk;      // same-process 9060 device (LSFGVK_DUAL_HOST)

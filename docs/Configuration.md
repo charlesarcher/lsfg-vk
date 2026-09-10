@@ -22,20 +22,11 @@ Next is a list of all available **profile** configuration options:
 (Default: `false`)
 - **Pacing Mode / `pacing`**: This option is explained in greater detail below. Supported values are **None / `none`**.
 - **GPU / `gpu`**: The GPU used for frame generation (the "processing GPU"). If left unset, frames are processed on the game's own GPU instead of an arbitrary first device found, which matches single-GPU behavior exactly. When set to a different GPU, lsfg-vk enters dual-GPU mode: the game keeps rendering and presenting on its own GPU, while the entire frame generation pipeline runs on the selected device. Frames are copied between both GPUs over PCIe, which costs bandwidth and adds latency:
-- **Presentation / `presentation`**: Controls where generated frames are presented. **`game`** (default) — the layer presents generated frames back into the game's own swapchain on the game GPU (two-way mode). **`external`** — the layer hands frames to a separate `lsfg-vk-app` process running on the processing GPU, which presents them on its own swapchain (one-way mode). External mode requires `gpu` to be set (the processing GPU must be explicit). When `presentation = external`, the game GPU never imports frames back; all presentation happens on the processing GPU.
+- **Presentation / `presentation`**: Controls where generated frames are presented. **`game`** (default for single-GPU) — the layer presents generated frames internally back into the game's own swapchain on the game GPU. **`external`** — the layer hands frames to a separate `lsfg-vk-app` process running on the processing GPU, which presents them on its own swapchain (one-way dual-GPU mode). External mode requires `gpu` to be set (the processing GPU must be explicit). Dual-GPU configurations require `presentation = external` (the legacy two-way mode has been removed); the game GPU never imports frames back, and all display presentation happens on the processing GPU.
 - **Output / `output`**: Connector name for the external presentation swapchain (only used when `presentation = external`). Matches the DRM connector name exactly (e.g. `HDMI-A-3`, `DP-1`). If omitted, the primary/active output is selected automatically. Per-backend semantics: **Wayland** — matches the `xdg_output` logical name (e.g. `HDMI-A-3`); **X11** — matches the RandR output name (e.g. `HDMI-A-3`). An invalid name produces a named error listing available outputs.
 
-  | Scenario | Measured PCIe traffic | Link requirement |
-  | --- | --- | --- |
-  | 1440p SDR, 60 fps, multiplier 2 | ~1.9 GB/s (copybench) | Any modern PCIe link suffices |
-  | 1440p SDR, 240 fps, multiplier 4 | ~7.6 GB/s (copybench) | Requires a x8-class link or better |
-  | Added latency (Windows community measurements) | n/a | ~3-5 ms |
-  | Added latency (measured on this rig) | n/a | 0.8–9.4 ms (see analysis.md) |
-
   A step-by-step walkthrough with tested examples is available in the
-  [Dual-GPU Setup Guide](Dual-GPU-Guide.md).
-
-  Unlike on Windows, presentation always stays on the render GPU: the game's WSI swapchain is bound to its own device and surface, so generated frames must travel back over PCIe (this is the core premise of upstream issue #159). You can identify a GPU through its name (e.g. `NVIDIA GeForce RTX 3080`), uppercase-only ID (e.g. `0x10DE:0x2C02`) or PCI bus ID (e.g. `3:0.0`). Changing this option requires an application restart, because the processing GPU is fixed while the process runs. On NVIDIA, dual-GPU mode is expected to work through the standard Linux dma-buf mechanism (`VK_EXT_external_memory_dma_buf`, supported since driver 515.43.04), but it remains unverified, as no NVIDIA test hardware was available for this project.
+  [One-Way Dual-GPU Setup Guide](One-Way-Dual-GPU-Guide.md).
 
 When `presentation = external`, the `output` option selects which physical display the `lsfg-vk-app` window targets. The connector name must match exactly what the backend enumerates (Wayland: `xdg_output` name; X11: RandR name). Run `lsfg-vk-app --profile <name> --session wayland` (or `x11`) with an invalid `--output` to see the list of available names.
 

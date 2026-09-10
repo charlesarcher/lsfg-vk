@@ -492,7 +492,6 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     this->exchangeLayout = layout;
 
     try {
-        this->stagingImages.reserve(STAGING_RING_DEPTH);
         for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
             auto msg = this->ipcConn->receive(std::chrono::milliseconds(10000));
             if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
@@ -507,41 +506,31 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             const int fd = this->ipcConn->takeReceivedFd();
             if (fd < 0)
                 throw ls::error("lsfg-vk: external stream error: STAGING arrived without its fd");
-            const bool importStaging = (std::getenv("LSFGVK_IMPORT_STAGING")
-                    && std::getenv("LSFGVK_IMPORT_STAGING")[0] == '1')
-                || (!this->fake && !(std::getenv("LSFGVK_NO_IMPORT")
-                    && std::getenv("LSFGVK_NO_IMPORT")[0] == '1'));
-            if (!importStaging) {
-                static const bool posixShm = std::getenv("LSFGVK_POSIX_SHM") == nullptr
-                    || std::getenv("LSFGVK_POSIX_SHM")[0] != '0';
-                if (!posixShm) {
-                    ::close(fd);
-                    continue;
-                }
-                const VkDeviceSize hostSize = std::max<VkDeviceSize>(
-                    negotiated.allocationSize,
-                    static_cast<VkDeviceSize>(layout.rowPitch) * extent.height);
-                const size_t mapBytes = static_cast<size_t>(hostSize) + 4096;
-                void* map = ::mmap(nullptr, mapBytes,
-                    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+            static const bool posixShm = std::getenv("LSFGVK_POSIX_SHM") == nullptr
+                || std::getenv("LSFGVK_POSIX_SHM")[0] != '0';
+            if (!posixShm) {
                 ::close(fd);
-                if (map == MAP_FAILED) {
-                    std::cerr << "lsfg-vk: posix-shm mmap failed slot " << i
-                        << " errno=" << errno << "\n";
-                    continue;
-                }
-                this->shmMaps.at(i) = map;
-                this->shmSeq.at(i) = reinterpret_cast<uint32_t*>(
-                    static_cast<char*>(map) + static_cast<size_t>(hostSize));
-                this->hostAllocSize = hostSize;
-                std::cerr << "lsfg-vk: posix-shm mmap slot " << i
-                    << " size=" << hostSize << "\n";
                 continue;
             }
-            // import consumes the fd on success; on failure the image closes it
-            this->stagingImages.emplace_back(vk, extent, format,
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                fd /*importFd*/, std::nullopt /*exportFd*/, layout);
+            const VkDeviceSize hostSize = std::max<VkDeviceSize>(
+                negotiated.allocationSize,
+                static_cast<VkDeviceSize>(layout.rowPitch) * extent.height);
+            const size_t mapBytes = static_cast<size_t>(hostSize) + 4096;
+            void* map = ::mmap(nullptr, mapBytes,
+                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            ::close(fd);
+            if (map == MAP_FAILED) {
+                std::cerr << "lsfg-vk: posix-shm mmap failed slot " << i
+                    << " errno=" << errno << "\n";
+                continue;
+            }
+            this->shmMaps.at(i) = map;
+            this->shmSeq.at(i) = reinterpret_cast<uint32_t*>(
+                static_cast<char*>(map) + static_cast<size_t>(hostSize));
+            this->hostAllocSize = hostSize;
+            std::cerr << "lsfg-vk: posix-shm mmap slot " << i
+                << " size=" << hostSize << "\n";
         }
     } catch (const ls::ipc::socket_error& e) {
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
@@ -595,13 +584,9 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             std::cerr << "lsfg-vk: capture copy on extra queue fam=" << extraFam
                       << " idx=" << extraIdx << "\n";
         }
-        const bool importStaging = (std::getenv("LSFGVK_IMPORT_STAGING")
-            && std::getenv("LSFGVK_IMPORT_STAGING")[0] == '1');
-        this->localCopyOnly = (this->fake && !importStaging)
+        this->localCopyOnly = this->fake
             || (std::getenv("LSFGVK_LOCAL_COPY")
-                && std::getenv("LSFGVK_LOCAL_COPY")[0] == '1')
-            || (std::getenv("LSFGVK_NO_IMPORT")
-                && std::getenv("LSFGVK_NO_IMPORT")[0] == '1');
+                && std::getenv("LSFGVK_LOCAL_COPY")[0] == '1');
         if (this->fake && !exportIsolatedOn()) {
             this->localImages.reserve(STAGING_RING_DEPTH);
             const VkImageUsageFlags localUsage =
@@ -967,9 +952,9 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         const auto& cmdbuf = this->captureCommandBuffers.at(0);
         cmdbuf.begin(vk);
         if (copyNoSig && imageIdx < this->info.images.size()
-                && !this->stagingImages.empty()) {
+                && !this->localImages.empty()) {
             const VkImage srcImage = this->info.images.at(imageIdx);
-            const vk::Image& dstImage = this->stagingImages.at(0);
+            const vk::Image& dstImage = this->localImages.at(0);
             cmdbuf.copyImage(vk,
                 {
                     barrierHelper(srcImage,
@@ -1142,8 +1127,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     if (!emptyFrame && !exportIsolatedOn()) {
     const vk::Image& dstImage = !this->hostImages.empty()
         ? this->hostImages.at(slot)
-        : ((this->localCopyOnly && !this->localImages.empty())
-            ? this->localImages.at(slot) : this->stagingImages.at(slot));
+        : this->localImages.at(slot);
     cmdbuf.copyImage(vk,
         {
             barrierHelper(srcImage,
