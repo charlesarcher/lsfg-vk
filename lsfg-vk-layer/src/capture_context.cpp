@@ -512,8 +512,8 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 || (!this->fake && !(std::getenv("LSFGVK_NO_IMPORT")
                     && std::getenv("LSFGVK_NO_IMPORT")[0] == '1'));
             if (!importStaging) {
-                static const bool posixShm = std::getenv("LSFGVK_POSIX_SHM")
-                    && std::getenv("LSFGVK_POSIX_SHM")[0] == '1';
+                static const bool posixShm = std::getenv("LSFGVK_POSIX_SHM") == nullptr
+                    || std::getenv("LSFGVK_POSIX_SHM")[0] != '0';
                 if (!posixShm) {
                     ::close(fd);
                     continue;
@@ -716,9 +716,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             std::cerr << "lsfg-vk: capture dst=9070-host-malloc size=" << hostSize << "\n";
             this->copyHop = std::make_unique<CopyHop>();
         }
-        const bool dualHost = (std::getenv("LSFGVK_DUAL_HOST") == nullptr
-            || std::getenv("LSFGVK_DUAL_HOST")[0] == '1')
-            && this->fake && !this->shmMaps.at(0) && !rawDmaBufOn() && !exportIsolatedOn();
+        const bool dualHost = false; // Never create a second VkDevice in game process (crashes vkd3d-proton)
         if (dualHost && this->fake && !this->shmMaps.at(0)) {
             try {
                 auto selectB = [](const vk::VulkanInstanceFuncs& fi,
@@ -1248,7 +1246,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             }
         }
     }
-    if (this->bVk && slot < this->bCbs.size() && slot < this->bFences.size()) {
+    if (false && this->bVk && slot < this->bCbs.size() && slot < this->bFences.size()) {
         auto& bvk = *this->bVk;
         if (this->bFences.at(slot).wait(bvk, 0)
                 && slot < this->bHostImages.size()

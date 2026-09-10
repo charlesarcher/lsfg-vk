@@ -1161,8 +1161,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             static uint32_t totalPresentCount = 0;
             ++totalPresentCount;
             static bool dumpedPresent = false;
-            if (!dumpedPresent && totalPresentCount >= 100 && std::getenv("LSFGVK_DUMP_PRESENT")) {
-                dumpedPresent = true;
+            static uint32_t lastDumpedSec = 0;
+            if (std::getenv("LSFGVK_DUMP_PRESENT")) {
+                const uint32_t curSec = static_cast<uint32_t>(totalPresentCount / 200);
+                if (curSec != lastDumpedSec && totalPresentCount >= 100) {
+                    lastDumpedSec = curSec;
+                    dumpedPresent = true;
                 cbFences.at((cbIdx + cbRingSize - 1) % cbRingSize).wait(vk, UINT64_MAX);
                 const size_t nb = static_cast<size_t>(extent.width) * extent.height * 4;
                 void* p = nullptr;
@@ -1206,12 +1210,20 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             }
                             std::fwrite(rgb.data(), 1, rgb.size(), out);
                             std::fclose(out);
+                            char named[128];
+                            std::snprintf(named, sizeof(named), "/tmp/lsfg-doubler-%u.ppm", lastDumpedSec);
+                            if (FILE* out2 = std::fopen(named, "wb")) {
+                                std::fprintf(out2, "P6\n%u %u\n255\n", extent.width, extent.height);
+                                std::fwrite(rgb.data(), 1, rgb.size(), out2);
+                                std::fclose(out2);
+                            }
                             std::cerr << "lsfg-vk-app: dumped full presentation swapchain image with HUD to /tmp/lsfg-doubler-presentation.ppm\n";
                         }
                     } catch (const std::exception& e) {
                         std::cerr << "lsfg-vk-app: present dump failed: " << e.what() << "\n";
                     }
                     ::free(p);
+                }
                 }
             }
             return true;

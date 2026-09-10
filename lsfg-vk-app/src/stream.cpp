@@ -293,8 +293,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         const uint64_t bytes = (static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull;
         static const bool posixShm =
             conf.presentation == ls::Presentation::External
-            && std::getenv("LSFGVK_POSIX_SHM")
-            && std::getenv("LSFGVK_POSIX_SHM")[0] == '1';
+            && (std::getenv("LSFGVK_POSIX_SHM") == nullptr
+                || std::getenv("LSFGVK_POSIX_SHM")[0] != '0');
         if (posixShm) {
         const uint64_t mapBytes = bytes + 4096ull;
         const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", MFD_CLOEXEC));
