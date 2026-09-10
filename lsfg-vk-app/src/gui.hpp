@@ -49,4 +49,8 @@ namespace lsfgvk::gui {
     /// Runs the GLFW + Dear ImGui event loop. Returns when the UI window is closed.
     int runGui(int argc, char** argv);
 
+    /// Launches the stream server worker thread driven by GUI state
+    void startServerWorker(const std::string& profileName, const std::string& sessionMode);
+    void stopServerWorker();
+
 } // namespace lsfgvk::gui

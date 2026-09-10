@@ -15,6 +15,44 @@
 namespace lsfgvk::gui {
 
     GuiState g_guiState;
+    static std::thread g_serverThread;
+    static std::atomic<bool> g_serverStop{false};
+
+    void stopServerWorker() {
+        if (g_guiState.serviceRunning.load()) {
+            g_serverStop.store(true);
+            g_guiState.serviceRunning.store(false);
+            if (g_serverThread.joinable()) {
+                g_serverThread.join();
+            }
+        }
+    }
+
+    void startServerWorker(const std::string& profileName, const std::string& sessionMode) {
+        stopServerWorker();
+        g_serverStop.store(false);
+        g_guiState.serviceRunning.store(true);
+        g_serverThread = std::thread([profileName, sessionMode]() {
+            try {
+                // Run headless server instance in background thread
+                std::string cmd = "/home/archerc/code/lsfg-vk/build/lsfg-vk-app/lsfg-vk-app -p \"" + profileName + "\"";
+                if (!sessionMode.empty() && sessionMode != "auto") {
+                    cmd += " -s " + sessionMode;
+                }
+                std::cerr << "lsfg-vk-gui: starting server: " << cmd << "\n";
+                // When g_serverStop fires or process exits, update flag
+                FILE* pipe = popen(cmd.c_str(), "r");
+                if (pipe) {
+                    char buf[256];
+                    while (!g_serverStop.load() && fgets(buf, sizeof(buf), pipe)) {
+                        // Forward server output
+                    }
+                    pclose(pipe);
+                }
+            } catch (...) {}
+            g_guiState.serviceRunning.store(false);
+        });
+    }
 
     static void setupDarkTheme() {
         ImGuiStyle& style = ImGui::GetStyle();
@@ -331,7 +369,14 @@ namespace lsfgvk::gui {
 
             ImGui::Spacing();
             if (ImGui::Button("Launch / Restart Stream Service", ImVec2(-1, 35))) {
-                g_guiState.serviceRunning.store(true);
+                std::string prof;
+                std::string sess;
+                {
+                    std::lock_guard<std::mutex> lk(g_guiState.mtx);
+                    prof = g_guiState.activeProfile;
+                    sess = g_guiState.sessionMode;
+                }
+                startServerWorker(prof, sess);
             }
             ImGui::EndChild();
 
@@ -371,6 +416,7 @@ namespace lsfgvk::gui {
         }
 
         g_guiState.shouldClose.store(true);
+        stopServerWorker();
 
         ImGui_ImplOpenGL3_Shutdown();
         ImGui_ImplGlfw_Shutdown();

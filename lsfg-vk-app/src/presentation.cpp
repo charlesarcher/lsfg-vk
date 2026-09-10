@@ -20,6 +20,7 @@
 // glibc keeps struct sigaction / sigemptyset behind __USE_POSIX; not needed here
 // but harmless. We only need poll/errno/close/getenv which are exposed.
 #include "lsfg-vk-app/presentation.hpp"
+#include "gui.hpp"
 
 #include "lsfg-vk-app/hud.hpp"
 #include "lsfg-vk-app/wsi/surface_backend.hpp"
@@ -1057,6 +1058,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             const double dt = std::chrono::duration<double>(now - statsLastTime).count();
             const uint32_t gameFps = static_cast<uint32_t>(frameCount.exchange(0) / dt);
             const uint32_t presentedFps = static_cast<uint32_t>(presentedFrames.exchange(0) / dt);
+            lsfgvk::gui::g_guiState.currentFpsReal.store(static_cast<float>(gameFps));
+            lsfgvk::gui::g_guiState.currentFpsGen.store(static_cast<float>(presentedFps));
+            lsfgvk::gui::g_guiState.streamActive.store(true);
             if (verboseEnabled())
                 std::cerr << "lsfg-vk-app: " << gameFps << " fps game, "
                           << presentedFps << " fps presented\n";
@@ -1154,6 +1158,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         Clock::now().time_since_epoch()).count());
                 const double latMs = (nowNs > capTsNs) ? (nowNs - capTsNs) / 1e6 : 0.0;
+                lsfgvk::gui::g_guiState.currentLatencyRealMs.store(static_cast<float>(latMs));
                 dbg("MEASURED LATENCY: REAL present slot %d latency %.2f ms", stagingIdx, latMs);
             }
             ++presentIdx;
@@ -1361,11 +1366,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 Clock::now().time_since_epoch()).count());
                         const double latMs = (nowNs > cur.captureTsNs) ? (nowNs - cur.captureTsNs) / 1e6 : 0.0;
+                        lsfgvk::gui::g_guiState.currentLatencyGenMs.store(static_cast<float>(latMs));
                         dbg("MEASURED LATENCY: GEN present slot %u latency %.2f ms", cur.stagingIdx, latMs);
                     }
                     ++presentIdx;
                     ++presentedFrames;
                     ++cur.nextDest;
+                    lsfgvk::gui::g_guiState.totalGenPresents.fetch_add(1);
+                    lsfgvk::gui::g_guiState.totalPresents.fetch_add(1);
                     dbg("output: GEN present dest %zu/%zu (slot %u)",
                         i, destCount, cur.stagingIdx);
                 } else if (cur.active) {
@@ -1377,6 +1385,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         if (d >= 0)
                             ::close(d);
                     cur.active = false;
+                    lsfgvk::gui::g_guiState.totalRealPresents.fetch_add(1);
+                    lsfgvk::gui::g_guiState.totalPresents.fetch_add(1);
                     dbg("output: REAL present (slot %u)", cur.stagingIdx);
                 } else if (lastShownStagingIdx >= 0) {
                     // --- HOLD-LAST: nothing newer to show ---------------------
