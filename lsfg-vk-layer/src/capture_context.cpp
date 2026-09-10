@@ -716,8 +716,9 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             std::cerr << "lsfg-vk: capture dst=9070-host-malloc size=" << hostSize << "\n";
             this->copyHop = std::make_unique<CopyHop>();
         }
-        static const bool dualHost = std::getenv("LSFGVK_DUAL_HOST")
-            && std::getenv("LSFGVK_DUAL_HOST")[0] == '1';
+        const bool dualHost = (std::getenv("LSFGVK_DUAL_HOST") == nullptr
+            || std::getenv("LSFGVK_DUAL_HOST")[0] == '1')
+            && this->fake && !this->shmMaps.at(0) && !rawDmaBufOn() && !exportIsolatedOn();
         if (dualHost && this->fake && !this->shmMaps.at(0)) {
             try {
                 auto selectB = [](const vk::VulkanInstanceFuncs& fi,
@@ -752,27 +753,24 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
                     void* p = nullptr;
                     if (::posix_memalign(&p, 4096, static_cast<size_t>(hostSize)) != 0)
-                        throw ls::error("posix_memalign dual-host A failed");
+                        throw ls::error("posix_memalign dual-host failed");
                     std::memset(p, 0, static_cast<size_t>(hostSize));
                     this->hostPtrsA.at(i) = p;
                     this->hostImages.emplace_back(vk, this->info.extent,
                         VK_FORMAT_R8G8B8A8_UNORM, hostUsage, p, hostSize);
-                    void* q = nullptr;
-                    if (::posix_memalign(&q, 4096, static_cast<size_t>(hostSize)) != 0)
-                        throw ls::error("posix_memalign dual-host B failed");
-                    std::memset(q, 0, static_cast<size_t>(hostSize));
-                    this->hostPtrsB.at(i) = q;
                     this->bHostImages.emplace_back(*this->bVk, this->info.extent,
-                        VK_FORMAT_R8G8B8A8_UNORM, hostUsage, q, hostSize);
+                        VK_FORMAT_R8G8B8A8_UNORM, hostUsage, p, hostSize);
                     this->bVramImages.emplace_back(*this->bVk, this->info.extent,
                         VK_FORMAT_R8G8B8A8_UNORM, vramUsage,
                         std::nullopt, std::nullopt, bLayout);
                     auto exp = this->bVramImages.back().exportDmaBuf(*this->bVk);
                     this->bExportFds.at(i) = exp.fd;
                 }
-                this->bEmptyCb.emplace(*this->bVk);
-                this->bEmptyFence.emplace(*this->bVk, true);
-                std::cerr << "lsfg-vk: dual-host A-malloc + B-malloc + 9060 dma-buf size="
+                for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+                    this->bCbs.emplace_back(*this->bVk);
+                    this->bFences.emplace_back(*this->bVk, true);
+                }
+                std::cerr << "lsfg-vk: zero-copy dual-host shared-malloc + 9060 dma-buf size="
                     << hostSize << "\n";
             } catch (const std::exception& e) {
                 std::cerr << "lsfg-vk: dual-host failed: " << e.what() << "\n";
@@ -846,8 +844,16 @@ CaptureContext::~CaptureContext() {
     for (int& fd : this->bExportFds) {
         if (fd >= 0) { ::close(fd); fd = -1; }
     }
-    this->bEmptyCb.reset();
-    this->bEmptyFence.reset();
+    static auto* leakBCbs = new std::vector<vk::CommandBuffer>;
+    static auto* leakBFences = new std::vector<vk::Fence>;
+    leakBCbs->insert(leakBCbs->end(),
+        std::make_move_iterator(this->bCbs.begin()),
+        std::make_move_iterator(this->bCbs.end()));
+    this->bCbs.clear();
+    leakBFences->insert(leakBFences->end(),
+        std::make_move_iterator(this->bFences.begin()),
+        std::make_move_iterator(this->bFences.end()));
+    this->bFences.clear();
     // RADV FreeMemory on HOST_ALLOCATION_BIT + dual VkDevice teardown
     // aborts FurMark (free(): invalid size). Intentionally never destroy.
     static auto* leakHost = new std::vector<vk::Image>;
@@ -1242,20 +1248,17 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             }
         }
     }
-    if (this->bVk && this->bEmptyCb.has_value() && this->bEmptyFence.has_value()) {
+    if (this->bVk && slot < this->bCbs.size() && slot < this->bFences.size()) {
         auto& bvk = *this->bVk;
-        if (this->bEmptyFence->wait(bvk, 0)
+        if (this->bFences.at(slot).wait(bvk, 0)
                 && slot < this->bHostImages.size()
                 && slot < this->bVramImages.size()) {
-            this->bEmptyFence->reset(bvk);
-            if (this->hostPtrsA.at(slot) && this->hostPtrsB.at(slot)
-                    && this->hostAllocSize > 0)
-                std::memcpy(this->hostPtrsB.at(slot), this->hostPtrsA.at(slot),
-                    static_cast<size_t>(this->hostAllocSize));
-            this->bEmptyCb->begin(bvk);
+            this->bFences.at(slot).reset(bvk);
+            auto& bcb = this->bCbs.at(slot);
+            bcb.begin(bvk);
             const auto& srcB = this->bHostImages.at(slot);
             const auto& dstB = this->bVramImages.at(slot);
-            this->bEmptyCb->copyImage(bvk,
+            bcb.copyImage(bvk,
                 {
                     barrierHelper(srcB.handle(),
                         VK_ACCESS_NONE, VK_ACCESS_TRANSFER_READ_BIT,
@@ -1271,15 +1274,15 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                         VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT,
                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL),
                 });
-            this->bEmptyCb->end(bvk);
-            VkCommandBuffer rawB = this->bEmptyCb->raw();
+            bcb.end(bvk);
+            VkCommandBuffer rawB = bcb.raw();
             const VkSubmitInfo bsi{
                 .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
                 .commandBufferCount = 1,
                 .pCommandBuffers = &rawB,
             };
             auto bres = bvk.df().QueueSubmit(bvk.queue(), 1, &bsi,
-                this->bEmptyFence->handle());
+                this->bFences.at(slot).handle());
             if (bres != VK_SUCCESS)
                 std::cerr << "lsfg-vk: dual-host 9060 QueueSubmit " << bres << "\n";
         }

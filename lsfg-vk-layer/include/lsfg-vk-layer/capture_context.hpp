@@ -99,8 +99,8 @@ namespace lsfgvk::layer {
         std::unique_ptr<CopyHop> copyHop;
         VkDeviceSize hostAllocSize{0};
         std::array<int, ls::ipc::STAGING_RING_DEPTH> bExportFds{};
-        std::optional<vk::CommandBuffer> bEmptyCb;
-        std::optional<vk::Fence> bEmptyFence;
+        std::vector<vk::CommandBuffer> bCbs;
+        std::vector<vk::Fence> bFences;
         vk::ImageLayout exchangeLayout{};     // negotiated LINEAR/DRM layout for localImages
         std::array<int, ls::ipc::STAGING_RING_DEPTH> localExportFds{};
         std::array<int, ls::ipc::STAGING_RING_DEPTH> rawExportFds{};

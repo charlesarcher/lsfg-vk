@@ -1508,10 +1508,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     continue;
                 }
 
-                // CPU copy: 9070 already finished into shm, so Release first is
+                // CPU copy / dual-host: 9070 already finished, so Release first is
                 // safe. dma-buf still points at the 9070 buffer — Release first
                 // lets the 9070 rewrite it while the 9060 copies (36 ms fight).
-                const bool dmaHop = (state.shmBytes == 0);
+                const bool dmaHop = (state.shmBytes == 0 && std::getenv("LSFGVK_DUAL_HOST") != nullptr
+                    && std::getenv("LSFGVK_DUAL_HOST")[0] == '0');
                 if (!dmaHop) {
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
                     dbg("input: Release first (slot %u) (fidx %llu)",
