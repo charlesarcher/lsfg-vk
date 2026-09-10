@@ -22,13 +22,14 @@ Card names used throughout:
 ```
 Game (9070 XT, unchanged swapchain)
    └─ layer hooks vkQueuePresentKHR:
-        blit presented frame → A-local staging image
-        export via dma-buf ──► unix socket ──► lsfg-vk-app
+        blit presented frame → host-visible staging buffer (posix_memalign, 4K page-aligned)
+        mapped via VK_EXT_external_memory_host (userptr) ──► unix socket ──► lsfg-vk-app
         (game's own present is forwarded unchanged underneath)
 
 lsfg-vk-app (own process, 9060 XT):
-   import staging images once at handshake
-   per frame: wait capture fd → run frame generation on 9060 XT
+   import decoupled host-visible staging buffers independently
+   per frame: wait capture sync-fd → PCIe DMA copy into 9060 VRAM (~1.98 ms)
+    → run frame generation shaders on 9060 XT
     → present ALL output frames from the 9060 XT's real swapchain:
          (multiplier-1) generated + 1 real   e.g. [generated, real] at multiplier 2
     → ack the staging slot back to the layer (backpressure)
@@ -76,7 +77,7 @@ lsfg-vk-app (own process, 9060 XT):
 | 2 | layer (in the game process) | records a blit: presented image → staging slot (slots alternate 0/1), waiting on the game's own present semaphores. |
 | 3 | layer | exports a sync-fd that signals "capture done" and sends `FRAME {slot, fd}` to the app. |
 | 4 | layer | forwards the game's original present unchanged — the game's window keeps presenting underneath the app's fullscreen window. |
-| 5 | app (9060 XT) | waits on the sync-fd (no CPU copy — the pixels are a dma-buf image shared between the GPUs; the doubler card reads them straight from the 9070 XT's memory) and runs LSSC frame generation: **`multiplier − 1` intermediate frames** synthesized between this real frame and the previous real frame. |
+| 5 | app (9060 XT) | waits on the sync-fd (zero CPU framebuffer memcpy — pixels are transferred directly over PCIe DMA in ~1.98 ms via decoupled userptr buffers mapped with `VK_EXT_external_memory_host`) and runs LSSC frame generation: **`multiplier − 1` intermediate frames** synthesized between this real frame and the previous real frame. |
 | 6 | app | presents from its own swapchain: the `multiplier − 1` generated frames, then the real frame (per-cycle order `[gen × (m−1), real]` — the `[gen x 1 + real]` lines in `-v`). |
 | 7 | app | sends `RELEASE {slot}` — the layer may now overwrite that slot. |
 | 8 | display | scans out the presented frames at up to its refresh rate. |
