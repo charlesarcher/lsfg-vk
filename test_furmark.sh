@@ -7,8 +7,8 @@
 # Usage: ./test_furmark.sh {baseline|doubled|ab} [seconds] [preset]
 #   presets:
 #     light  1280x720  MSAA1  vsync0   high native fps; exposes present-path throttle
-#     bound  2560x1440 MSAA4  vsync0   GPU-bound; target slightly under 200 like RE2
-#     panel  2560x1440 MSAA1  vsync0   match DP-7; default
+#     bound  2560x1440 MSAA4  vsync0   GPU-bound; target slightly under 200 like RE2 (default)
+#     panel  2560x1440 MSAA1  vsync0   match DP-7
 #     heavy  2560x1440 MSAA8  vsync0   GPU-bound; should NOT look like the 20fps gate
 # Mangohud ON by default (mangohud --dlsym). Do not set MANGOHUD=0 unless
 # bisecting overlay cost.
@@ -22,7 +22,7 @@ set -euo pipefail
 ROOT=/home/archerc/code/lsfg-vk
 MODE=${1:-ab}
 SECS=${2:-8}
-PRESET=${3:-panel}
+PRESET=${3:-bound}
 SOCK=${LSFGVK_APP_SOCK:-$HOME/.local/state/lsfg-vk/app.sock}
 APP="$ROOT/build/lsfg-vk-app/lsfg-vk-app"
 LAYER_DIR="$ROOT/build/lsfg-vk-layer"
