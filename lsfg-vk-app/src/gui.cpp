@@ -345,6 +345,28 @@ namespace lsfgvk::gui {
             glClear(GL_COLOR_BUFFER_BIT);
             ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
 
+            static int frameCount = 0;
+            if (++frameCount == 5 || std::getenv("LSFGVK_UI_DUMP")) {
+                std::vector<uint8_t> pixels(static_cast<size_t>(displayW) * displayH * 4);
+                glReadPixels(0, 0, displayW, displayH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+                if (FILE* f = std::fopen("/tmp/lsfg_ui_window.ppm", "wb")) {
+                    std::fprintf(f, "P6\n%d %d\n255\n", displayW, displayH);
+                    std::vector<uint8_t> rgb(static_cast<size_t>(displayW) * displayH * 3);
+                    for (int y = 0; y < displayH; ++y) {
+                        for (int x = 0; x < displayW; ++x) {
+                            const size_t srcIdx = (static_cast<size_t>(displayH - 1 - y) * displayW + x) * 4;
+                            const size_t dstIdx = (static_cast<size_t>(y) * displayW + x) * 3;
+                            rgb[dstIdx + 0] = pixels[srcIdx + 0];
+                            rgb[dstIdx + 1] = pixels[srcIdx + 1];
+                            rgb[dstIdx + 2] = pixels[srcIdx + 2];
+                        }
+                    }
+                    std::fwrite(rgb.data(), 1, rgb.size(), f);
+                    std::fclose(f);
+                    std::cerr << "lsfg-vk-app: dumped GUI framebuffer to /tmp/lsfg_ui_window.ppm\n";
+                }
+            }
+
             glfwSwapBuffers(window);
         }
 
