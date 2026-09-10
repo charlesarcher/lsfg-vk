@@ -39,7 +39,7 @@ case "$PRESET" in
 esac
 
 # FurMark Vulkan device list (NOT the GpuMonitor list): 0=9060, 1=9070, 2=Intel
-FURMARK_VK_GPU_9070=1
+FURMARK_VK_GPU_9070="${RENDER_GPU_INDEX:-1}"
 
 export DISPLAY=${DISPLAY:-:0}
 export WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
