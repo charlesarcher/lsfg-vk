@@ -99,7 +99,7 @@ namespace lsfgvk::gui {
         glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
         glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-        GLFWwindow* window = glfwCreateWindow(980, 680, "Lossless Scaling Frame Generator (lsfg-vk)", nullptr, nullptr);
+        GLFWwindow* window = glfwCreateWindow(980, 840, "Lossless Scaling Frame Generator (lsfg-vk)", nullptr, nullptr);
         if (!window) {
             std::cerr << "lsfg-vk-app: failed to create GLFW window\n";
             glfwTerminate();
@@ -177,10 +177,10 @@ namespace lsfgvk::gui {
             const float colWidth = (ImGui::GetContentRegionAvail().x - 16.0f) * 0.5f;
 
             // ── Left Column ────────────────────────────────────────────────────────────
-            ImGui::BeginChild("LeftColumn", ImVec2(colWidth, 0), false);
+            ImGui::BeginChild("LeftColumn", ImVec2(colWidth, 0), false, ImGuiWindowFlags_NoScrollbar);
 
             // Card 1: Frame Generation
-            ImGui::BeginChild("CardFG", ImVec2(0, 200), true);
+            ImGui::BeginChild("CardFG", ImVec2(0, 210), true, ImGuiWindowFlags_NoScrollbar);
             ImGui::Text("Frame Generation");
             ImGui::Separator();
             ImGui::Spacing();
@@ -212,7 +212,7 @@ namespace lsfgvk::gui {
             ImGui::Spacing();
 
             // Card 2: Capture
-            ImGui::BeginChild("CardCapture", ImVec2(0, 130), true);
+            ImGui::BeginChild("CardCapture", ImVec2(0, 130), true, ImGuiWindowFlags_NoScrollbar);
             ImGui::Text("Capture");
             ImGui::Separator();
             ImGui::Spacing();
@@ -230,7 +230,7 @@ namespace lsfgvk::gui {
             ImGui::Spacing();
 
             // Card 3: Cursor
-            ImGui::BeginChild("CardCursor", ImVec2(0, 150), true);
+            ImGui::BeginChild("CardCursor", ImVec2(0, 170), true, ImGuiWindowFlags_NoScrollbar);
             ImGui::Text("Cursor");
             ImGui::Separator();
             ImGui::Spacing();
@@ -249,10 +249,10 @@ namespace lsfgvk::gui {
             ImGui::SameLine();
 
             // ── Right Column ───────────────────────────────────────────────────────────
-            ImGui::BeginChild("RightColumn", ImVec2(colWidth, 0), false);
+            ImGui::BeginChild("RightColumn", ImVec2(colWidth, 0), false, ImGuiWindowFlags_NoScrollbar);
 
             // Card 4: GPU & Display
-            ImGui::BeginChild("CardGPU", ImVec2(0, 150), true);
+            ImGui::BeginChild("CardGPU", ImVec2(0, 150), true, ImGuiWindowFlags_NoScrollbar);
             ImGui::Text("GPU & Display");
             ImGui::Separator();
             ImGui::Spacing();
@@ -283,7 +283,7 @@ namespace lsfgvk::gui {
             ImGui::Spacing();
 
             // Card 5: Rendering & Pacing
-            ImGui::BeginChild("CardRendering", ImVec2(0, 180), true);
+            ImGui::BeginChild("CardRendering", ImVec2(0, 225), true, ImGuiWindowFlags_NoScrollbar);
             ImGui::Text("Rendering");
             ImGui::Separator();
             ImGui::Spacing();
@@ -306,7 +306,7 @@ namespace lsfgvk::gui {
             ImGui::Spacing();
 
             // Card 6: Profile & Action
-            ImGui::BeginChild("CardAction", ImVec2(0, 150), true);
+            ImGui::BeginChild("CardAction", ImVec2(0, 150), true, ImGuiWindowFlags_NoScrollbar);
             ImGui::Text("Active Profile & Control");
             ImGui::Separator();
             ImGui::Spacing();
