@@ -95,7 +95,7 @@ start_app() {
     LSFGVK_OVERLAY_GAP="${LSFGVK_OVERLAY_GAP:-}" \
     LSFGVK_DUMP_PPM="${LSFGVK_DUMP_PPM:-}" \
     LSFGVK_DUMP_PRESENT="${LSFGVK_DUMP_PRESENT:-}" \
-    "$APP" --profile app-oneway --session wayland \
+    "$APP" --profile "${APP_PROFILE:-app-oneway}" --session wayland \
     >"$OUT/app.log" 2>&1 &
   APP_PID=$!
   STARTED_APP=1
@@ -126,7 +126,7 @@ run_furmark() {
     export LSFGVK_CONFIG="$HOME/.config/lsfg-vk/conf.toml"
     export LSFGVK_APP_SOCK="$SOCK"
     export LSFGVK_LAYER_DBG=1
-    export LSFGVK_PROFILE=furmark-oneway
+    export LSFGVK_PROFILE="${GAME_PROFILE:-furmark-oneway}"
     # LSFGVK_TIMING is opt-in: CmdResetQueryPool on the copy CB was left
     # on from session 13.53 and may stall the 9070. Do not default it.
     # Do NOT set MESA_VK_DEVICE_SELECT here: it collapses FurMark's Vulkan
@@ -190,7 +190,7 @@ summarize() {
 
 assert_binaries
 echo "out=$OUT mode=$MODE preset=$PRESET ${W}x${H} msaa=$MSAA secs=$SECS mangohud=${MANGOHUD:-1}"
-echo "render=9070XT(vk-index $FURMARK_VK_GPU_9070)  present=9060XT(app-oneway)"
+echo "render=9070XT(vk-index $FURMARK_VK_GPU_9070)  present=${APP_PROFILE:-9060XT(app-oneway)}"
 
 case "$MODE" in
   baseline)
