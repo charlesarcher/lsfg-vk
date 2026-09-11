@@ -60,12 +60,12 @@ Backend::Backend() {
         this->m_profile_index = 0;
 
     // spawn saving thread
+    // Session 13.20: cv-wait for the dirty flag (no periodic wakeups)
     std::thread([this, path]() {
         while (true) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-            if (!this->m_dirty.exchange(false))
-                continue;
+            std::unique_lock<std::mutex> lk(this->m_saveMtx);
+            this->m_saveCv.wait(lk, [this] { return this->m_dirty.load(); });
+            lk.unlock();
 
             ls::ConfigFile config{};
             config.global() = this->m_global;
