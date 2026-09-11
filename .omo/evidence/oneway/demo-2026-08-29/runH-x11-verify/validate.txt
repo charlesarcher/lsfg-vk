@@ -1,3 +1,0 @@
-  vkcube-oneway: presentation=external, output=-
-  app-oneway: presentation=external, output=-
-Validation success

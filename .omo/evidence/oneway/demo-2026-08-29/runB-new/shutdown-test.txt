@@ -1,1 +1,0 @@
-CLEAN: app exited 54 ms after SIGINT (no TERM/KILL fallback)

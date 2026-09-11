@@ -1,2 +1,0 @@
-$ grep -ri "dual gpu is not supported\|must be the \*\*same gpu" docs/Configuration.md
-exit=1 (1 = no matches, gate PASS)

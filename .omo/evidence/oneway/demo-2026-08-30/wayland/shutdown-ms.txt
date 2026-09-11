@@ -1,1 +1,0 @@
-Wayland sigint->exit: 0 ms
