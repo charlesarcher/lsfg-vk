@@ -1,0 +1,1 @@
+tools/benchmarks/bench_furmark.sh

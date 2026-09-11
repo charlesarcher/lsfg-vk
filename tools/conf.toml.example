@@ -1,0 +1,27 @@
+# Example lsfg-vk configuration file for one-way dual-GPU offload
+# Place at ~/.config/lsfg-vk/conf.toml or point LSFGVK_CONFIG to this file.
+version = 2
+
+[global]
+dll = "/mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll"
+allow_fp16 = true
+
+# ── App Offload Profile ───────────────────────────────────────────────────
+[[profile]]
+name = "app-oneway"
+gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
+presentation = "external"
+multiplier = 2
+# Transport options: "shm" (POSIX shared memory CPU copy, ~2-6ms latency),
+#                   "dmabuf" (DRM PRIME zero-copy DMA with implicit sync, ~50ms),
+#                   "decoupled" (Decoupled zero-copy DMA without implicit sync, ~4ms)
+transport = "decoupled"
+
+# ── FurMark Game External Profile ─────────────────────────────────────────
+[[profile]]
+name = "furmark-oneway"
+active_in = "furmark"
+gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
+presentation = "external"
+multiplier = 2
+transport = "decoupled"
