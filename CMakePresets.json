@@ -1,0 +1,73 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 21,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "default",
+      "displayName": "Default (Release)",
+      "description": "Standard release build with Vulkan layer, presentation app, and CLI",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LSFGVK_BUILD_LAYER": "ON",
+        "LSFGVK_BUILD_APP": "ON",
+        "LSFGVK_BUILD_CLI": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "inherits": "default",
+      "displayName": "Release",
+      "description": "Optimized release build"
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug",
+      "description": "Debug build with symbols and assertions",
+      "binaryDir": "${sourceDir}/build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LSFGVK_BUILD_LAYER": "ON",
+        "LSFGVK_BUILD_APP": "ON",
+        "LSFGVK_BUILD_CLI": "ON"
+      }
+    },
+    {
+      "name": "relwithdebinfo",
+      "displayName": "Release with Debug Info",
+      "description": "Optimized release build with debug symbols",
+      "binaryDir": "${sourceDir}/build-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "LSFGVK_BUILD_LAYER": "ON",
+        "LSFGVK_BUILD_APP": "ON",
+        "LSFGVK_BUILD_CLI": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "default",
+      "configurePreset": "default"
+    },
+    {
+      "name": "release",
+      "configurePreset": "release"
+    },
+    {
+      "name": "debug",
+      "configurePreset": "debug"
+    },
+    {
+      "name": "relwithdebinfo",
+      "configurePreset": "relwithdebinfo"
+    }
+  ]
+}

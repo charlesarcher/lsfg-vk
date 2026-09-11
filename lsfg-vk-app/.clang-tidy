@@ -1,0 +1,55 @@
+UseColor: true
+Checks:
+# APP: Usually, we keep all checks enabled (mirror of the other modules)
+- "bugprone-*"
+- "clang-analyzer-*"
+- "cppcoreguidelines-*"
+- "misc-*"
+- "modernize-*"
+- "performance-*"
+- "portability-*"
+- "readability-*"
+# APP: Some checks related purely to code-style are disabled
+- -modernize-use-designated-initializers
+- -modernize-use-trailing-return-type
+- -modernize-deprecated-headers
+- -readability-function-cognitive-complexity
+- -readability-math-missing-parentheses
+- -readability-braces-around-statements
+- -readability-implicit-bool-conversion
+- -readability-identifier-length
+- -readability-magic-numbers
+- -cppcoreguidelines-avoid-magic-numbers
+- -cppcoreguidelines-macro-usage
+- -bugprone-easily-swappable-parameters
+- -portability-avoid-pragma-once
+# Vulkan requires the use of reinterpret/const casts in many places
+- -cppcoreguidelines-pro-type-reinterpret-cast
+- -cppcoreguidelines-pro-type-const-cast
+# The WSI backends embed C protocol code (wayland/xcb) that needs C-style
+# memory access
+- -cppcoreguidelines-pro-bounds-pointer-arithmetic
+- -cppcoreguidelines-pro-type-union-access
+- -clang-diagnostic-unsafe-buffer-usage
+# C feature-test macros must keep their reserved spelling (all modules)
+- -bugprone-reserved-identifier
+# The TEMP DEBUG vsnprintf-based dbg() helper is the house pattern
+- -modernize-avoid-variadic-functions
+- -cppcoreguidelines-pro-type-vararg
+- -cppcoreguidelines-pro-bounds-array-to-pointer-decay
+- -cppcoreguidelines-avoid-c-arrays
+- -modernize-avoid-c-arrays
+# include-cleaner cannot see usage through the generated protocol headers
+- -misc-include-cleaner
+# SurfaceBackend is an abstract interface (deleted-copy semantics pending a
+# separate refactor; a virtual destructor alone is deliberate there)
+- -cppcoreguidelines-special-member-functions
+# File-scope state (signal handlers, debug probes) is the established
+# pattern in this module
+- -cppcoreguidelines-avoid-non-const-global-variables
+# Only report diagnostics for this module's own sources; the generated
+# wayland-scanner headers (build/.../protocols/) and system headers are
+# out of scope.
+HeaderFilterRegex: 'lsfg-vk-app/(src|include)/.*'
+CheckOptions:
+    cppcoreguidelines-pro-bounds-avoid-unchecked-container-access.ExcludeClasses: '::std::map;::std::unordered_map;::std::flat_map;::toml::table'
