@@ -10,9 +10,11 @@
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
+#include "lsfg-vk-common/vulkan/timestamps.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <utility>
 #include <vector>
 
@@ -27,6 +29,7 @@ namespace lsfgvk::layer {
         VkColorSpaceKHR colorSpace;
         VkExtent2D extent;
         VkPresentModeKHR presentMode;
+        bool fake{false};   // layer-owned images, no driver swapchain behind them
     };
 
     /// modify the swapchain create info based on the profile pre-swapchain creation
@@ -44,8 +47,10 @@ namespace lsfgvk::layer {
         /// @param backend lsfg-vk backend instance
         /// @param profile active game profile
         /// @param info swapchain info
+        /// @param gameDeviceName device name of this context's game device (mode logging)
         Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
-            ls::GameConf profile, SwapchainInfo info);
+            ls::GameConf profile, SwapchainInfo info,
+            const std::string& gameDeviceName);
 
         /// present a frame
         /// @param vk vulkan instance
@@ -77,8 +82,15 @@ namespace lsfgvk::layer {
         size_t idx{1};
         size_t fidx{0}; // real frame index
 
+        // GPU timestamp instrumentation (enabled via LSFGVK_TIMING=1)
+        vk::TimingRing timingRing;
+
         ls::GameConf profile;
         SwapchainInfo info;
+
+        // nonblocking acquire prefetch state
+        std::optional<uint32_t> pendingAcquireIdx{std::nullopt};
+        std::optional<vk::Semaphore> pendingAcquireSemaphore{std::nullopt};
     };
 
 }

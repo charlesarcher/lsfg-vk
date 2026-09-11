@@ -8,14 +8,18 @@
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
+#include "lsfg-vk-common/vulkan/timestamps.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
+#include <iostream>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -48,10 +52,16 @@ namespace {
             }
         };
     }
+
 }
 
 void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint32_t maxImages,
         VkSwapchainCreateInfoKHR& createInfo) {
+    if (profile.presentation == ls::Presentation::External) {
+        createInfo.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        return;
+    }
+
     createInfo.imageUsage |=
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
@@ -61,17 +71,29 @@ void layer::context_ModifySwapchainCreateInfo(const ls::GameConf& profile, uint3
             if (maxImages && createInfo.minImageCount > maxImages)
                 createInfo.minImageCount = maxImages;
 
-            createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+            if (std::getenv("LSFGVK_FIFO")) {
+                createInfo.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+            }
             break;
     }
 }
 
 Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
-            ls::GameConf profile, SwapchainInfo info) :
+            ls::GameConf profile, SwapchainInfo info,
+            const std::string& gameDeviceName) :
         instance(backend),
-        profile(std::move(profile)), info(std::move(info)) {
+        profile(std::move(profile)), info(std::move(info)),
+        timingRing(vk, "layer") {
     const VkExtent2D extent = this->info.extent;
     const bool hdr = this->info.format > 57;
+    const VkFormat format = hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+
+    const auto gameUuid = vk.deviceUUID();
+    if (gameUuid != backend.selectedDeviceUUID())
+        throw ls::error("cross-device frame generation is not supported in internal swapchain presentation (two-way dual-GPU is removed); use presentation='external' with lsfg-vk-app");
+
+    std::cerr << "lsfg-vk: frame generation on the game's own device '"
+        << gameDeviceName << "'\n";
 
     std::vector<int> sourceFds(2);
     std::vector<int> destinationFds(this->profile.multiplier - 1);
@@ -79,14 +101,14 @@ Swapchain::Swapchain(const vk::Vulkan& vk, backend::Instance& backend,
     this->sourceImages.reserve(sourceFds.size());
     for (int& fd : sourceFds)
         this->sourceImages.emplace_back(vk,
-            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
+            extent, format,
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             std::nullopt, &fd);
 
     this->destinationImages.reserve(destinationFds.size());
     for (int& fd : destinationFds)
         this->destinationImages.emplace_back(vk,
-            extent, hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM,
+            extent, format,
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             std::nullopt, &fd);
 
@@ -133,17 +155,18 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
     const auto& swapchainImage = this->info.images.at(imageIdx);
-    const auto& sourceImage = this->sourceImages.at(this->fidx % 2);
+    const auto& sourceImage = this->sourceImages.at(this->fidx % this->sourceImages.size());
 
-    // schedule frame generation
-    try {
-        this->instance.get().scheduleFrames(this->ctx.get());
-    } catch (const std::exception& e) {
-        throw ls::error("failed to schedule frames", e);
+    // Read back timing for frame N-4 (host readback while GPU works on N)
+    if (this->timingRing.enabled() && this->fidx >= 4) {
+        auto timing = this->timingRing.readFrame(this->fidx - 4);
+        if (timing) {
+            this->timingRing.writeCsvRow(*timing);
+        }
     }
 
     // update present mode when not using pacing
-    if (this->profile.pacing == ls::Pacing::None) {
+    if (this->profile.pacing == ls::Pacing::None && std::getenv("LSFGVK_FIFO")) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-warning-option"
 #pragma clang diagnostic ignored "-Wunsafe-buffer-usage"
@@ -160,14 +183,15 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
 #pragma clang diagnostic pop
     }
 
-    // wait for completion of previous frame
-    if (this->fidx && !this->renderFence->wait(vk, 150ULL * 1000 * 1000))
-        throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
-    this->renderFence->reset(vk);
-
-    // copy swapchain image into backend source image
+    // record the capture blit (shared by both sync modes)
     const auto& cmdbuf = *this->renderCommandBuffer;
     cmdbuf.begin(vk);
+
+    // Reset query pool for this frame
+    this->timingRing.resetFrame(cmdbuf.handle(), this->fidx);
+
+    // Timestamp: Game CopyIn (swapchain -> source dma-buf)
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInStart, true);
 
     cmdbuf.blitImage(vk,
         {
@@ -196,6 +220,20 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         }
     );
 
+    this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyInEnd, false);
+
+    // schedule frame generation
+    try {
+        this->instance.get().scheduleFrames(this->ctx.get());
+    } catch (const std::exception& e) {
+        throw ls::error("failed to schedule frames", e);
+    }
+
+    // wait for completion of previous frame
+    if (this->fidx && !this->renderFence->wait(vk, 150ULL * 1000 * 1000))
+        throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
+    this->renderFence->reset(vk);
+
     cmdbuf.end(vk);
     cmdbuf.submit(vk,
         semaphores, VK_NULL_HANDLE, 0,
@@ -222,6 +260,9 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         // copy backend destination image into swapchain image
         auto& cmdbuf = pass.commandBuffer;
         cmdbuf.begin(vk);
+
+        // Timestamp: Game CopyOut (dest dma-buf -> swapchain)
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyOutStart, true);
 
         cmdbuf.blitImage(vk,
             {
@@ -250,6 +291,8 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             }
         );
 
+        this->timingRing.writeTimestamp(cmdbuf.handle(), vk::TimingRing::Stage::GameCopyOutEnd, false);
+
         std::vector<VkSemaphore> waitSemaphores{ pass.acquireSemaphore.handle() };
         if (i) { // non-first pass
             const auto& prevPCS = this->postCopySemaphores.at((this->idx - 1) % this->postCopySemaphores.size());
@@ -261,11 +304,14 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
             pcs.second.handle()
         };
 
+        VkFence renderFence =
+            i == this->destinationImages.size() - 1 ? this->renderFence->handle() : VK_NULL_HANDLE;
+
         cmdbuf.end(vk);
         cmdbuf.submit(vk,
             waitSemaphores, this->syncSemaphore->handle(), this->idx,
             signalSemaphores, VK_NULL_HANDLE, 0,
-            i == this->destinationImages.size() - 1 ? this->renderFence->handle() : VK_NULL_HANDLE
+            renderFence
         );
 
         // present swapchain image
