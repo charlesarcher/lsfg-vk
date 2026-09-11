@@ -2,6 +2,7 @@
 
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 
 #include <array>
@@ -11,8 +12,11 @@
 #include <filesystem>
 #include <fstream>
 #include <ios>
+#include <iostream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 #include <dlfcn.h>
@@ -60,9 +64,18 @@ namespace {
     }
 
     /// create a vulkan instance
+    /// @param enableSurfaceExtensions when true (graphical instances) the
+    ///        presentation-surface instance extensions are enabled so their
+    ///        entry points resolve via vkGetInstanceProcAddr: the platform
+    ///        surface extensions (vkCreateXcbSurfaceKHR /
+    ///        vkCreateWaylandSurfaceKHR) plus the base VK_KHR_surface (the
+    ///        vkGetPhysicalDeviceSurface* queries and vkDestroySurfaceKHR the
+    ///        WSI backends resolve). Availability-filtered: only an extension
+    ///        the loader actually reports is requested.
     ls::owned_ptr<VkInstance> createInstance(
             const std::string& appName, version appVersion,
-            const std::string& engineName, version engineVersion) {
+            const std::string& engineName, version engineVersion,
+            bool enableSurfaceExtensions = false) {
         VkInstance handle{};
 
         auto vkCreateInstance =
@@ -78,9 +91,52 @@ namespace {
             .engineVersion = engineVersion.into(),
             .apiVersion = VK_API_VERSION_1_2 // seems 1.2 is supported on all Vulkan-capable GPUs
         };
+
+        // Presentation-surface instance extensions must be enabled for their
+        // creation functions to be exported by the loader. Only enable an
+        // extension the loader actually reports as available, so we never ask
+        // for an unavailable one and hit VK_ERROR_EXTENSION_NOT_PRESENT.
+        // the base extension is mandatory: the vkGetPhysicalDeviceSurface*
+        // queries and vkDestroySurfaceKHR are VK_KHR_surface entry points, and
+        // the loader resolves them via ipa only when the extension is enabled.
+        const char* surfaceExtNames[] = {
+            "VK_KHR_surface",
+            "VK_KHR_xcb_surface",
+            "VK_KHR_wayland_surface"
+        };
+        std::vector<const char*> enabledExtensions;
+        if (enableSurfaceExtensions) {
+            // every vulkan function is pulled from the loader via
+            // vkGetInstanceProcAddr; the library never links libvulkan.
+            auto enumerateExt = ipa<PFN_vkEnumerateInstanceExtensionProperties>(
+                get_mpa(), VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties");
+            if (!enumerateExt)
+                throw ls::vulkan_error(
+                    "failed to get vkEnumerateInstanceExtensionProperties symbol");
+            uint32_t extCount{};
+            if (enumerateExt(VK_NULL_HANDLE, &extCount, nullptr) != VK_SUCCESS)
+                throw ls::vulkan_error("failed to enumerate instance extensions");
+            std::vector<VkExtensionProperties> exts(extCount);
+            if (extCount > 0
+                    && enumerateExt(VK_NULL_HANDLE, &extCount, exts.data()) != VK_SUCCESS)
+                throw ls::vulkan_error("failed to enumerate instance extensions");
+            for (const auto& ext : exts) {
+                const std::string_view name{ext.extensionName};
+                for (const char* want : surfaceExtNames)
+                    if (name == std::string_view(want)) {
+                        enabledExtensions.push_back(want);
+                        break;
+                    }
+            }
+        }
+
         const VkInstanceCreateInfo instanceInfo{
             .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-            .pApplicationInfo = &appInfo
+            .pApplicationInfo = &appInfo,
+            .enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size()),
+            .ppEnabledExtensionNames = enabledExtensions.empty()
+                ? nullptr
+                : enabledExtensions.data()
         };
         auto res = vkCreateInstance(&instanceInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
@@ -149,6 +205,40 @@ namespace {
         return supportedFeaturesVulkan12.shaderFloat16 == VK_TRUE;
     }
 
+    /// query the device and driver uuids of a physical device
+    VkPhysicalDeviceIDProperties queryIDProperties(const VulkanInstanceFuncs& fi,
+            VkPhysicalDevice physdev) {
+        VkPhysicalDeviceIDProperties idProps{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
+        };
+        VkPhysicalDeviceProperties2 props{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &idProps
+        };
+        fi.GetPhysicalDeviceProperties2(physdev, &props);
+        return idProps;
+    }
+
+    /// check if a physical device exposes a given extension
+    bool hasDeviceExtension(const VulkanInstanceFuncs& fi, VkPhysicalDevice physdev,
+            std::string_view name) {
+        uint32_t extCount{};
+        auto res = fi.EnumerateDeviceExtensionProperties(physdev, VK_NULL_HANDLE,
+            &extCount, VK_NULL_HANDLE);
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkEnumerateDeviceExtensionProperties() failed");
+
+        std::vector<VkExtensionProperties> extensions(extCount);
+        res = fi.EnumerateDeviceExtensionProperties(physdev, VK_NULL_HANDLE,
+            &extCount, extensions.data());
+        if (res != VK_SUCCESS)
+            throw ls::vulkan_error(res, "vkEnumerateDeviceExtensionProperties() failed");
+
+        for (const auto& ext : extensions)
+            if (std::string_view(ext.extensionName) == name) return true;
+        return false;
+    }
+
     template<typename T>
     T dpa(const VulkanInstanceFuncs& funcs, VkDevice device, const char* name) {
         T func = reinterpret_cast<T>(
@@ -158,12 +248,32 @@ namespace {
         return func;
     }
 
+    template<typename T>
+    T dpa_optional(const VulkanInstanceFuncs& funcs, VkDevice device, const char* name) {
+        T func = reinterpret_cast<T>(
+            funcs.GetDeviceProcAddr(device, name));
+        return func; // may be nullptr
+    }
+
+    /// query the name of a physical device
+    std::string queryDeviceName(const VulkanInstanceFuncs& fi, VkPhysicalDevice physdev) {
+        VkPhysicalDeviceProperties2 props{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+        };
+        fi.GetPhysicalDeviceProperties2(physdev, &props);
+        // NOLINTNEXTLINE(cppcoreguidelines-pro-bounds-array-to-pointer-decay, modernize-return-braced-init-list)
+        return std::string(props.properties.deviceName);
+    }
+
     /// create a logical device
     ls::owned_ptr<VkDevice> createLogicalDevice(const VulkanInstanceFuncs& fi,
-            VkPhysicalDevice physdev, uint32_t cfi, bool fp16) {
+            VkPhysicalDevice physdev, uint32_t cfi, bool fp16,
+            bool enableDmaBufExtensions,
+            std::optional<uint32_t> transferQFI) {
         VkDevice handle{};
 
         const float queuePriority{1.0F}; // highest priority
+        const float transferQueuePriority{1.0F}; // highest priority
         const VkPhysicalDeviceVulkan12Features requestedFeaturesVulkan12{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             .shaderFloat16 = fp16,
@@ -175,22 +285,93 @@ namespace {
             .queueCount = 1,
             .pQueuePriorities = &queuePriority
         };
-        const std::vector<const char*> requestedExtensions{
+        std::vector<VkDeviceQueueCreateInfo> queueInfos{ requestedQueueInfo };
+        if (transferQFI.has_value()) {
+            const VkDeviceQueueCreateInfo transferQueueInfo{
+                .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+                .queueFamilyIndex = *transferQFI,
+                .queueCount = 1,
+                .pQueuePriorities = &transferQueuePriority
+            };
+            queueInfos.push_back(transferQueueInfo);
+        }
+        std::vector<const char*> requestedExtensions{
             VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
             VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
-            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME
+            VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
+            VK_KHR_SWAPCHAIN_EXTENSION_NAME
         };
+        if (hasDeviceExtension(fi, physdev, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME))
+            requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+        if (enableDmaBufExtensions) {
+            // two-stage policy: capability is requested best-effort here
+            // (silent skip keeps same-device users on drivers without these
+            // extensions fully working), while the hard Q4 error fires at
+            // openContext only when cross-device exchange is actually needed
+            // but unavailable. extensions are init-time capability bits with
+            // zero per-frame cost, so over-requesting costs nothing.
+            const bool hasDmaBuf = hasDeviceExtension(fi, physdev,
+                VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+            const bool hasDrmModifier = hasDeviceExtension(fi, physdev,
+                VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+            if (hasDmaBuf && hasDrmModifier) {
+                requestedExtensions.push_back(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+                requestedExtensions.push_back(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+            } else {
+                std::cerr << "lsfg-vk: dma-buf extensions unavailable on '"
+                    << queryDeviceName(fi, physdev) << "', dual-gpu mode disabled\n";
+            }
+        }
+        if (hasDeviceExtension(fi, physdev, VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
+            requestedExtensions.push_back(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+        std::cerr << "lsfg-vk: enabling device extensions:";
+        for (const auto* ext : requestedExtensions)
+            std::cerr << ' ' << ext;
+        std::cerr << '\n';
         const VkDeviceCreateInfo deviceInfo{
             .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .pNext = &requestedFeaturesVulkan12,
-            .queueCreateInfoCount = 1,
-            .pQueueCreateInfos = &requestedQueueInfo,
+            .queueCreateInfoCount = static_cast<uint32_t>(queueInfos.size()),
+            .pQueueCreateInfos = queueInfos.data(),
             .enabledExtensionCount = static_cast<uint32_t>(requestedExtensions.size()),
             .ppEnabledExtensionNames = requestedExtensions.data()
         };
         auto res = fi.CreateDevice(physdev, &deviceInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkCreateDevice() failed");
+
+        // Attach loader data to the freshly created device. The Vulkan loader
+        // implements device entry points such as vkCreateSwapchainKHR behind the
+        // loader, so they only resolve via vkGetDeviceProcAddr once loader data
+        // is present on the device. The standalone Vulkan ctor resolves its
+        // device-function pointers (including the swapchain PFNs required by a
+        // graphical device) AFTER this function returns, so loader data MUST be
+        // set here for a graphical device to build a real swapchain surface.
+        // This is isolated to the standalone ctor: createLogicalDevice is only
+        // called from there (vulkan.cpp:545), never by the layer's two-way path.
+        // Attach loader data to the freshly created device. The Vulkan loader
+        // implements device entry points such as vkCreateSwapchainKHR behind the
+        // loader, so they only resolve via vkGetDeviceProcAddr once loader data
+        // is present on the device. The standalone Vulkan ctor resolves its
+        // device-function pointers (including the swapchain PFNs required by a
+        // graphical device) AFTER this function returns, so loader data MUST be
+        // set here for a graphical device to build a real swapchain surface.
+        // This is isolated to the standalone ctor: createLogicalDevice is only
+        // called from there (vulkan.cpp:545), never by the layer's two-way path.
+        {
+            auto GetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(
+                fi.GetDeviceProcAddr(handle, "vkGetDeviceQueue"));
+            VkQueue queue{VK_NULL_HANDLE};
+            if (GetDeviceQueue)
+                GetDeviceQueue(handle, cfi, 0, &queue);
+            auto setLoaderDataFn = reinterpret_cast<PFN_vkSetDeviceLoaderData>(
+                fi.GetDeviceProcAddr(handle, "vkSetDeviceLoaderData"));
+            if (setLoaderDataFn) {
+                auto ldr = setLoaderDataFn(handle, queue);
+                if (ldr != VK_SUCCESS)
+                    throw ls::vulkan_error(ldr, "vkSetDeviceLoaderData() failed");
+            }
+        }
 
         auto defunc =
             dpa<PFN_vkDestroyDevice>(fi, handle, "vkDestroyDevice");
@@ -284,6 +465,30 @@ namespace {
     }
 }
 
+std::optional<uint32_t> vk::findTransferQFI(const VulkanInstanceFuncs& fi,
+        VkPhysicalDevice physdev) {
+    uint32_t queueCount{};
+    fi.GetPhysicalDeviceQueueFamilyProperties(physdev, &queueCount, VK_NULL_HANDLE);
+
+    std::vector<VkQueueFamilyProperties> queues(queueCount);
+    fi.GetPhysicalDeviceQueueFamilyProperties(physdev, &queueCount, queues.data());
+
+    for (uint32_t i = 0; i < queueCount; ++i) {
+        const auto flags = queues.at(i).queueFlags;
+        if ((flags & VK_QUEUE_TRANSFER_BIT)
+                && !(flags & VK_QUEUE_GRAPHICS_BIT)
+                && !(flags & VK_QUEUE_COMPUTE_BIT))
+            return i;
+    }
+    for (uint32_t i = 0; i < queueCount; ++i) {
+        const auto flags = queues.at(i).queueFlags;
+        if ((flags & VK_QUEUE_TRANSFER_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT))
+            return i;
+    }
+
+    return std::nullopt;
+}
+
 /// initialize vulkan instance function pointers
 VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceProcAddr mpa,
         bool graphical) {
@@ -295,6 +500,15 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
             "vkEnumerateDeviceExtensionProperties"),
         .GetPhysicalDeviceProperties2 = ipa<PFN_vkGetPhysicalDeviceProperties2>(mpa, i,
             "vkGetPhysicalDeviceProperties2"),
+        .GetPhysicalDeviceFormatProperties2 =
+            ipa<PFN_vkGetPhysicalDeviceFormatProperties2>(mpa, i,
+                "vkGetPhysicalDeviceFormatProperties2"),
+        .GetPhysicalDeviceExternalSemaphoreProperties =
+            ipa<PFN_vkGetPhysicalDeviceExternalSemaphoreProperties>(mpa, i,
+                "vkGetPhysicalDeviceExternalSemaphoreProperties"),
+        .GetPhysicalDeviceExternalFenceProperties =
+            ipa<PFN_vkGetPhysicalDeviceExternalFenceProperties>(mpa, i,
+                "vkGetPhysicalDeviceExternalFenceProperties"),
         .GetPhysicalDeviceQueueFamilyProperties =
             ipa<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(mpa, i,
                 "vkGetPhysicalDeviceQueueFamilyProperties"),
@@ -307,7 +521,10 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
 
         .GetPhysicalDeviceSurfaceCapabilitiesKHR = graphical ?
             ipa<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(mpa, i,
-                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") : nullptr
+                "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") : nullptr,
+        .GetPhysicalDeviceSurfacePresentModesKHR = graphical ?
+            ipa<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(mpa, i,
+                "vkGetPhysicalDeviceSurfacePresentModesKHR") : nullptr
     };
 }
 
@@ -336,13 +553,19 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .BeginCommandBuffer = dpa<PFN_vkBeginCommandBuffer>(f, d, "vkBeginCommandBuffer"),
         .EndCommandBuffer = dpa<PFN_vkEndCommandBuffer>(f, d, "vkEndCommandBuffer"),
         .CmdPipelineBarrier = dpa<PFN_vkCmdPipelineBarrier>(f, d, "vkCmdPipelineBarrier"),
+        .CmdPipelineBarrier2 = dpa_optional<PFN_vkCmdPipelineBarrier2>(f, d, "vkCmdPipelineBarrier2"),
         .CmdBlitImage = dpa<PFN_vkCmdBlitImage>(f, d, "vkCmdBlitImage"),
         .CmdClearColorImage = dpa<PFN_vkCmdClearColorImage>(f, d, "vkCmdClearColorImage"),
         .CmdBindPipeline = dpa<PFN_vkCmdBindPipeline>(f, d, "vkCmdBindPipeline"),
         .CmdBindDescriptorSets = dpa<PFN_vkCmdBindDescriptorSets>(f, d, "vkCmdBindDescriptorSets"),
         .CmdDispatch = dpa<PFN_vkCmdDispatch>(f, d, "vkCmdDispatch"),
         .CmdCopyBufferToImage = dpa<PFN_vkCmdCopyBufferToImage>(f, d, "vkCmdCopyBufferToImage"),
+        .CmdCopyImage = dpa<PFN_vkCmdCopyImage>(f, d, "vkCmdCopyImage"),
+        .CmdCopyImage2 = dpa_optional<PFN_vkCmdCopyImage2>(f, d, "vkCmdCopyImage2"),
+        .CmdWriteTimestamp = dpa<PFN_vkCmdWriteTimestamp>(f, d, "vkCmdWriteTimestamp"),
+        .CmdResetQueryPool = dpa<PFN_vkCmdResetQueryPool>(f, d, "vkCmdResetQueryPool"),
         .QueueSubmit = dpa<PFN_vkQueueSubmit>(f, d, "vkQueueSubmit"),
+        .QueueSubmit2 = dpa_optional<PFN_vkQueueSubmit2>(f, d, "vkQueueSubmit2"),
         .AllocateDescriptorSets = dpa<PFN_vkAllocateDescriptorSets>(f, d,
             "vkAllocateDescriptorSets"),
         .FreeDescriptorSets = dpa<PFN_vkFreeDescriptorSets>(f, d, "vkFreeDescriptorSets"),
@@ -375,10 +598,19 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .GetPipelineCacheData = dpa<PFN_vkGetPipelineCacheData>(f, d, "vkGetPipelineCacheData"),
         .CreateComputePipelines = dpa<PFN_vkCreateComputePipelines>(f, d, "vkCreateComputePipelines"),
         .DestroyPipeline = dpa<PFN_vkDestroyPipeline>(f, d, "vkDestroyPipeline"),
+        .GetImageSubresourceLayout = dpa<PFN_vkGetImageSubresourceLayout>(f, d,
+            "vkGetImageSubresourceLayout"),
+        .CreateQueryPool = dpa<PFN_vkCreateQueryPool>(f, d, "vkCreateQueryPool"),
+        .DestroyQueryPool = dpa<PFN_vkDestroyQueryPool>(f, d, "vkDestroyQueryPool"),
+        .GetQueryPoolResults = dpa<PFN_vkGetQueryPoolResults>(f, d, "vkGetQueryPoolResults"),
 
         .SignalSemaphoreKHR = dpa<PFN_vkSignalSemaphoreKHR>(f, d, "vkSignalSemaphoreKHR"),
         .WaitSemaphoresKHR = dpa<PFN_vkWaitSemaphoresKHR>(f, d, "vkWaitSemaphoresKHR"),
         .GetMemoryFdKHR = dpa<PFN_vkGetMemoryFdKHR>(f, d, "vkGetMemoryFdKHR"),
+        .GetMemoryFdPropertiesKHR = dpa<PFN_vkGetMemoryFdPropertiesKHR>(f, d,
+            "vkGetMemoryFdPropertiesKHR"),
+        .GetMemoryHostPointerPropertiesEXT = dpa_optional<PFN_vkGetMemoryHostPointerPropertiesEXT>(
+            f, d, "vkGetMemoryHostPointerPropertiesEXT"),
         .ImportSemaphoreFdKHR = dpa<PFN_vkImportSemaphoreFdKHR>(f, d, "vkImportSemaphoreFdKHR"),
         .GetSemaphoreFdKHR = dpa<PFN_vkGetSemaphoreFdKHR>(f, d, "vkGetSemaphoreFdKHR"),
 
@@ -400,10 +632,13 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         PhysicalDeviceSelector selectPhysicalDevice,
         bool isGraphical,
         std::optional<PFN_vkSetDeviceLoaderData> setLoaderData,
-        const std::optional<std::filesystem::path>& cachefile) :
+        const std::optional<std::filesystem::path>& cachefile,
+        bool enableDmaBufExtensions,
+        bool enableTransferQueue) :
     instance(createInstance(
         appName, appVersion,
-        engineName, engineVersion
+        engineName, engineVersion,
+        isGraphical
     )),
     instance_funcs(initVulkanInstanceFuncs(*this->instance, get_mpa(), false)),
     phys_dev(findPhysicalDevice(this->instance_funcs,
@@ -416,12 +651,16 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
     device(createLogicalDevice(this->instance_funcs,
         this->phys_dev,
         this->queueFamilyIdx,
-        this->fp16
+        this->fp16,
+        enableDmaBufExtensions,
+        enableTransferQueue
+            ? findTransferQFI(this->instance_funcs, this->phys_dev)
+            : std::nullopt
     )),
     setLoaderData(setLoaderData),
     device_funcs(initVulkanDeviceFuncs(
         this->instance_funcs,
-        *this->device, false
+        *this->device, isGraphical
     )),
     computeQueue(getQueue(this->device_funcs, *this->device,
         this->setLoaderData,
@@ -430,6 +669,17 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         *this->device,
         this->queueFamilyIdx
     )),
+    transferQueueFamilyIdx(enableTransferQueue
+        ? findTransferQFI(this->instance_funcs, this->phys_dev).value_or(VK_QUEUE_FAMILY_IGNORED)
+        : VK_QUEUE_FAMILY_IGNORED),
+    transferQueue(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+        ? getQueue(this->device_funcs, *this->device,
+            this->setLoaderData, this->transferQueueFamilyIdx)
+        : VK_NULL_HANDLE),
+    transferCmdPool(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+        ? createCommandPool(this->device_funcs,
+            *this->device, this->transferQueueFamilyIdx)
+        : ls::owned_ptr<VkCommandPool>{}),
     pipelineCache(createPipelineCache(this->device_funcs,
         *this->device, cachefile
     )),
@@ -508,4 +758,72 @@ void Vulkan::persistPipelineCache() const noexcept {
         static_cast<std::streamsize>(cacheData.size()));
     if (!file.good())
         return;
+}
+
+std::array<uint8_t, 16> Vulkan::deviceUUID() const {
+    return std::to_array(queryIDProperties(this->instance_funcs, this->phys_dev).deviceUUID);
+}
+
+std::array<uint8_t, 16> Vulkan::driverUUID() const {
+    return std::to_array(queryIDProperties(this->instance_funcs, this->phys_dev).driverUUID);
+}
+
+bool Vulkan::supportsDmaBuf() const {
+    return hasDeviceExtension(this->instance_funcs, this->phys_dev,
+        VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+}
+
+bool Vulkan::supportsDrmModifierImages() const {
+    return hasDeviceExtension(this->instance_funcs, this->phys_dev,
+        VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+}
+
+DeviceExchangeCaps Vulkan::exchangeCaps(VkFormat format) const {
+    VkDrmFormatModifierPropertiesListEXT modList{
+        .sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT
+    };
+    VkFormatProperties2 props{
+        .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+        .pNext = &modList
+    };
+    this->instance_funcs.GetPhysicalDeviceFormatProperties2(this->phys_dev, format, &props);
+
+    std::vector<VkDrmFormatModifierPropertiesEXT> modifiers(
+        modList.drmFormatModifierCount);
+    modList.pDrmFormatModifierProperties = modifiers.data();
+    this->instance_funcs.GetPhysicalDeviceFormatProperties2(this->phys_dev, format, &props);
+
+    std::vector<ExchangeModifierCaps> caps{};
+    caps.reserve(modifiers.size());
+    for (const auto& mod : modifiers)
+        caps.push_back(ExchangeModifierCaps{
+            .modifier = mod.drmFormatModifier,
+            .requiredUsageBits = mod.drmFormatModifierTilingFeatures
+        });
+
+    return {{format, std::move(caps)}};
+}
+
+bool Vulkan::supportsSyncFdSemaphoreExportImport() const {
+    const VkPhysicalDeviceExternalSemaphoreInfo info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_SEMAPHORE_INFO,
+        .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT
+    };
+    VkExternalSemaphoreProperties props{};
+    this->instance_funcs.GetPhysicalDeviceExternalSemaphoreProperties(this->phys_dev,
+        &info, &props);
+    return (props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT)
+        && (props.externalSemaphoreFeatures & VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT);
+}
+
+bool Vulkan::supportsSyncFdFenceExportImport() const {
+    const VkPhysicalDeviceExternalFenceInfo info{
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_FENCE_INFO,
+        .handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT
+    };
+    VkExternalFenceProperties props{};
+    this->instance_funcs.GetPhysicalDeviceExternalFenceProperties(this->phys_dev,
+        &info, &props);
+    return (props.externalFenceFeatures & VK_EXTERNAL_FENCE_FEATURE_EXPORTABLE_BIT)
+        && (props.externalFenceFeatures & VK_EXTERNAL_FENCE_FEATURE_IMPORTABLE_BIT);
 }

@@ -9,3 +9,16 @@
 /.clangd
 /.cache
 /.ccls
+
+# local build/data artifacts
+/build-asan
+/measurements/raw
+
+# local runtime logs, profiles and evidence
+*.log
+*.ini
+*.perf.data*
+trace.fxt*
+VP_VULKANINFO_*.json
+.hermes/
+.omo/

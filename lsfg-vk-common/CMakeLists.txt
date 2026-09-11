@@ -3,16 +3,19 @@ set(COMMON_SOURCES
     "src/configuration/detection.cpp"
     "src/helpers/errors.cpp"
     "src/helpers/paths.cpp"
+    "src/ipc/socket.cpp"
     "src/vulkan/buffer.cpp"
     "src/vulkan/command_buffer.cpp"
     "src/vulkan/descriptor_pool.cpp"
     "src/vulkan/descriptor_set.cpp"
+    "src/vulkan/exchange.cpp"
     "src/vulkan/fence.cpp"
     "src/vulkan/image.cpp"
     "src/vulkan/sampler.cpp"
     "src/vulkan/semaphore.cpp"
     "src/vulkan/shader.cpp"
     "src/vulkan/timeline_semaphore.cpp"
+    "src/vulkan/timestamps.cpp"
     "src/vulkan/vulkan.cpp")
 
 add_library(lsfg-vk-common STATIC ${COMMON_SOURCES})

@@ -4,19 +4,24 @@
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/paths.hpp"
+#include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/timeline_semaphore.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,10 +42,92 @@ namespace {
         return static_cast<uint64_t>(ts.tv_sec) * 1000ULL +
             static_cast<uint64_t>(ts.tv_nsec) / 1000000ULL;
     }
+
+    // compute percentile from sorted values
+    double percentile(const std::vector<uint64_t>& values, double p) {
+        if (values.empty()) return 0.0;
+        size_t idx = static_cast<size_t>(std::ceil(p / 100.0 * static_cast<double>(values.size()))) - 1;
+        idx = std::min(idx, values.size() - 1);
+        return static_cast<double>(values[idx]);
+    }
+
+    // read timing CSV and compute per-stage percentiles
+    void printTimingSummary(const std::string& csvPath) {
+        std::ifstream file(csvPath);
+        if (!file.is_open()) {
+            std::cerr << "warning: could not open timing CSV for summary: " << csvPath << "\n";
+            return;
+        }
+
+        std::string line;
+        // skip header
+        std::getline(file, line);
+
+        std::vector<uint64_t> copyIn, flow, generate, copyOut, total, gameIn, gameOut;
+
+        while (std::getline(file, line)) {
+            std::stringstream ss(line);
+            std::string field;
+            std::vector<std::string> fields;
+
+            while (std::getline(ss, field, ',')) {
+                fields.push_back(field);
+            }
+
+            if (fields.size() < 9) continue;
+
+            try {
+                copyIn.push_back(std::stoull(fields[2]));
+                flow.push_back(std::stoull(fields[3]));
+                generate.push_back(std::stoull(fields[4]));
+                copyOut.push_back(std::stoull(fields[5]));
+                total.push_back(std::stoull(fields[6]));
+                gameIn.push_back(std::stoull(fields[7]));
+                gameOut.push_back(std::stoull(fields[8]));
+            } catch (...) {
+                continue;
+            }
+        }
+
+        auto sortVec = [](std::vector<uint64_t>& v) {
+            std::sort(v.begin(), v.end());
+        };
+        sortVec(copyIn);
+        sortVec(flow);
+        sortVec(generate);
+        sortVec(copyOut);
+        sortVec(total);
+        sortVec(gameIn);
+        sortVec(gameOut);
+
+        auto printStage = [](const char* name, const std::vector<uint64_t>& v) {
+            if (v.empty()) return;
+            double p50 = percentile(v, 50.0);
+            double p95 = percentile(v, 95.0);
+            std::cerr << "  " << std::left << std::setw(16) << name
+                      << "p50: " << std::right << std::setw(10) << std::fixed << std::setprecision(2) << (p50 / 1e6) << " ms"
+                      << "  p95: " << std::setw(10) << (p95 / 1e6) << " ms\n";
+        };
+
+        std::cerr << "\ntiming summary (percentiles in ms):\n";
+        printStage("copy_in:", copyIn);
+        printStage("flow:", flow);
+        printStage("generate:", generate);
+        printStage("copy_out:", copyOut);
+        printStage("total:", total);
+        printStage("game_copy_in:", gameIn);
+        printStage("game_copy_out:", gameOut);
+    }
 }
 
 int benchmark::run(const Options& opts) {
     try {
+        // Set timing environment variables if requested
+        if (opts.timing_csv.has_value()) {
+            ::setenv("LSFGVK_TIMING", "1", 1);
+            ::setenv("LSFGVK_TIMING_CSV", opts.timing_csv->c_str(), 1);
+        }
+
         // parse options
         if (opts.flow < 0.25F || opts.flow > 1.0F)
             throw ls::error("flow scale must be between 0.25 and 1.0");
@@ -54,6 +141,7 @@ int benchmark::run(const Options& opts) {
             static_cast<uint32_t>(opts.width),
             static_cast<uint32_t>(opts.height)
         };
+        const VkFormat format = opts.hdr ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
 
         // create instance
         const vk::Vulkan vk{
@@ -84,11 +172,11 @@ int benchmark::run(const Options& opts) {
 
         std::pair<int, int> srcfds{};
         const vk::Image frame_0{vk,
-            extent, VK_FORMAT_R8G8B8A8_UNORM,
+            extent, format,
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             std::nullopt, &srcfds.first};
         const vk::Image frame_1{vk,
-            extent, VK_FORMAT_R8G8B8A8_UNORM,
+            extent, format,
             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
             std::nullopt, &srcfds.second};
 
@@ -97,7 +185,7 @@ int benchmark::run(const Options& opts) {
         for (int i = 0; i < (opts.multiplier - 1); i++) {
             int fd{};
             destimgs.emplace_back(vk,
-                extent, VK_FORMAT_R8G8B8A8_UNORM,
+                extent, format,
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                 std::nullopt,
                 &fd
@@ -125,10 +213,27 @@ int benchmark::run(const Options& opts) {
             },
             dll, opts.allow_fp16
         };
+
+        // opaque-fd-equivalent descriptors: modifier sentinel marks legacy
+        // OPAQUE_FD imports, allocationSize/rowPitch are ignored for those;
+        // exporter and processing device coincide here, so this stays same-device
+        const std::array<vk::ExchangeDescriptor, 2> srcDescs{{
+            { srcfds.first, 0, 0, lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
+                format, extent },
+            { srcfds.second, 0, 0, lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
+                format, extent }
+        }};
+        std::vector<vk::ExchangeDescriptor> destDescs{};
+        destDescs.reserve(destfds.size());
+        for (const int fd : destfds)
+            destDescs.push_back({ fd, 0, 0, lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
+                format, extent });
+
         lsfgvk::backend::Context& lsfgvk_ctx = lsfgvk.openContext(
-            srcfds, destfds,
+            srcDescs, destDescs, vk.deviceUUID(),
+            lsfgvk::backend::EXCHANGE_MODIFIER_OPAQUE,
             syncfd, extent.width, extent.height,
-            false, 1.0F / opts.flow, opts.performance_mode
+            opts.hdr, 1.0F / opts.flow, opts.performance_mode
         );
 
         // run the benchmark
@@ -171,6 +276,11 @@ int benchmark::run(const Options& opts) {
         std::cerr << std::setprecision(2) << std::fixed;
         std::cerr << "  fps (generated):  " << fps_generated << "fps\n";
         std::cerr << "  fps (total):      " << fps_total << "fps\n";
+
+        // print timing summary if CSV was requested
+        if (opts.timing_csv.has_value()) {
+            printTimingSummary(*opts.timing_csv);
+        }
 
         // deinitialize lsfg-vk
         lsfgvk.closeContext(lsfgvk_ctx);

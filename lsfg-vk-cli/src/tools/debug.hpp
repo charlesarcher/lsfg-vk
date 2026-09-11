@@ -14,13 +14,16 @@ namespace lsfgvk::cli::debug {
         bool allow_fp16{true};
         int width{1920};
         int height{1080};
+        bool hdr{false};
 
         float flow{0.85F};
         int multiplier{2};
         bool performance_mode{true};
         std::optional<std::string> gpu;
+        std::optional<std::string> render_gpu;
 
         std::filesystem::path path;
+        std::optional<std::string> timing_csv;
     };
 
     /// run the "debug" command

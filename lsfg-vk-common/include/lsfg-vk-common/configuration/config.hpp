@@ -17,12 +17,34 @@ namespace ls {
         std::optional<std::string> dll;
         /// should fp16 be allowed
         bool allow_fp16{};
+        /// default IPC socket path override
+        std::optional<std::string> socket_path;
+        /// global debug logging
+        bool debug{false};
     };
 
     /// pacing methods
     enum class Pacing : uint8_t {
         /// do not perform any pacing (vsync+novrr)
         None
+    };
+
+    /// presentation mode for a profile
+    enum class Presentation : uint8_t {
+        /// present frames in the game process itself
+        Game,
+        /// present frames in an external companion process
+        External
+    };
+
+    /// transport mode for cross-device one-way external presentation
+    enum class Transport : uint8_t {
+        /// POSIX shared memory CPU copy (CopyHop pixel walk, ~2-6ms latency)
+        PosixShm,
+        /// DRM PRIME DMA-BUF zero-copy export (parks on implicit-sync ~30ms)
+        DmaBuf,
+        /// Decoupled zero-copy hardware DMA without implicit sync
+        DecoupledDma
     };
 
     /// game profile configuration
@@ -41,6 +63,24 @@ namespace ls {
         bool performance_mode{false};
         /// pacing method
         Pacing pacing{Pacing::None};
+        /// where the frames get presented
+        Presentation presentation{Presentation::Game};
+        /// optional output name for external presentation
+        std::optional<std::string> output;
+        /// transport mode for one-way external presentation
+        Transport transport{Transport::PosixShm};
+        /// custom IPC socket path override
+        std::optional<std::string> socket_path;
+        /// emulate isolated/fake swapchain for headless/resizing games
+        bool fake_swapchain{false};
+        /// use Wayland layer-shell (zwlr_layer_shell_v1)
+        bool layer_shell{false};
+        /// fullscreen presentation window
+        bool fullscreen{true};
+        /// show telemetry HUD
+        bool hud{true};
+        /// enable debug logging
+        bool debug{false};
     };
 
     /// parsed configuration file

@@ -22,6 +22,13 @@ int validate::run(const Options& opts) {
 
     try {
         const ls::ConfigFile config{path};
+        for (const auto& profile : config.profiles()) {
+            const auto* const presentation = profile.presentation == ls::Presentation::External
+                ? "external" : "game";
+            std::cerr << "  " << profile.name
+                      << ": presentation=" << presentation
+                      << ", output=" << (profile.output ? *profile.output : "-") << '\n';
+        }
         std::cerr << "Validation success\n";
     } catch (const std::exception& e) {
         std::cerr << "Validation failed: " << e.what() << '\n';

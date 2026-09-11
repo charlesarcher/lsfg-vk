@@ -1,5 +1,6 @@
 set(CLI_SOURCES
     "src/tools/benchmark.cpp"
+    "src/tools/copybench.cpp"
     "src/tools/debug.cpp"
     "src/tools/validate.cpp"
     "src/main.cpp")

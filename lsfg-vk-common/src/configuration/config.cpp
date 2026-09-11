@@ -8,6 +8,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <utility>
@@ -106,11 +107,33 @@ namespace {
             return Pacing::None;
         throw ls::error("unknown pacing method: " + str);
     }
+    /// parse a presentation mode from string
+    Presentation presentationFromString(const std::string& str) {
+        if (str == "game")
+            return Presentation::Game;
+        if (str == "external")
+            return Presentation::External;
+        throw ls::error("unknown presentation mode: " + str
+            + " (allowed values: 'game', 'external')");
+    }
+    /// parse a transport mode from string
+    Transport transportFromString(const std::string& str) {
+        if (str == "shm" || str == "posix_shm")
+            return Transport::PosixShm;
+        if (str == "dmabuf" || str == "dma" || str == "dma_buf")
+            return Transport::DmaBuf;
+        if (str == "decoupled" || str == "decoupled_dma" || str == "zero_copy" || str == "dma_no_sync")
+            return Transport::DecoupledDma;
+        throw ls::error("unknown transport mode: " + str
+            + " (allowed values: 'shm', 'dmabuf', 'decoupled')");
+    }
     /// parse the global configuration
     GlobalConf parseGlobalConf(const toml::table& tbl) {
         const GlobalConf conf{
             .dll = tbl["dll"].value<std::string>(),
-            .allow_fp16 = tbl["allow_fp16"].value_or(true)
+            .allow_fp16 = tbl["allow_fp16"].value_or(true),
+            .socket_path = tbl["socket"].value<std::string>(),
+            .debug = tbl["debug"].value_or(false)
         };
 
         if (conf.dll && !std::filesystem::exists(*conf.dll))
@@ -127,13 +150,26 @@ namespace {
             .multiplier = tbl["multiplier"].value_or(2U),
             .flow_scale = tbl["flow_scale"].value_or(1.0F),
             .performance_mode = tbl["performance_mode"].value_or(false),
-            .pacing = parcingFromString(tbl["pacing"].value_or<std::string>("none"))
+            .pacing = parcingFromString(tbl["pacing"].value_or<std::string>("none")),
+            .presentation = presentationFromString(tbl["presentation"].value_or<std::string>("game")),
+            .output = tbl["output"].value<std::string>(),
+            .transport = transportFromString(tbl["transport"].value_or<std::string>("shm")),
+            .socket_path = tbl["socket"].value<std::string>(),
+            .fake_swapchain = tbl["fake_swapchain"].value_or(false),
+            .layer_shell = tbl["layer_shell"].value_or(false),
+            .fullscreen = tbl["fullscreen"].value_or(true),
+            .hud = tbl["hud"].value_or(true),
+            .debug = tbl["debug"].value_or(false)
         };
 
         if (conf.multiplier <= 1)
             throw ls::error("multiplier must be greater than 1");
         if (conf.flow_scale < 0.25F || conf.flow_scale > 1.0F)
             throw ls::error("flow_scale must be between 0.25 and 1.0");
+        if (conf.presentation == Presentation::External && !conf.gpu)
+            throw ls::error("external presentation requires 'gpu' to select the processing device");
+        if (conf.output && conf.presentation == Presentation::Game)
+            std::cerr << "lsfg-vk: warning: output is only used by presentation='external'\n";
 
         return conf;
     }
@@ -247,6 +283,10 @@ void ConfigFile::write(const std::filesystem::path& path) const {
                 profile.insert("pacing", "none");
                 break;
         }
+        if (conf.presentation != Presentation::Game)
+            profile.insert("presentation", "external");
+        if (conf.output)
+            profile.insert("output", conf.output.value_or(""));
 
         profiles.push_back(profile);
     }

@@ -3,7 +3,9 @@
 #pragma once
 
 #include "../helpers/pointers.hpp"
+#include "exchange.hpp"
 
+#include <array>
 #include <bitset>
 #include <cstdint>
 #include <filesystem>
@@ -23,6 +25,10 @@ namespace vk {
         PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices;
         PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties;
         PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2;
+        PFN_vkGetPhysicalDeviceFormatProperties2 GetPhysicalDeviceFormatProperties2;
+        PFN_vkGetPhysicalDeviceExternalSemaphoreProperties
+            GetPhysicalDeviceExternalSemaphoreProperties;
+        PFN_vkGetPhysicalDeviceExternalFenceProperties GetPhysicalDeviceExternalFenceProperties;
         PFN_vkGetPhysicalDeviceQueueFamilyProperties GetPhysicalDeviceQueueFamilyProperties;
         PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2;
         PFN_vkGetPhysicalDeviceMemoryProperties GetPhysicalDeviceMemoryProperties;
@@ -31,6 +37,7 @@ namespace vk {
 
         // extension functions
         PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR GetPhysicalDeviceSurfaceCapabilitiesKHR;
+        PFN_vkGetPhysicalDeviceSurfacePresentModesKHR GetPhysicalDeviceSurfacePresentModesKHR;
     };
 
     /// initialize vulkan instance function pointers
@@ -69,13 +76,19 @@ namespace vk {
         PFN_vkBeginCommandBuffer BeginCommandBuffer;
         PFN_vkEndCommandBuffer EndCommandBuffer;
         PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+        PFN_vkCmdPipelineBarrier2 CmdPipelineBarrier2;
         PFN_vkCmdBlitImage CmdBlitImage;
         PFN_vkCmdClearColorImage CmdClearColorImage;
         PFN_vkCmdBindPipeline CmdBindPipeline;
         PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
         PFN_vkCmdDispatch CmdDispatch;
         PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+        PFN_vkCmdCopyImage CmdCopyImage;
+        PFN_vkCmdCopyImage2 CmdCopyImage2;
+        PFN_vkCmdWriteTimestamp CmdWriteTimestamp;
+        PFN_vkCmdResetQueryPool CmdResetQueryPool;
         PFN_vkQueueSubmit QueueSubmit;
+        PFN_vkQueueSubmit2 QueueSubmit2;
         PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
         PFN_vkFreeDescriptorSets FreeDescriptorSets;
         PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
@@ -104,11 +117,17 @@ namespace vk {
         PFN_vkGetPipelineCacheData GetPipelineCacheData;
         PFN_vkCreateComputePipelines CreateComputePipelines;
         PFN_vkDestroyPipeline DestroyPipeline;
+        PFN_vkGetImageSubresourceLayout GetImageSubresourceLayout;
+        PFN_vkCreateQueryPool CreateQueryPool;
+        PFN_vkDestroyQueryPool DestroyQueryPool;
+        PFN_vkGetQueryPoolResults GetQueryPoolResults;
 
         // extension functions
         PFN_vkSignalSemaphoreKHR SignalSemaphoreKHR;
         PFN_vkWaitSemaphoresKHR WaitSemaphoresKHR;
         PFN_vkGetMemoryFdKHR GetMemoryFdKHR;
+        PFN_vkGetMemoryFdPropertiesKHR GetMemoryFdPropertiesKHR;
+        PFN_vkGetMemoryHostPointerPropertiesEXT GetMemoryHostPointerPropertiesEXT;
         PFN_vkImportSemaphoreFdKHR ImportSemaphoreFdKHR;
         PFN_vkGetSemaphoreFdKHR GetSemaphoreFdKHR;
         PFN_vkCreateSwapchainKHR CreateSwapchainKHR;
@@ -125,6 +144,16 @@ namespace vk {
     /// @return initialized function pointers
     VulkanDeviceFuncs initVulkanDeviceFuncs(const VulkanInstanceFuncs& fi, VkDevice device,
         bool graphical);
+
+    /// find a queue family index usable for transfer-only work: first pass
+    /// prefers a dedicated transfer family (TRANSFER without GRAPHICS/COMPUTE),
+    /// falling back to any non-graphics transfer-capable family (e.g. a
+    /// COMPUTE|TRANSFER family). returns std::nullopt when no such family exists
+    /// @param fi instance function pointers
+    /// @param physdev physical device handle
+    /// @return the queue family index, or std::nullopt if none exists
+    std::optional<uint32_t> findTransferQFI(const VulkanInstanceFuncs& fi,
+        VkPhysicalDevice physdev);
 
     /// vulkan version wrapper
     class version {
@@ -155,13 +184,24 @@ namespace vk {
         /// @param isGraphical whether the device is graphical (rather than compute)
         /// @param setLoaderData optional function to set loader data
         /// @param cachefile optional path to pipeline cache file
+        /// @param enableDmaBufExtensions whether to additionally enable the
+        ///        dma-buf exchange extensions (VK_EXT_external_memory_dma_buf,
+        ///        VK_EXT_image_drm_format_modifier) when the selected physical
+        ///        device supports them; requesting them on an unsupported device
+        ///        is a hard error. defaults to off (legacy extension set)
+        /// @param enableTransferQueue whether to additionally create a second
+        ///        queue from a non-graphics transfer-capable family (used by
+        ///        the app's input thread for snapshot copies). only takes
+        ///        effect when such a family exists; defaults to off
         /// @throws ls::vulkan_error on failure
         Vulkan(const std::string& appName, version appVersion,
             const std::string& engineName, version engineVersion,
             PhysicalDeviceSelector selectPhysicalDevice,
             bool isGraphical = false,
             std::optional<PFN_vkSetDeviceLoaderData> setLoaderData = std::nullopt,
-            const std::optional<std::filesystem::path>& cachefile = std::nullopt);
+            const std::optional<std::filesystem::path>& cachefile = std::nullopt,
+            bool enableDmaBufExtensions = false,
+            bool enableTransferQueue = false);
 
         /// create based on an existing externally managed vulkan instance.
         /// @param instance vulkan instance handle
@@ -210,9 +250,75 @@ namespace vk {
         /// @return the compute queue handle
         [[nodiscard]] const auto& queue() const { return this->computeQueue; }
 
+        /// get the compute queue family index
+        /// @return the queue family index
+        [[nodiscard]] uint32_t queueFamilyIndex() const { return this->queueFamilyIdx; }
+
+        /// get the transfer queue family index
+        /// @return the queue family index, or VK_QUEUE_FAMILY_IGNORED if no
+        ///         transfer queue was created
+        [[nodiscard]] uint32_t transferQueueFamilyIndex() const {
+            return this->transferQueueFamilyIdx;
+        }
+
+        /// get the transfer queue
+        /// @return the queue handle, or VK_NULL_HANDLE if not created
+        [[nodiscard]] VkQueue transferQueueHandle() const { return this->transferQueue; }
+
+        /// DMA-in uses the existing transfer queue. Do not request a second
+        /// queue in that family (that hung the offload GPU).
+        [[nodiscard]] VkQueue dmaQueueHandle() const {
+            return this->transferQueue != VK_NULL_HANDLE
+                ? this->transferQueue : this->computeQueue;
+        }
+
+        /// get the transfer command pool
+        /// @return the command pool handle, or VK_NULL_HANDLE if not created
+        [[nodiscard]] VkCommandPool transferCmdPoolHandle() const {
+            return this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+                ? *this->transferCmdPool : VK_NULL_HANDLE;
+        }
+
+        /// check if a transfer queue was created
+        /// @return true if a transfer queue exists
+        [[nodiscard]] bool hasTransferQueue() const {
+            return this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED;
+        }
+
         /// check if fp16 is supported
         /// @return true if fp16 is supported
         [[nodiscard]] bool supportsFP16() const { return this->fp16; }
+
+        /// get the device uuid of the physical device
+        /// @return the 16-byte device uuid
+        [[nodiscard]] std::array<uint8_t, 16> deviceUUID() const;
+
+        /// get the driver uuid of the physical device
+        /// @return the 16-byte driver uuid
+        [[nodiscard]] std::array<uint8_t, 16> driverUUID() const;
+
+        /// check if VK_EXT_external_memory_dma_buf is supported
+        /// @return true if dma buf imports/exports are supported
+        [[nodiscard]] bool supportsDmaBuf() const;
+
+        /// check if VK_EXT_image_drm_format_modifier is supported
+        /// @return true if drm modifier images are supported
+        [[nodiscard]] bool supportsDrmModifierImages() const;
+
+        /// query the drm modifier exchange capabilities of the physical device
+        /// for a single format, filled from VkDrmFormatModifierPropertiesListEXT.
+        /// devices without VK_EXT_image_drm_format_modifier yield an empty list
+        /// @param format format to query capabilities for
+        /// @return caps keyed under the queried format
+        [[nodiscard]] DeviceExchangeCaps exchangeCaps(VkFormat format) const;
+
+        /// check if sync fd semaphores can be exported and imported
+        /// @return true if sync fd semaphore export/import is supported
+        [[nodiscard]] bool supportsSyncFdSemaphoreExportImport() const;
+
+        /// check if sync fd fences can be exported and imported
+        /// @return true if sync fd fence export/import is supported
+        [[nodiscard]] bool supportsSyncFdFenceExportImport() const;
 
         /// get instance-level function pointers
         /// @return the instance function pointers
@@ -238,6 +344,9 @@ namespace vk {
         VkQueue computeQueue;
 
         ls::owned_ptr<VkCommandPool> cmdPool;
+        uint32_t transferQueueFamilyIdx{VK_QUEUE_FAMILY_IGNORED};
+        VkQueue transferQueue{};
+        ls::owned_ptr<VkCommandPool> transferCmdPool;
         ls::owned_ptr<VkPipelineCache> pipelineCache;
         std::optional<std::filesystem::path> cachefile;
     };

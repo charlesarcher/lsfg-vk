@@ -21,9 +21,9 @@ namespace lsfgvk::backend {
     public:
         /// create a mipmaps shaderchain
         /// @param ctx context
-        /// @param sourceImages pair of source images
+        /// @param sourceImages source images (STAGING_RING_DEPTH of them)
         Mipmaps(const Ctx& ctx,
-            const std::pair<vk::Image, vk::Image>& sourceImages);
+            const std::vector<vk::Image>& sourceImages);
 
         /// prepare the shaderchain initially
         /// @param images vector to fill with image handles

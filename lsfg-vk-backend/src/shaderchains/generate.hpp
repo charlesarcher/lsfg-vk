@@ -22,12 +22,12 @@ namespace lsfgvk::backend {
         /// create a generate shaderchain
         /// @param ctx context
         /// @param idx generated frame index
-        /// @param sourceImages pair of source images
+        /// @param sourceImages source images (STAGING_RING_DEPTH of them)
         /// @param inputImage1 input image 1
         /// @param inputImage2 input image 2
         /// @param inputImage3 input image 3
         Generate(const Ctx& ctx, size_t idx,
-            const std::pair<vk::Image, vk::Image>& sourceImages,
+            const std::vector<vk::Image>& sourceImages,
             const vk::Image& inputImage1,
             const vk::Image& inputImage2,
             const vk::Image& inputImage3,

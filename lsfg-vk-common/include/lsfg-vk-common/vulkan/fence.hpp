@@ -15,8 +15,10 @@ namespace vk {
     public:
         /// create a fence
         /// @param vk the vulkan instance
+        /// @param signaled create the fence in the signaled state (for
+        ///                 command-buffer rings whose first wait must pass)
         /// @throws ls::vulkan_error on failure
-        Fence(const vk::Vulkan& vk);
+        explicit Fence(const vk::Vulkan& vk, bool signaled = false);
 
         /// reset the fence
         /// @param vk the vulkan instance

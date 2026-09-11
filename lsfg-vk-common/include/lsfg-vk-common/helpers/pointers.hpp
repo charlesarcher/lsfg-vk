@@ -62,6 +62,8 @@ namespace ls {
                 throw std::logic_error("lazy: no value present");
             return *this->opt;
         }
+
+        void reset() { this->opt.reset(); }
     private:
         std::optional<T> opt{};
     };
