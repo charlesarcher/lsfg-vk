@@ -882,6 +882,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         int snapFd{ -1 };           // sync_fd semaphore for the snapshot copy; -1 if no snapshot
         uint32_t stagingIdx{ 0 };
         uint64_t captureTsNs{ 0 };
+        // Session 40 latency ledger stamps (CLOCK_MONOTONIC steady_clock ns):
+        // recvTsNs = FRAME pulled off the wire by the input thread;
+        // schedDoneNs = scheduleFrames had submitted snapshot + frame-gen work
+        // (the app's last queue touch for this frame).
+        uint64_t recvTsNs{ 0 };
+        uint64_t schedDoneNs{ 0 };
     };
     struct Inbox {
         std::mutex m;
@@ -1050,6 +1056,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             std::vector<int> doneFds;  // produced gen fds; -1 once imported
             int snapFd{ -1 };          // snapshot sync_fd sem for REAL blit
             uint64_t captureTsNs{ 0 };
+            uint64_t recvTsNs{ 0 };    // Session 40 ledger stamps (see PendingFrame)
+            uint64_t schedDoneNs{ 0 };
         } cur;
         int lastShownStagingIdx{ -1 }; // newest real frame actually shown (HOLD-LAST)
         uint64_t presentIdx{ 0 };      // rolling index into the signal pool
@@ -1303,6 +1311,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         cur.doneFds = std::move(pf->doneFds);
                         cur.snapFd = pf->snapFd;  // -1 if no snapshot fd
                         cur.captureTsNs = pf->captureTsNs;
+                        cur.recvTsNs = pf->recvTsNs;
+                        cur.schedDoneNs = pf->schedDoneNs;
                     } else if (wantDropWsi.exchange(false, std::memory_order_relaxed)
                             && g_overlay.wsi) {
                         dbg("output: idle drop overlay WSI (keep IPC)");
@@ -1406,6 +1416,23 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         const double latMs = (nowNs > cur.captureTsNs) ? (nowNs - cur.captureTsNs) / 1e6 : 0.0;
                         lsfgvk::gui::g_guiState.currentLatencyGenMs.store(static_cast<float>(latMs));
                         dbg("MEASURED LATENCY: GEN present slot %u latency %.2f ms", cur.stagingIdx, latMs);
+                        // Session 40 ledger: IPC hop (capture→recv) + app solve
+                        // (recv→schedDone excerpts the app's work window)
+                        if (cur.recvTsNs > cur.captureTsNs) {
+                            const float ipcMs = static_cast<float>(
+                                (cur.recvTsNs - cur.captureTsNs) / 1e6);
+                            lsfgvk::gui::g_guiState.latencyIpcMs.store(ipcMs);
+                            if (cur.schedDoneNs > cur.recvTsNs)
+                                lsfgvk::gui::g_guiState.latencyGenSolveMs.store(static_cast<float>(
+                                    (cur.schedDoneNs - cur.recvTsNs) / 1e6));
+                            static uint32_t ledgerLogged = 0;
+                            if (ledgerLogged++ < 5)
+                                dbg("ledger: ipc %.3f ms solve %.3f ms (slot %u)",
+                                    ipcMs,
+                                    (cur.schedDoneNs > cur.recvTsNs)
+                                        ? (cur.schedDoneNs - cur.recvTsNs) / 1e6 : 0.0,
+                                    cur.stagingIdx);
+                        }
                     }
                     ++presentIdx;
                     ++presentedFrames;
@@ -1542,6 +1569,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
                 lastFrameAt = Clock::now();
                 gotFrame = true;
+                const auto recvTs = Clock::now();
                 auto msg = conn.receive(std::nullopt);
                 const auto* frame = std::get_if<ls::ipc::Frame>(&msg);
                 if (!frame)
@@ -2075,7 +2103,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 dbg("input: scheduleFrames took %lld us (fidx %llu)",
                     elapsedUs(tSched0, Clock::now()), (unsigned long long)fidx);
 
-                inbox.push(PendingFrame{ std::move(doneFds), snapFd, frame->stagingIdx, frame->captureTsNs });
+                PendingFrame pf{ std::move(doneFds), snapFd,
+                    frame->stagingIdx, frame->captureTsNs };
+                pf.recvTsNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        recvTs.time_since_epoch()).count());
+                pf.schedDoneNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Clock::now().time_since_epoch()).count());
+                inbox.push(std::move(pf));
                 ++frameCount;
                 ++fidx;
             }
