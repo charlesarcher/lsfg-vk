@@ -131,21 +131,29 @@ static void *input_thread(void *arg) {
      * on the desk, so listen on all of them. */
     int fds[64];
     int nfd = 0;
+    char names[64][120];
     glob_t gg;
     if (glob("/dev/input/by-id/*event-mouse*", 0, nullptr, &gg) == 0) {
-        for (size_t i = 0; i < gg.gl_pathc && nfd < 32; ++i) {
-            int fd = open(gg.gl_pathv[i], O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-            if (fd < 0) continue;
+        // copy paths FIRST: globfree() frees gl_pathv, any later use of it is
+        // a use-after-free (the standalone evread_c tool segfaulted exactly
+        // there — first key event printed a freed device string).
+        const size_t npaths = gg.gl_pathc < 32 ? gg.gl_pathc : 32;
+        for (size_t i = 0; i < npaths; ++i)
+            snprintf(names[i], sizeof(names[i]), "%s", gg.gl_pathv[i]);
+        globfree(&gg);
+        for (size_t i = 0; i < npaths; ++i) {
+            int fd = open(names[i], O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+            if (fd < 0) { perror(names[i]); continue; }
             unsigned clk = CLOCK_MONOTONIC; /* matches KWin clock_id=1 */
             if (ioctl(fd, EVIOCSCLOCKID, &clk) != 0)
                 perror("EVIOCSCLOCKID (timestamps may be CLOCK_REALTIME!)");
             else {
-                printf("input: %s -> CLOCK_MONOTONIC\n", gg.gl_pathv[i]);
+                printf("input: %s -> CLOCK_MONOTONIC\n", names[i]);
                 fflush(stdout);
             }
             fds[nfd++] = fd;
+            fflush(stdout);
         }
-        globfree(&gg);
     }
     if (nfd == 0) { perror("no input devices readable"); return nullptr; }
 
@@ -167,7 +175,13 @@ static void *input_thread(void *arg) {
             for (size_t j = 0; j < count; ++j) {
                 if (ev[j].type != EV_KEY || ev[j].value != 1)
                     continue;
-                if (ev[j].code == BTN_LEFT) {  /* left-click press */
+                static int dbg = -1;
+            if (dbg < 0)
+                dbg = getenv("LSFG_PROBE_DEBUG") ? 1 : 0;
+            if (dbg)
+                printf("ev: t=%u c=%u v=%u on fd#%d\n", ev[j].type,
+                       ev[j].code, ev[j].value, i);
+            if (ev[j].code == BTN_LEFT) {  /* left-click press */
                     const uint64_t event_ns =
                         (uint64_t)ev[j].time.tv_sec * 1000000000ULL
                         + (uint64_t)ev[j].time.tv_usec * 1000ULL;
