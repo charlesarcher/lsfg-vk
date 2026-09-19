@@ -56,7 +56,9 @@ namespace lsfgvk::gui {
         std::atomic<float> latencyIpcMs{0.0f};
         std::atomic<float> latencyGenSolveMs{0.0f};
         std::atomic<float> latencyScanMs{0.0f};
-        std::atomic<float> latencyGenExtraMs{0.0f};
+        std::atomic<float> latencyGenExtraMs{0.0f};   // GEN scanout minus REAL scanout
+        std::atomic<float> latencyRealScanMs{0.0f};   // REAL present-submit → latch
+        std::atomic<float> latencyGenScanMs{0.0f};    // GEN present-submit → latch
         std::atomic<float> inputLatencyP50Ms{0.0f};
         std::atomic<float> inputLatencyP99Ms{0.0f};
         std::atomic<bool>  inputLatencyValid{false};

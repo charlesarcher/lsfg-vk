@@ -1117,6 +1117,33 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             std::snprintf(lat, sizeof(lat), "%.1f+%.1f+%.1fms",
                                 static_cast<double>(ipc), static_cast<double>(solve),
                                 static_cast<double>(scan));
+                        // Opt-in experience row (LSFGVK_LATENCY_HUD=experience|all):
+                        // GEN adds +X ms = GEN scanout minus REAL scanout EMA.
+                        // Dashes until both anchors are live — never a guessed number.
+                        static const bool expHud =
+                            [] {
+                                const char* e = std::getenv("LSFGVK_LATENCY_HUD");
+                                return e && (std::strcmp(e, "experience") == 0
+                                    || std::strcmp(e, "all") == 0);
+                            }();
+                        if (expHud) {
+                            const float genExtra = lsfgvk::gui::g_guiState.
+                                latencyGenExtraMs.load();
+                            const float p50 = lsfgvk::gui::g_guiState.
+                                inputLatencyP50Ms.load();
+                            const float p99 = lsfgvk::gui::g_guiState.
+                                inputLatencyP99Ms.load();
+                            if (genExtra != 0.0f)
+                                std::snprintf(lat, sizeof(lat), "%.1f+%.1f+%.1f E%+.1f",
+                                    static_cast<double>(ipc), static_cast<double>(solve),
+                                    static_cast<double>(scan),
+                                    static_cast<double>(genExtra));
+                            else
+                                std::snprintf(lat, sizeof(lat), "%.1f+%.1f+%.1f E--",
+                                    static_cast<double>(ipc), static_cast<double>(solve),
+                                    static_cast<double>(scan));
+                            (void)p50; (void)p99; // click→photon row rides step 4 calibration
+                        }
                         hud->update(std::to_string(gameFps) + "/" + std::to_string(presentedFps),
                             lat);
                     }
@@ -1211,6 +1238,28 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             // Session 40: drain presented-feedback (needs the blocking
             // roundtrip; see drainPresentFeedback docs)
             g_overlay.wsi->drainPresentFeedback();
+            {
+                // REAL present→scanout: submit time vs the same commit's latch.
+                // EMA (alpha 1/8) iInto latencyRealScanMs, used for the GEN adds
+                // delta and the experience row.
+                const uint64_t idx = presentIdx > 0 ? presentIdx - 1 : 0;
+                (void)idx;
+                const uint64_t latchNs = g_overlay.wsi->lastPresentLatchNs();
+                if (latchNs > 0) {
+                    const uint64_t submitNs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            tReal0.time_since_epoch()).count());
+                    if (latchNs > submitNs && latchNs - submitNs < 100'000'000ULL) {
+                        const float scanMs = static_cast<float>(
+                            static_cast<double>(latchNs - submitNs) / 1e6);
+                        const float prior = lsfgvk::gui::g_guiState.
+                            latencyRealScanMs.load(std::memory_order_relaxed);
+                        lsfgvk::gui::g_guiState.latencyRealScanMs.store(
+                            prior == 0.0f ? scanMs : prior + (scanMs - prior) / 8.0f,
+                            std::memory_order_relaxed);
+                    }
+                }
+            }
             if (capTsNs > 0) {
                 const uint64_t nowNs = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1420,10 +1469,34 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     };
                     // Session 40: same as REAL — arm before the commit.
                     g_overlay.wsi->armPresentFeedback(fbHandle);
+                    const auto tGenSubmit = Clock::now();
                     const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
                     if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                         throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
                     g_overlay.wsi->drainPresentFeedback();
+                    {
+                        // GEN present→scanout EMA + 'GEN adds' delta vs REAL.
+                        const uint64_t latchNs = g_overlay.wsi->lastPresentLatchNs();
+                        if (latchNs > 0) {
+                            const uint64_t submitNs = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    tGenSubmit.time_since_epoch()).count());
+                            if (latchNs > submitNs && latchNs - submitNs < 100'000'000ULL) {
+                                const float scanMs = static_cast<float>(
+                                    static_cast<double>(latchNs - submitNs) / 1e6);
+                                float prior = lsfgvk::gui::g_guiState.
+                                    latencyGenScanMs.load(std::memory_order_relaxed);
+                                lsfgvk::gui::g_guiState.latencyGenScanMs.store(
+                                    prior == 0.0f ? scanMs : prior + (scanMs - prior) / 8.0f,
+                                    std::memory_order_relaxed);
+                                const float realScan = lsfgvk::gui::g_guiState.
+                                    latencyRealScanMs.load(std::memory_order_relaxed);
+                                if (realScan > 0.0f)
+                                    lsfgvk::gui::g_guiState.latencyGenExtraMs.store(
+                                        scanMs - realScan, std::memory_order_relaxed);
+                            }
+                        }
+                    }
                     if (cur.captureTsNs > 0) {
                         const uint64_t nowNs = static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
