@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <iostream>
 #include <optional>
+#include <unordered_set>
 #include <string>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -26,8 +27,14 @@
 namespace lsfgvk::layer {
 namespace {
     std::atomic<uintptr_t> nextHandle{0x5AF50001};
-    std::unordered_map<VkSwapchainKHR, IsolatedSwapchain> g_isolated;
-    std::unordered_set<VkSwapchainKHR> g_tombstones;
+    // heap-leaked on purpose: a file-static map would run its destructor during
+    // exit() AFTER the Vulkan instance's statics may already be destroyed
+    // (cross-TU static dtor order is UB) — observed as a SEGV inside
+    // ~unordered_map() at __libc_start_main's exit path (cored 61477, bt: exit →
+    // ~unordered_map<VkSwapchainKHR*, IsolatedSwapchain>). Never-freed heap keeps
+    // the destructor from ever running; the OS reclaims everything at exit.
+    auto* g_isolated = new std::unordered_map<VkSwapchainKHR, IsolatedSwapchain>();
+    auto* g_tombstones = new std::unordered_set<VkSwapchainKHR>();
     uint32_t g_signalFamily{~0u};
     uint32_t g_signalIndex{0};
     bool g_signalNoted{false};
@@ -122,28 +129,28 @@ VkSwapchainKHR allocIsolatedHandle() {
 }
 
 bool isIsolated(VkSwapchainKHR handle) {
-    return g_isolated.find(handle) != g_isolated.end();
+    return g_isolated->find(handle) != g_isolated->end();
 }
 
 bool isIsolatedTombstone(VkSwapchainKHR handle) {
-    return g_tombstones.find(handle) != g_tombstones.end();
+    return g_tombstones->find(handle) != g_tombstones->end();
 }
 
 IsolatedSwapchain& isolatedAt(VkSwapchainKHR handle) {
-    return g_isolated.at(handle);
+    return g_isolated->at(handle);
 }
 
 void destroyIsolated(const vk::Vulkan& vk, VkSwapchainKHR handle) {
-    auto it = g_isolated.find(handle);
-    if (it == g_isolated.end())
+    auto it = g_isolated->find(handle);
+    if (it == g_isolated->end())
         return;
     if (it->second.icdAcqSem != VK_NULL_HANDLE)
         vk.df().DestroySemaphore(vk.dev(), it->second.icdAcqSem, nullptr);
     for (int fd : it->second.exportFds)
         if (fd >= 0)
             ::close(fd);
-    g_isolated.erase(it);
-    g_tombstones.insert(handle);
+    g_isolated->erase(it);
+    g_tombstones->insert(handle);
 }
 
 IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateInfoKHR& info) {
@@ -240,7 +247,7 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
 }
 
 void storeIsolated(VkSwapchainKHR handle, IsolatedSwapchain iso) {
-    g_isolated.emplace(handle, std::move(iso));
+    g_isolated->emplace(handle, std::move(iso));
 }
 
 void isolatedSignal(const vk::Vulkan& vk, VkQueue signalQueue, VkQueue fallback,
