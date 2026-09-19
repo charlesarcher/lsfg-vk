@@ -283,7 +283,9 @@ int main(int argc, char** argv) {
             if (g_tracks[i].scale == 1 && target == nullptr)
                 target = g_outputs[i];
         }
-        if (target) {
+        const bool nofs = getenv("LSFGVK_PROBE_WINDOWED") != nullptr;
+        if (target && !nofs) {
+            printf("fullscreen to scale-1 output\n");
             xdg_toplevel_set_fullscreen(tl, target);
             wl_surface_commit(surf);
             for (int i = 0; i < 10 && !g_surfConfigured; ++i) wl_display_roundtrip(dpy);
@@ -517,14 +519,47 @@ int main(int argc, char** argv) {
 
         /* acquire + draw + commit */
         uint32_t idx = 0;
-        VkResult ac = vkAcquireNextImageKHR(dev, swap, 33'333'333ULL /* 33 ms cap: an
-            occluded surface can stop buffer cycling forever; without a cap the main
-            loop froze after the first commit (observed: no ticks past first commit) */,
-            acqSems[frameSeq % NSWSEMS], VK_NULL_HANDLE, &idx);
+        /* S40: use the FENCE form with a 0-ns timeout polled by the host —
+           acq-sem waits can wedge inside RADV's syncobj path (gdb main-frames
+           deep in libvulkan_radeon in every 'decay' run); a fence keeps the
+           wait on the host where nothing can hide it. */
+        VkFence acqFence = cbsFences[(8 + (frameSeq & 7)) & 7];  /* host poll */
+        VkResult ac = vkAcquireNextImageKHR(dev, swap, 0 /*host polls*/,
+            VK_NULL_HANDLE,
+            acqFence, &idx);
+        if (ac == VK_SUCCESS || ac == VK_SUBOPTIMAL_KHR) {
+            const VkResult w = vkWaitForFences(dev, 1, &acqFence, VK_FALSE, 12'000'000ULL);
+            if (w != VK_SUCCESS && w != VK_TIMEOUT) { }
+            if (w != VK_SUCCESS) {
+                /* give the fence a chance; on timeout also reset so the next
+                   acquire can signal it again */
+                vkResetFences(dev, 1, &acqFence);
+                printf("acquire signaled but fence late (w=%d)\n", w);
+            }
+        }
         if (ac == VK_TIMEOUT || ac == VK_NOT_READY)
-            continue;   /* keep the input thread fed; retry next pass */
-        if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR)
+            continue;   /* host-paced spin keeps going */
+        if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR) {
+            printf("acquire FAILED ac=%d (fallthrough continue)\n", ac);
             continue;
+        }
+                /* (old acquire-sem path removed; fence-poll acquire above is canonical) */
+        if (ac == VK_TIMEOUT || ac == VK_NOT_READY) {
+            static unsigned acqFail = 0; static uint64_t lastReport = 0;
+            ++acqFail;
+            struct timespec rn; clock_gettime(CLOCK_MONOTONIC, &rn);
+            const uint64_t nowNs = rn.tv_sec * 1000000000ULL + rn.tv_nsec;
+            if (nowNs - lastReport > 2000000000ULL) {
+                printf("acquire spinning: %u failures since last report (ac=%d)\n",
+                    acqFail, ac);
+                acqFail = 0; lastReport = nowNs;
+            }
+            continue;   /* keep the input thread fed; retry next pass */
+        }
+        if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR) {
+            printf("acquire FAILED ac=%d (fallthrough continue)\n", ac);
+            continue;
+        }
 
         int magenta = 0;
         uint64_t thisClickT = 0;
@@ -552,9 +587,10 @@ int main(int argc, char** argv) {
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
             vkEndCommandBuffer(cbs[idx]);
-            VkSemaphore ws[1] = { acqSems[frameSeq % NSWSEMS] };
+            /* fence-acquire: the CB needs no sem wait; exclusivity comes
+               from the acquire (KWin cannot present an acquired image). */
             VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            si.waitSemaphoreCount = 1; si.pWaitSemaphores = ws;
+            si.waitSemaphoreCount = 0; si.pWaitSemaphores = nullptr;
             VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
             si.pWaitDstStageMask = &st;
             si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
@@ -581,9 +617,9 @@ int main(int argc, char** argv) {
                 vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                     &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
                 vkEndCommandBuffer(cbs[idx]);
-                VkSemaphore ws[1] = { acqSems[frameSeq % NSWSEMS] };
+                /* fence-acquire path: no wait semaphore (see main-loop note) */
                 VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                si.waitSemaphoreCount = 1; si.pWaitSemaphores = ws;
+                si.waitSemaphoreCount = 0; si.pWaitSemaphores = nullptr;
                 VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
                 si.pWaitDstStageMask = &st;
                 si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
@@ -607,13 +643,18 @@ int main(int argc, char** argv) {
         vkResetCommandBuffer(cbs[idx], 0);
             VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             vkBeginCommandBuffer(cbs[idx], &bbi);
-            VkClearColorValue clear = { .float32 = { 0.06f, 0.05f, 0.12f, 1.0f } };
+            /* S40: KWin skips presenting IDENTICAL surfaces — a static bg
+               stops compositor buffer retirement and the acquire starves
+               (the whole 'decay' traced here). 1-bit jitter forces damage. */
+            VkClearColorValue clear = { .float32 = { 0.06f, 0.05f,
+                0.12f + 0.004f * (float)(frameSeq & 1), 1.0f } };
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
             vkEndCommandBuffer(cbs[idx]);
-            VkSemaphore ws[1] = { acqSems[frameSeq % NSWSEMS] };
+            /* fence-acquire: the CB needs no sem wait; exclusivity comes
+               from the acquire (KWin cannot present an acquired image). */
             VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-            si.waitSemaphoreCount = 1; si.pWaitSemaphores = ws;
+            si.waitSemaphoreCount = 0; si.pWaitSemaphores = nullptr;
             VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
             si.pWaitDstStageMask = &st;
             si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
@@ -640,13 +681,11 @@ int main(int argc, char** argv) {
         /* dispatch until THIS commit's presented arrives (KWin replies one frame
            later at vblank); the FIFO barrier pacing needs us to keep dispatching
            or Mesa's internal queue wedges. bounded ~50 ms. */
-        for (int k = 0; k < 12; ++k) {
-            wl_display_roundtrip(dpy);
-            if (magenta && atomic_load(&g_latch[slot])) break;
-            if (!magenta) break;   /* bg frames: one dispatch is enough */
-            struct timespec tw = { 0, 3000000 };
-            nanosleep(&tw, nullptr);
-        }
+        /* S40: single roundtrip per commit, exactly like lsfg-vk-app's
+           drainPresentFeedback — the 12-iteration loop wedged Mesa's WSI
+           internal pacing in every decayed run (and the flush keeps the
+           FIFO bursts rolling). */
+        wl_display_roundtrip(dpy);
         frameSeq++;
         if (frameSeq == 1) printf("render loop ALIVE (first frame presented, slot %u)\n", slot);
         if (frameSeq % 240 == 0)
@@ -702,9 +741,19 @@ int main(int argc, char** argv) {
             const uint64_t nowNs = pz.tv_sec * 1000000000ULL + pz.tv_nsec;
             const uint64_t target = magentaUntil ? 2 : 8;
             if (lastPaceNs && nowNs - lastPaceNs < target * 1000000ULL) {
-                const uint64_t rest = target * 1000000ULL - (nowNs - lastPaceNs);
-                struct timespec rs = { rest / 1000000000ULL, rest % 1000000000ULL };
-                nanosleep(&rs, nullptr);
+                /* S40 FINAL LOCK: dispatch while waiting — Mesa's WSI owns a
+                   PRIVATE wayland queue whose callbacks deliver buffer
+                   retirement; sleeping without dispatching starves it and
+                   wedges FIFO presents (the entire decay mechanic).
+                   wl_display_dispatch_pending routes bytes to their queues. */
+                wl_display_dispatch_pending(dpy);
+                const uint64_t rest2 = target * 1000000ULL - (nowNs - lastPaceNs);
+                if (rest2 < target * 1000000ULL) {
+                    struct timespec rs = { rest2 / 1000000000ULL, rest2 % 1000000000ULL };
+                    nanosleep(&rs, nullptr);
+                }
+            } else {
+                wl_display_dispatch_pending(dpy);   /* pacing-exempt dispatch */
             }
             lastPaceNs = nowNs;
         } while (0);
