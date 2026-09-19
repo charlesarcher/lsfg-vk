@@ -40,6 +40,9 @@ namespace ls::hud {
         /// slot. called at a 1 Hz cadence from the present loop thread.
         /// @throws ls::vulkan_error if the previous upload fence does not signal
         void update(std::string_view text);
+        /// Session 40 latency HUD: optional second row under the fps row
+        /// (digits/'.'/'-'/'/'). empty = no second row (1-line box).
+        void update(std::string_view text, std::string_view second);
 
         /// the image the present loop blits into the top-left
         [[nodiscard]] const vk::Image& image() const { return *this->slotImage[this->active]; }
@@ -50,13 +53,16 @@ namespace ls::hud {
 
         /// the pixel extent of the box rasterized into the image
         [[nodiscard]] VkExtent2D box() const { return this->boxExtent; }
+        /// Session 40: is the second (latency) row currently rendered?
+        [[nodiscard]] bool hasSecondRow() const { return this->twoRows; }
 
         /// the present loop calls this after blitting the active image so the
         /// next upload barrier's srcAccessMask is exact
         void markRead() { this->slotLastAccess[this->active] = VK_ACCESS_TRANSFER_READ_BIT; }
 
     private:
-        void rasterize(std::string_view text, std::vector<uint8_t>& out) const;
+        void rasterize(std::string_view text, std::vector<uint8_t>& out,
+            bool topHalf) const;
 
         const vk::Vulkan& vk;
         std::array<ls::lazy<vk::Image>, 2> slotImage;
@@ -69,5 +75,6 @@ namespace ls::hud {
         VkExtent2D boxExtent;
         uint32_t scale;
         vk::CommandBuffer cmdbuf;
+        bool twoRows{ false };
     };
 }

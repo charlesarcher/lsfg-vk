@@ -1103,8 +1103,23 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // hud.update submits on the queue; serialize against the input thread.
                 std::lock_guard<std::mutex> lk(submitMtx);
                 try {
-                    if (hud)
-                        hud->update(std::to_string(gameFps) + "/" + std::to_string(presentedFps));
+                    if (hud) {
+                        // Session 40 latency row: ipc/solve/scan p50s (ms) —
+                        // the always-on pipeline row (segments E..H, one line).
+                        // The opt-in experience row (click→photon p50/p99 +
+                        // GEN adds) arrives with the probe client (step 4) and
+                        // will ride the same second row, gated by config.
+                        char lat[64] = "";
+                        const float ipc = lsfgvk::gui::g_guiState.latencyIpcMs.load();
+                        const float solve = lsfgvk::gui::g_guiState.latencyGenSolveMs.load();
+                        const float scan = lsfgvk::gui::g_guiState.latencyScanMs.load();
+                        if (ipc > 0 || solve > 0 || scan > 0)
+                            std::snprintf(lat, sizeof(lat), "%.1f+%.1f+%.1fms",
+                                static_cast<double>(ipc), static_cast<double>(solve),
+                                static_cast<double>(scan));
+                        hud->update(std::to_string(gameFps) + "/" + std::to_string(presentedFps),
+                            lat);
+                    }
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk-app: hud update failed: " << e.what() << "\n";
                 }

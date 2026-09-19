@@ -44,6 +44,18 @@ namespace {
         }
         return false;
     }
+    /// the '.' glyph in a 5x7 cell: a single 2x2 dot at the bottom-left
+    bool dotPixel(int x, int y) {
+        return (x == 0 || x == 1) && (y == 5 || y == 6);
+    }
+    /// the '-' glyph in a 5x7 cell: the middle horizontal bar
+    bool dashPixel(int x, int y) {
+        return y == 3 && x >= 1 && x <= 3;
+    }
+    /// the '+' glyph in a 5x7 cell: cross in the center
+    bool plusPixel(int x, int y) {
+        return (x == 2 && y >= 1 && y <= 5) || (y == 3 && x >= 1 && x <= 3);
+    }
     /// the '/' glyph in a 5x7 cell (a 1-2 px thick diagonal)
     bool slashPixel(int x, int y) {
         switch (y) {
@@ -57,6 +69,12 @@ namespace {
         }
     }
     bool glyphPixel(char c, int x, int y) {
+        if (c == '.')
+            return dotPixel(x, y);
+        if (c == '-')
+            return dashPixel(x, y);
+        if (c == '+')
+            return plusPixel(x, y);
         if (c >= '0' && c <= '9') {
             const uint8_t segs = kDigit[static_cast<size_t>(c - '0')];
             for (const uint8_t s : kSegment)
@@ -91,9 +109,10 @@ Hud::Hud(const vk::Vulkan& vk, uint32_t outputHeight, VkFormat format)
     uint32_t s = outputHeight / 240;
     s = s < 3 ? 3 : (s > 10 ? 10 : s);
     this->scale = s;
-    // the box is sized for 6 glyph cells ("NN/NNN"); shorter/longer texts are
-    // scaled to fill the same box (see rasterize)
-    this->boxExtent = VkExtent2D{ 34 * s, 11 * s };
+    // the box is sized for 6 glyph cells ("NN/NNN") plus (Session 40) an
+    // optional second latency row — the box is permanently 2x11 rows tall;
+    // update() centers the single row when no second row is rendered.
+    this->boxExtent = VkExtent2D{ 34 * s, 22 * s };
     for (uint8_t i = 0; i < 2; ++i) {
         this->slotImage[i].emplace(vk, this->boxExtent, format,
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
@@ -102,6 +121,11 @@ Hud::Hud(const vk::Vulkan& vk, uint32_t outputHeight, VkFormat format)
 }
 
 void Hud::update(std::string_view text) {
+    this->update(text, {});
+}
+
+void Hud::update(std::string_view text, std::string_view second) {
+    this->twoRows = !second.empty();
     const uint8_t next = static_cast<uint8_t>(this->active ^ 1);
     auto& img = *this->slotImage[next];
     auto& fence = *this->slotFence[next];
@@ -116,7 +140,14 @@ void Hud::update(std::string_view text) {
 
     std::vector<uint8_t> px(static_cast<size_t>(this->boxExtent.width)
         * this->boxExtent.height * 4);
-    this->rasterize(text, px);
+    // first (fps) row centered in the top half when the second row is in
+    // use, else centered in the whole box (single-row layout).
+    if (this->twoRows) {
+        this->rasterize(text, px, true /* topHalf */);
+        this->rasterize(second, px, false /* bottomHalf */);
+    } else {
+        this->rasterize(text, px, false /* center whole box */);
+    }
 
     const vk::Buffer buf(this->vk, px.data(), px.size(),
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
@@ -165,8 +196,11 @@ void Hud::update(std::string_view text) {
     this->active = next;
 }
 
-void Hud::rasterize(std::string_view text, std::vector<uint8_t>& out) const {
-    const uint32_t w = this->boxExtent.width, h = this->boxExtent.height;
+void Hud::rasterize(std::string_view text, std::vector<uint8_t>& out,
+        bool topHalf) const {
+    const uint32_t w = this->boxExtent.width;
+    const uint32_t h = this->twoRows ? this->boxExtent.height / 2 : this->boxExtent.height;
+    const uint32_t yOff = topHalf ? 0 : this->boxExtent.height / 2;
     for (uint32_t i = 0; i < static_cast<uint32_t>(out.size() / 4); ++i)
         storePxl(this->format, out.data() + static_cast<size_t>(i) * 4,
             kBox[0], kBox[1], kBox[2]);
@@ -180,7 +214,7 @@ void Hud::rasterize(std::string_view text, std::vector<uint8_t>& out) const {
     if (se < 1)
         se = 1;
     const uint32_t textW = 5 * len * se, textH = 7 * se;
-    const uint32_t x0 = (w - textW) / 2, y0 = (h - textH) / 2;
+    const uint32_t x0 = (w - textW) / 2, y0 = yOff + (h - textH) / 2;
     for (uint32_t c = 0; c < len && c < text.size(); ++c) {
         for (int gx = 0; gx < 5; ++gx) {
             for (int gy = 0; gy < 7; ++gy) {
