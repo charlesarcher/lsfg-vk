@@ -92,6 +92,53 @@ static const struct wp_presentation_feedback_listener fb_listener =
 
 static _Atomic unsigned g_plantSlot = 2;
 static _Atomic uint64_t  g_plantNs  = 0;     /* click injection moment  */
+
+/* --- dedicated input-pivot thread state (write side) --- */
+static int g_inFds[64];
+static int g_inNfd = 0;
+static _Atomic unsigned g_clickHead = 0;  /* writer index */
+static _Atomic unsigned g_clickTail = 0;  /* reader index */
+static uint64_t g_clickRing[64];
+static pthread_mutex_t g_clickMtx = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_inRun = 1;
+
+static void* input_thread_fn(void* arg) {
+    (void)arg;
+    struct pollfd pfd[64];
+    for (int i = 0; i < g_inNfd; ++i) { pfd[i].fd = g_inFds[i]; pfd[i].events = POLLIN; }
+    struct input_event ev[64];
+    while (atomic_load(&g_inRun)) {
+        const int pr = poll(pfd, (nfds_t)g_inNfd, 250);
+        if (pr <= 0) continue;
+        for (int i = 0; i < g_inNfd; ++i) {
+            if (!(pfd[i].revents & POLLIN)) continue;
+            ssize_t n;
+            while ((n = read(g_inFds[i], ev, sizeof(ev))) > 0) {
+                for (size_t j = 0; j < (size_t)n / sizeof(ev[0]); ++j) {
+                    if (ev[j].type == EV_KEY
+                            && ev[j].code == BTN_LEFT && ev[j].value == 1) {
+                        static unsigned totalClicks = 0;
+                        ++totalClicks;
+                        if (totalClicks == 1)
+                            printf("first click seen\n");
+                        else
+                            printf("click #%u armed\n", totalClicks);
+                        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                        const uint64_t t0 = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+                        unsigned head = atomic_load(&g_clickHead);
+                        unsigned tail = atomic_load(&g_clickTail);
+                        unsigned next = (head + 1) & 63;
+                        if (next != tail) {   /* drop on overflow (.Never expected) */
+                            g_clickRing[head] = t0;
+                            atomic_store(&g_clickHead, next);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return nullptr;
+}
 static double now_ms(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
@@ -99,6 +146,18 @@ static double now_ms(void) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    /* optional side-log: LSFGVK_PROBE_LOG=/path — lets a second reader (agent)
+       inspect a human's run after the fact (^C-safe: line-buffered writes). */
+    {
+        const char* logpath = getenv("LSFGVK_PROBE_LOG");
+        if (logpath) {
+            FILE* lf = fopen(logpath, "a");
+            if (lf) {
+                dup2(fileno(lf), fileno(stdout));
+                setvbuf(stdout, nullptr, _IOLBF, 0);
+            }
+        }
+    }
     const unsigned wantSamples = argc > 1 ? (unsigned)atoi(argv[1]) : 20;
 
     dpy = wl_display_connect(nullptr);
@@ -241,7 +300,7 @@ int main(int argc, char** argv) {
     }
 
     /* --- input thread: SAME discovery as probe_latency (all mice + virtual clicker) --- */
-    int fds[64]; int nfd = 0;
+    int fds[64]; int nfd = 0;  /* copies; handed to the input thread below */
     glob_t gg;
     if (glob("/dev/input/by-id/*event-mouse*", 0, nullptr, &gg) == 0) {
         char names[64][128];
@@ -270,16 +329,13 @@ int main(int argc, char** argv) {
         }
     }
     printf("input devices armed: %d\n", nfd);
-    /* fd health probe: poll each armed fd for 150 ms — the clicker is seen as
-       readable within one click period (400 ms), real mice stay silent. */
-    {
-        struct pollfd hp[64];
-        for (int i = 0; i < nfd; ++i) { hp[i].fd = fds[i]; hp[i].events = POLLIN; }
-        const int hpres = poll(hp, (nfds_t)nfd, 150);
-        printf("health poll: %d readable of %d fds (t=0s)\n", hpres, nfd);
-        for (int i = 0; i < nfd; ++i)
-            if (hp[i].revents & POLLIN) printf("  readable fd idx %d\n", i);
-    }
+    /* hand the armed fds to a DEDICATED pump thread (the in-line pump inside the
+       present loop starved: with the loop pacing at ~250 fps the pump rarely got
+       polled between present-hosting stalls — proven: 1 read of 10 clicks). */
+    g_inNfd = nfd;
+    for (int i = 0; i < nfd; ++i) g_inFds[i] = fds[i];
+    pthread_t inthr;
+    pthread_create(&inthr, nullptr, input_thread_fn, nullptr);
 
     /* --- main loop: render + feedback + click pairing --- */
     printf("click the mouse (or run uclick) — %u samples wanted\n", wantSamples);
@@ -297,34 +353,18 @@ int main(int argc, char** argv) {
     struct input_event ev[64];
 
     uint64_t frameSeq = 0;
+    double tStartMs = now_ms();
     for (;;) {
-        /* pump input: collect clicks — poll() first, only read armed fds */
-        {
-            struct pollfd qfds[64];
-            for (int i = 0; i < nfd; ++i) { qfds[i].fd = fds[i]; qfds[i].events = POLLIN; }
-            const int qres = poll(qfds, (nfds_t)nfd, 0);
-            for (int i = 0; qres > 0 && i < nfd; ++i) {
-                if (!(qfds[i].revents & POLLIN)) continue;
-                ssize_t n;
-                while ((n = read(fds[i], ev, sizeof(ev))) > 0) {
-                    static unsigned rawEvents = 0;
-                    if (++rawEvents <= 5)
-                        printf("raw ev fd#%d n=%zd type=%u code=%u val=%d\n",
-                            i, n, ev[0].type, ev[0].code, ev[0].value);
-                    for (size_t j = 0; j < (size_t)n / sizeof(ev[0]); ++j) {
-                        if (ev[j].type == EV_KEY
-                                && ev[j].code == BTN_LEFT && ev[j].value == 1) {
-                            static unsigned totalClicks = 0;
-                            if (++totalClicks == 1)
-                                printf("first click seen\n");
-                            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-                            const uint64_t t0 = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-                            if (nClickT < 64) clickT[nClickT++] = t0;
-                        }
-                    }
-                }
-            }
-        } /* pump scope */
+                /* pump input: consume from the dedicated input thread's ring */
+        while (atomic_load(&g_clickTail) != atomic_load(&g_clickHead)) {
+            const unsigned tail = atomic_load(&g_clickTail);
+            uint64_t t0;
+            pthread_mutex_lock(&g_clickMtx);
+            t0 = g_clickRing[tail];
+            pthread_mutex_unlock(&g_clickMtx);
+            if (nClickT < 64) clickT[nClickT++] = t0;
+            atomic_store(&g_clickTail, (tail + 1) & 63);
+        }
 
         /* acquire + draw + commit */
         uint32_t idx = 0;
@@ -333,12 +373,14 @@ int main(int argc, char** argv) {
 
         int magenta = 0;
         uint64_t thisClickT = 0;
-        if (nClickT > 0) {
-            /* newest click becomes THIS frame's paint instant */
+        static uint64_t magentaUntil = 0;   /* wall-clock ns until which we hold */
+        if (nClickT > 0 && magentaUntil == 0) {
+            /* newest click becomes THIS frame's paint instant. The flash is
+               HELD ~120 ms so it is perceivable at any frame rate; the
+               MEASUREMENT pairs with the FIRST magenta commit only. */
             thisClickT = clickT[--nClickT];
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            uint64_t now = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-            (void)now;
+            magentaUntil = ts.tv_sec * 1000000000ULL + 120000000ULL;
             /* paint magenta for the frame from THIS swapchain image */
             vkResetCommandBuffer(cbs[idx], 0);
             VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
@@ -357,6 +399,31 @@ int main(int argc, char** argv) {
             si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
             vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
             magenta = 1;
+        } else if (magentaUntil) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            const uint64_t nowNs = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+            if (nowNs < magentaUntil) {
+                /* HOLD: repaint magenta until expiry */
+                vkResetCommandBuffer(cbs[idx], 0);
+                VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                vkBeginCommandBuffer(cbs[idx], &bbi);
+                VkClearColorValue clear = { .float32 = { 1.0f, 0.02f, 1.0f, 1.0f } };
+                vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
+                    &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
+                vkEndCommandBuffer(cbs[idx]);
+                VkSemaphore ws[1] = { acqSems[frameSeq % 3] };
+                VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                si.waitSemaphoreCount = 1; si.pWaitSemaphores = ws;
+                VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
+                si.pWaitDstStageMask = &st;
+                si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
+                VkSemaphore sg[1] = { presSems[frameSeq % 3] };
+                si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
+                vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                magenta = 1; /* held, not a new sample */
+            } else {
+                magentaUntil = 0;
+            }
         } else {
             /* background frame: reset the slot back to dim (cheap clear command) */
             vkResetCommandBuffer(cbs[idx], 0);
@@ -395,7 +462,11 @@ int main(int argc, char** argv) {
         wl_display_roundtrip(dpy);  /* drain presented feedback for this commit */
         frameSeq++;
         if (frameSeq == 1) printf("render loop ALIVE (first frame presented, slot %u)\n", slot);
-        if (frameSeq % 240 == 0) printf("loop tick %u\n", frameSeq);
+        if (frameSeq % 240 == 0)
+            printf("tick %u clickT=%u ring(tail=%u head=%u) magUntil=%llu\n",
+                frameSeq, nClickT, atomic_load(&g_clickTail),
+                atomic_load(&g_clickHead),
+                (unsigned long long)(magentaUntil ? 1u : 0u));
 
         if (magenta) {
             const uint64_t latch = atomic_load(&g_latch[slot]);
@@ -410,7 +481,15 @@ int main(int argc, char** argv) {
             }
         }
         if (collected >= wantSamples) break;
-        if (wantSamples && frameSeq > wantSamples * 2 + 2000) break; /* runaway guard */
+        /* instrument runtime cap (wall clock), not frame-count: the user needs
+           TIME to click; the old frame-count guard (~2000 frames ≈ 8 s at
+           uncapped rates) killed the probe before a human could click
+           (observed on Charles's run: 'no chance to click, it comes and goes'). */
+        if (frameSeq % 240 == 0) {
+            struct timespec rn; clock_gettime(CLOCK_MONOTONIC, &rn);
+            const double elapsed = rn.tv_sec * 1000.0 + rn.tv_nsec / 1e6 - tStartMs;
+            if (elapsed > 120000.0) break;  /* 120 s hard cap */
+        }
     }
 
     printf("RESULT n=%u", collected);
