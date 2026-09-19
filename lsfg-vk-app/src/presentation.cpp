@@ -47,6 +47,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <cmath>
 #include <cstdlib>
 #include <deque>
 #include <exception>
@@ -1846,6 +1847,56 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     std::memcpy(state.hostPtrs.at(sidx), state.shmMaps.at(sidx),
                         state.shmBytes);
                     dbg("input: posix-shm memcpy slot %u", sidx);
+
+                    // Session-40 click-response detector (LSFGVK_CODETECT=1):
+                    // downsampled grid RMS-diff of the newest captured game frame
+                    // vs the previous copy of THIS slot. A large content jump
+                    // right after uclick's keystroke injection = the in-game
+                    // visible response ⇒ candidate click→frame latency sample.
+                    // Reads hostPtrs (CPU-side copy: shm path only), 1/64 pixels.
+                    static const bool codetect =
+                        std::getenv("LSFGVK_CODETECT") != nullptr
+                        && std::getenv("LSFGVK_CODETECT")[0] == '1';
+                    if (codetect && state.shmBytes) {
+                        static std::vector<uint8_t> prevGrid{};
+                        static uint32_t prevHotSlot = 0xffffffffu;
+                        const auto* px = static_cast<const uint8_t*>(
+                            state.hostPtrs.at(sidx));
+                        const size_t tot = static_cast<size_t>(w) * h;
+                        const size_t step = px ? (16 * 4) : 16; /* 16-px grid */
+                        uint64_t sum = 0; size_t n = 0;
+                        std::vector<uint8_t> grid;
+                        grid.reserve((tot / 256) + 8);
+                        const uint64_t recvNs = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                recvTs.time_since_epoch()).count());
+                        for (size_t i = 0; i + 15 < tot; i += 256) {
+                            // luminance-ish (G dominant) single byte
+                            const uint8_t g = px[i * 4 + 1];
+                            grid.push_back(g);
+                            if (!prevGrid.empty() && n < prevGrid.size()) {
+                                const int d =
+                                    static_cast<int>(g) -
+                                    static_cast<int>(prevGrid[n]);
+                                sum += static_cast<uint64_t>(d * d);
+                                ++n;
+                            }
+                        }
+                        const double rms = n
+                            ? std::sqrt(static_cast<double>(sum) / n) : 0.0;
+                        if (rms > 24.0) {
+                            lsfgvk::gui::g_guiState.inputLatencyValid.store(true);
+                            FILE* f = std::fopen("/tmp/lsfg-codeetect.log", "a");
+                            if (f) {
+                                std::fprintf(f, "ACT %llu slot%u fidx%llu rms%.1f\n",
+                                    (unsigned long long)recvNs, sidx,
+                                    (unsigned long long)fidx, rms);
+                                std::fclose(f);
+                            }
+                        }
+                        prevGrid = std::move(grid);
+                        (void)prevHotSlot;
+                    }
                     if (false && w >= 2560 && state.hostPtrs.at(sidx)
                             && (fidx == 80 || fidx == 250 || (fidx > 0 && fidx % 400 == 0))) {
                         char path[128];
