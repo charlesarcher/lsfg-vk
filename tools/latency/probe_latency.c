@@ -127,6 +127,7 @@ static uint64_t now_ns(void) {
 
 /* --- input thread: ALL mice, BTN_LEFT presses ------------------------------ */
 static _Atomic uint64_t g_click_ns[2] = { 0, 0 };
+static _Atomic unsigned g_clicks = 0;   /* total BTN_LEFT presses latched */
 static _Atomic int g_click_slot = 0;
 volatile _Atomic uint32_t g_paint_flag = 0; /* paint loop watches this */
 
@@ -188,11 +189,7 @@ static void *input_thread(void *arg) {
                 printf("ev: t=%u c=%u v=%u on fd#%d\n", ev[j].type,
                        ev[j].code, ev[j].value, i);
             if (ev[j].code == BTN_LEFT) {  /* left-click press */
-                    static unsigned fires = 0;
-                    if (fires++ < 10) {
-                        printf("input: BTN_LEFT fired #%u\n", fires);
-                        fflush(stdout);
-                    }
+                    atomic_fetch_add(&g_clicks, 1);
                     const uint64_t event_ns =
                         (uint64_t)ev[j].time.tv_sec * 1000000000ULL
                         + (uint64_t)ev[j].time.tv_usec * 1000ULL;
@@ -247,6 +244,10 @@ int main(int argc, char **argv) {
     struct xdg_toplevel *tl = xdg_surface_get_toplevel(xs);
     xdg_toplevel_add_listener(tl, &toplevel_listener, nullptr);
     xdg_toplevel_set_app_id(tl, "probe-latency");
+    /* fullscreen on whatever output KWin picked (DP-7): (nullptr = current) —
+     * a 320x180 toplevel is easy to miss on a 2560x1440 panel; KWin reported
+     * the tiny window 'out=DP-7 (Not Responding)' — visible but too small to
+     * spot. Fullscreen makes the click-to-photon marker unmissable. */
     xdg_toplevel_set_fullscreen(tl, nullptr);
 
     /* XDG map contract (xdg-shell spec, learned via KWin's error 3):
@@ -331,8 +332,10 @@ int main(int argc, char **argv) {
             struct timespec ts2; clock_gettime(CLOCK_MONOTONIC, &ts2);
             const double el = ts2.tv_sec + ts2.tv_nsec / 1e9 - t0;
             if (waited++ % 200 == 0) {
-                fprintf(stderr, "waiting for click (%.1fs elapsed, %u samples)\n",
-                        el, collected);
+                const unsigned clicks = atomic_load(&g_clicks);
+                fprintf(stderr,
+                        "waiting (%.1fs: %u clicks, %.1f cps, %u samples)\n",
+                        el, clicks, clicks / (el > 0.5 ? el : 0.5), collected);
                 fflush(stderr);
             }
             nanosleep(&idle, nullptr);
@@ -340,13 +343,10 @@ int main(int argc, char **argv) {
         }
         atomic_store(&g_click_ns[slot], 0); /* consume */
 
-        /* paint an obvious marker (magenta square at center) */
-        memset(px, 0x20, SHM_SZ);
-        for (uint32_t y = H / 4 + 10; y < H / 4 + 30 && y < H; ++y)
-            for (uint32_t x = W / 4 + 10; x < W / 4 + 30 && x < W; ++x) {
-                uint8_t *p = px + ((size_t)y * W + x) * 4;
-                p[0] = 0xC8; p[1] = 0x10; p[2] = 0xC8; p[3] = 0xFF;
-            }
+        /* paint the WHOLE frame bright magenta on click (unmissable flash) */
+        for (size_t i = 0; i < SHM_SZ; i += 4) {
+            px[i + 0] = 0xE0; px[i + 1] = 0x20; px[i + 2] = 0xE0; px[i + 3] = 0xFF;
+        }
 
         unsigned fslot = atomic_fetch_add(&g_which, 1) & 1;
         unsigned arm_slot = fslot; /* proxy-owned; fb listener reads via data */
@@ -371,9 +371,8 @@ int main(int argc, char **argv) {
                 const double ms = (double)(latch - click) / 1e6;
                 if (ms > 0.0 && ms < 500.0) {
                     samples[collected++] = ms;
-                    if (collected % 10 == 0 || collected < 5)
-                        printf("sample %u: click->latch %.1f ms (seq %llu)\n",
-                            collected, ms, (unsigned long long)atomic_load(&g_seq));
+                    printf("sample %u: click->latch %.1f ms\n", collected, ms);
+                    fflush(stdout);
                 }
                 break;
             }
