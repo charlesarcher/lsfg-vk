@@ -514,9 +514,15 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 ::close(fd);
                 continue;
             }
-            const VkDeviceSize hostSize = std::max<VkDeviceSize>(
-                negotiated.allocationSize,
-                static_cast<VkDeviceSize>(layout.rowPitch) * extent.height);
+            const VkDeviceSize hostSize = [&] {
+                const VkDeviceSize np = std::max<VkDeviceSize>(
+                    negotiated.allocationSize,
+                    static_cast<VkDeviceSize>(layout.rowPitch) * extent.height);
+                /* round up to page size: the host-import path requires
+                 * allocationSize be a 4096-multiple, and the seq-counter
+                 * offset must match the app's rounded staging size */
+                return (np + 4095) & ~4095ll;
+            }();
             const size_t mapBytes = static_cast<size_t>(hostSize) + 4096;
             void* map = ::mmap(nullptr, mapBytes,
                 PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);

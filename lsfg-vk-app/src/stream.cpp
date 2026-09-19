@@ -190,7 +190,10 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     conn.send(ls::ipc::Negotiated{
         .modifier = neg.modifier,
         .rowPitch = rowPitch,
-        .allocationSize = static_cast<uint64_t>(rowPitch) * h
+        /* page-rounded so both sides agree on the shm seq-counter offset
+         * (the staging ring allocates exactly this size; an un-rounded
+         * allocationSize desyncs the layer's seq map at non-4K sizes) */
+        .allocationSize = ((static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull)
     });
 
     const vk::ImageLayout layout{
