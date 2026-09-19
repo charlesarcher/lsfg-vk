@@ -26,6 +26,7 @@
 #include "lsfg-vk-app/wsi/surface_backend.hpp"
 
 #include "lsfg-vk-common/helpers/errors.hpp"
+#include "lsfg-vk-common/ipc/latency_ledger.hpp"
 #include "lsfg-vk-app/swizzle_spv.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/descriptor_pool.hpp"
@@ -76,6 +77,11 @@
 
 namespace ls::presentation {
 namespace {
+    /// Session 40 dbl-ledger app-side sink: (capTsNs, presentedNs) per REAL
+    /// present, consumed by tools/latency/probe_vk for click→photon through
+    /// the doubled path. Env-gated: only mapped when LSFGVK_DBL_LEDGER=1.
+    lsfgvk::ledger::LedgerSink g_ledgerApp;
+
     /// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
 /// on LSFGVK_APP_DBG so the default stream stays clean.
 const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
@@ -1250,6 +1256,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     const uint64_t submitNs = static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
                             tReal0.time_since_epoch()).count());
+                    // Session 40 dbl-ledger: row per decoded REAL present:
+                    // (frame captureTsNs from the layer, compositor latch).
+                    g_ledgerApp.init();
+                    g_ledgerApp.publish(capTsNs, latchNs);
                     if (latchNs > submitNs && latchNs - submitNs < 100'000'000ULL) {
                         const float scanMs = static_cast<float>(
                             static_cast<double>(latchNs - submitNs) / 1e6);

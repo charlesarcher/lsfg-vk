@@ -1014,6 +1014,8 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         VkQueue queue, VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
+    // Session 40 dbl-ledger: lazily arm the (capTs -> slot) sink, env-gated.
+    this->ledger.init();
 // RELEASE handling frees slots draining non-blocking
     int entryDrained = 0;
     try {
@@ -1499,6 +1501,9 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         this->ipcConn->attachFd(sendFd);
         this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot), capTs });
+        // Session 40 dbl-ledger: publish (capTs, slot) for the click probe
+        // (env-gated, lockless single-writer shm ring).
+        this->ledger.publish(capTs, static_cast<uint64_t>(slot));
         sendFd = -1;
         syncFd = -1;
     } catch (const std::exception& e) {

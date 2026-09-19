@@ -4,6 +4,7 @@
 
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
+#include "lsfg-vk-common/ipc/latency_ledger.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
@@ -108,6 +109,7 @@ namespace lsfgvk::layer {
         std::array<void*, ls::ipc::STAGING_RING_DEPTH> destMaps{};
         std::array<void*, ls::ipc::STAGING_RING_DEPTH> rawMaps{};
         VkDeviceSize rawBytes{0};
+        lsfgvk::ledger::LayerSink ledger;   // click→photon probe anchor (env-gated)
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> dmaBufSent{};
         bool localCopyOnly{false};
         std::vector<vk::Semaphore> captureSemaphores; // recreated per cycle in present(), behind the fence gate

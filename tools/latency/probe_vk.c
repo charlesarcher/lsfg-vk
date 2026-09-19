@@ -150,6 +150,68 @@ static double now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
 
+
+/* ---- Session 40 dbl-ledger reader (app-side scanout anchor) ----
+   Layout must match lsfg-vk-common/ipc/latency_ledger.hpp byte-exact. */
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#define LEDGER_MAGIC ((uint64_t)0x4c44424c45444745ULL)   /* LDBLEDGER */
+#define LAYER_MAGIC  ((uint64_t)0x4c44424c41594552ULL)   /* LDBLAYER */
+#define LEDGER_FILE  (1024u * 128u)
+#define LAYER_FILE   4096u
+static uint64_t* g_ledgerMap = nullptr;   /* hdr: [magic][slot hdr+2 rows*4] */
+static uint64_t* g_layerMap  = nullptr;   /* hdr: [magic][head][rows..] */
+static int g_ledgerFd = -1, g_layerFd = -1;
+static void ledger_reader_init(void) {
+    struct stat st;
+    int fd = shm_open("/lsfg-dbl-ledger", O_RDONLY, 0);
+    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= LEDGER_FILE) {
+        void* m = mmap(nullptr, LEDGER_FILE, PROT_READ, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED && *(uint64_t*)m == LEDGER_MAGIC) {
+            if (!g_ledgerMap) printf("dbl-ledger: app sink attached\n");
+            g_ledgerMap = (uint64_t*)m; g_ledgerFd = fd;
+        } else close(fd);
+    }
+    fd = shm_open("/lsfg-dbl-layer", O_RDONLY, 0);
+    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= LAYER_FILE) {
+        void* m = mmap(nullptr, LAYER_FILE, PROT_READ, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED && *(uint64_t*)m == LAYER_MAGIC) {
+            if (!g_layerMap) printf("dbl-ledger: layer sink attached\n");
+            g_layerMap = (uint64_t*)m; g_layerFd = fd;
+        } else close(fd);
+    }
+}
+/* newest layer row (capTs slot published AFTER COMMIT ARM: the row matching our
+   magenta frame is the newest capTs >= commit-arm time) */
+static int layer_latest(uint64_t* capTs, uint64_t* fidx) {
+    if (!g_layerMap) return 0;
+    const uint64_t head = g_layerMap[1];
+    if (!head) return 0;
+    const size_t off = 16 + ((head - 1) % 254) * 16;
+    const uint64_t* row = (const uint64_t*)((const char*)g_layerMap + off);
+    if (!row[0]) return 0;
+    *capTs = row[0]; *fidx = row[1];
+    return 1;
+}
+/* scan the ledger ring for the FIRST row with captureTs >= ts0 (chronological);
+   returns presentedNs via *presented. Window: 512 newest rows. */
+static int ledger_pair(uint64_t ts0, uint64_t* presented) {
+    if (!g_ledgerMap) return 0;
+    const uint64_t slot = g_ledgerMap[1]; /* next-write (1-based, monotonic) */
+    if (slot == 0) return 0;
+    uint64_t* hdr = g_ledgerMap;
+    const uint64_t COUNT = slot - 1;
+    const uint64_t back = COUNT > 512 ? 512 : COUNT;
+    for (uint64_t k = slot - back; k < slot; ++k) {
+        const uint64_t* row = hdr + 2 + (k % 4095) * 4;
+        if (row[0] == 0) continue;                 /* stale slot */
+        if (row[0] >= ts0) { *presented = row[1]; return row[1] != 0; }
+        (void)k;
+    }
+    return 0;
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     /* optional side-log: LSFGVK_PROBE_LOG=/path — lets a second reader (agent)
@@ -367,6 +429,9 @@ int main(int argc, char** argv) {
     uint64_t frameSeq = 0;
     double tStartMs = now_ms();
     for (;;) {
+        { static int attachedOnce = 0;
+          if (!attachedOnce && g_ledgerMap && g_layerMap) attachedOnce = 1;
+          if (!attachedOnce) ledger_reader_init(); }
                 /* pump input: consume from the dedicated input thread's ring */
         while (atomic_load(&g_clickTail) != atomic_load(&g_clickHead)) {
             const unsigned tail = atomic_load(&g_clickTail);
@@ -441,6 +506,7 @@ int main(int argc, char** argv) {
                 magenta = 1; /* held, not a new sample */
             } else {
                 magentaUntil = 0;
+                printf("hold expired (nClickT=%u)\n", nClickT);
             }
         } else {
             /* background frame: reset the slot back to dim (cheap clear command) */
@@ -495,17 +561,42 @@ int main(int argc, char** argv) {
                 atomic_load(&g_clickHead),
                 (unsigned long long)(magentaUntil ? 1u : 0u));
 
-        if (magenta) {
+        if (magenta && thisClickT) {
+            printf("pair-attempt click%s=%llu\n", "", (unsigned long long)thisClickT);
+            /* Preferred pairing: the APP's scanout ledger (doubled picture is
+               presented on the app's overlay surface; the probe's own surface
+               sits occluded and KWin posts no presented-feedback for it). */
+            uint64_t capTs = 0, fidx = 0;
+            if (layer_latest(&capTs, &fidx)) {
+                uint64_t presented = 0;
+                /* scan a few dispatch cycles: the app's drain lags ~1 frame */
+                for (int k = 0; k < 3 && !ledger_pair(capTs, &presented); ++k) {
+                    struct timespec tw = { 0, 2500000 };
+                    nanosleep(&tw, nullptr);
+                }
+                if (presented) {
+                    const double ms = (double)(presented - thisClickT) / 1e6;
+                    if (ms > 0.0 && ms < 500.0 && collected < wantSamples && collected < 512) {
+                        samples[collected++] = ms;
+                        printf("sample %u: click->photon %.2f ms (ledger slot=%llu fidx=%llu)\n",
+                            collected, ms, (unsigned long long)capTs, (unsigned long long)fidx);
+                    }
+                    thisClickT = 0;
+                    atomic_store(&g_latch[slot], 0);
+                }
+            }
+            /* fallback: own-surface feedback (baseline mode, no layer) */
             const uint64_t latch = atomic_load(&g_latch[slot]);
             printf("magenta latch=%llu\n", (unsigned long long)latch);
-            if (latch && thisClickT && collected < wantSamples && collected < 512) {
+            if (latch && collected < wantSamples && collected < 512) {
                 const double ms = (double)(latch - thisClickT) / 1e6;
                 if (ms > 0.0 && ms < 500.0) {
                     samples[collected++] = ms;
-                    printf("sample %u: click->latch %.2f ms\n", collected, ms);
+                    printf("sample %u: click->latch %.2f ms (surface)\n", collected, ms);
                 }
                 thisClickT = 0;
             }
+            else if (!latch) thisClickT = thisClickT; /* wait next cycles */
         }
         if (collected >= wantSamples) break;
         /* instrument runtime cap (wall clock), not frame-count: the user needs
