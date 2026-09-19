@@ -29,6 +29,7 @@ if ! pgrep -x lsfg-vk-app >/dev/null; then
     rm -f "$LSFGVK_APP_SOCK"
     env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH -u LSFGVK_LAYER_DBG \
         LSFGVK_APP_DBG=1 \
+        LSFGVK_LAYER_SHELL=1 \
         LSFGVK_CONFIG="$LSFGVK_CONFIG" \
         LSFGVK_APP_SOCK="$LSFGVK_APP_SOCK" \
         setsid -f "$APP_BIN" --profile app-oneway --session wayland \
