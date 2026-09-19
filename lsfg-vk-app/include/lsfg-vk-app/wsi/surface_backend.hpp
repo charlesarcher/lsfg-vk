@@ -55,6 +55,13 @@ namespace ls::wsi {
         [[nodiscard]] virtual VkFormat swapchainFormat(VkSurfaceKHR surface) = 0;
         /// pump display/WM events for up to @p timeout_ms; return true if window resized or closed
         virtual bool processEvents(int timeout_ms) = 0;
+        /// Session 40: arm compositor-presented feedback for the next frame
+        /// presented on the given (opaque) surface-backed present path. No-op on
+        /// backends without a presented-feedback protocol (X11 returns false).
+        virtual bool armPresentFeedback(WindowHandle handle) = 0;
+        /// newest compositor latch timestamp from the last armed feedback
+        /// (CLOCK_MONOTONIC ns; 0 = no feedback delivered yet)
+        [[nodiscard]] virtual uint64_t lastPresentLatchNs() const = 0;
         /// tear down window + surface + connection (idempotent)
         virtual void destroy() = 0;
     };

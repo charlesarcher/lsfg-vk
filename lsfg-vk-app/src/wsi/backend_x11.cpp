@@ -357,7 +357,14 @@ public:
         }
     }
 
-    void destroy() override {
+    
+    // Session 40: compositor-presented feedback has no X11 equivalent wired
+    // here (XSHAPE/Present extension not bound); latency HUD scanout anchor
+    // stays a Wayland-feature until an X11 Present-counter backend lands.
+    bool armPresentFeedback(WindowHandle /*handle*/) override { return false; }
+    [[nodiscard]] uint64_t lastPresentLatchNs() const override { return 0; }
+
+void destroy() override {
         if (mWindow != 0 && mConn != nullptr) {
             xcb_destroy_window(mConn, mWindow);
             mWindow = 0;

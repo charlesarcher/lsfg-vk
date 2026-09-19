@@ -114,9 +114,34 @@ add_custom_command(
     COMMENT "Generating wlr-layer-shell protocol headers"
     VERBATIM)
 
+
+# presentation-time (stable) - compositor-presented feedback for the latency HUD:
+# per-frame KWin latch time (CLOCK_MONOTONIC) + vblank MSC; the photon anchor
+# for the input latency measurement campaign (Session 40).
+find_path(WAYLAND_PROTOCOLS_PRESENTATION_XML presentation-time/presentation-time.xml
+    PATHS /usr/share/wayland-protocols /usr/share/qt6/wayland/protocols
+    NO_DEFAULT_PATH)
+if(NOT WAYLAND_PROTOCOLS_PRESENTATION_XML)
+    message(FATAL_ERROR "presentation-time.xml not found in wayland-protocols")
+endif()
+
+add_custom_command(
+    OUTPUT "${WAYLAND_PROTOCOLS_DIR}/presentation-time-client-protocol.h"
+           "${WAYLAND_PROTOCOLS_DIR}/presentation-time-protocol.c"
+    COMMAND ${WAYLAND_SCANNER} client-header
+            "${WAYLAND_PROTOCOLS_PRESENTATION_XML}/presentation-time/presentation-time.xml"
+            "${WAYLAND_PROTOCOLS_DIR}/presentation-time-client-protocol.h"
+    COMMAND ${WAYLAND_SCANNER} private-code
+            "${WAYLAND_PROTOCOLS_PRESENTATION_XML}/presentation-time/presentation-time.xml"
+            "${WAYLAND_PROTOCOLS_DIR}/presentation-time-protocol.c"
+    DEPENDS "${WAYLAND_PROTOCOLS_PRESENTATION_XML}/presentation-time/presentation-time.xml"
+            ${WAYLAND_SCANNER}
+    COMMENT "Generating presentation-time protocol headers"
+    VERBATIM)
+
 # Custom target to ensure protocol generation runs before compilation
 add_custom_target(wayland_protocols ALL
-    DEPENDS "${WAYLAND_PROTOCOLS_DIR}/xdg-shell-client-protocol.h"
+    DEPENDS "${WAYLAND_PROTOCOLS_DIR}/presentation-time-client-protocol.h"
             "${WAYLAND_PROTOCOLS_DIR}/xdg-shell-protocol.c"
             "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-client-protocol.h"
             "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-protocol.c"
@@ -125,6 +150,7 @@ add_custom_target(wayland_protocols ALL
 
 # Link the generated protocol C files into the app (compile as C)
 add_library(wayland_protocols_gen STATIC
+    "${WAYLAND_PROTOCOLS_DIR}/presentation-time-protocol.c"
     "${WAYLAND_PROTOCOLS_DIR}/xdg-shell-protocol.c"
     "${WAYLAND_PROTOCOLS_DIR}/xdg-output-unstable-v1-protocol.c"
     "${WAYLAND_PROTOCOLS_DIR}/wlr-layer-shell-unstable-v1-protocol.c")

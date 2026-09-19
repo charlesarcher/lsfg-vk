@@ -620,6 +620,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const std::atomic<bool>& stop) {
     const uint32_t w = state.width, h = state.height;
     bool dropOverlay = false;
+    // Session 40: window handle for wp_presentation arming; set once when the
+    // overlay WSI is built inside ensureOverlayWsi, read from the present
+    // loops. X11 backends return false from armPresentFeedback — no arming.
+    ls::wsi::WindowHandle fbHandle{ nullptr };
 
     auto ensureOverlayWsi = [&] {
     if (g_overlay.wsi)
@@ -655,6 +659,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
     const auto handle = g_overlay.wsi->createWindow(outputName, VkExtent2D{ w, h }, 0u);
     VkSurfaceKHR surface = g_overlay.wsi->createSurface(vk, handle);
+    fbHandle = handle;  // Session 40: publish to the present loops
 
     // --- query caps, then pick an extent the surface will accept (> 0x0) -----
     VkSurfaceCapabilitiesKHR caps{};
@@ -1061,6 +1066,25 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             lsfgvk::gui::g_guiState.currentFpsReal.store(static_cast<float>(gameFps));
             lsfgvk::gui::g_guiState.currentFpsGen.store(static_cast<float>(presentedFps));
             lsfgvk::gui::g_guiState.streamActive.store(true);
+            // Session 40: scanout-derived latency. wp_presentation latch is
+            // CLOCK_MONOTONIC (same clock as Clock::now); the comparison is
+            // exact, no cross-clock math. When no feedback has arrived yet
+            // the HUD fields simply stay at their last value.
+            if (g_overlay.wsi) {
+                const uint64_t latchNs = g_overlay.wsi->lastPresentLatchNs();
+                if (latchNs > 0) {
+                    // last queued REAL present: newest capture at submit time
+                    const uint64_t nowNs = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            Clock::now().time_since_epoch()).count());
+                    if (latchNs < nowNs && nowNs - latchNs < 1'000'000'000ULL) {
+                        // present->scanout headroom (queue drains + compositor hold)
+                        const float scanMs = static_cast<float>(
+                            static_cast<double>(nowNs - latchNs) / 1e6);
+                        lsfgvk::gui::g_guiState.latencyScanMs.store(scanMs);
+                    }
+                }
+            }
             if (verboseEnabled())
                 std::cerr << "lsfg-vk-app: " << gameFps << " fps game, "
                           << presentedFps << " fps presented\n";
@@ -1150,6 +1174,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 .pSwapchains = &swapchain,
                 .pImageIndices = &idx,
             };
+            // Session 40: arm presented-feedback BEFORE the commit: the
+            // feedback object associates with this surface's next commit
+            // (the present below), and the compositor replies asynchronously
+            // after scanning that buffer out (latch = photon side).
+            g_overlay.wsi->armPresentFeedback(fbHandle);
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
@@ -1358,6 +1387,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         .pSwapchains = &swapchain,
                         .pImageIndices = &idx,
                     };
+                    // Session 40: same as REAL — arm before the commit.
+                    g_overlay.wsi->armPresentFeedback(fbHandle);
                     const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
                     if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                         throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");

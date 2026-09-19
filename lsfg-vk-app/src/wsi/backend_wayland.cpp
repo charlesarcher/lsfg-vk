@@ -30,6 +30,7 @@
 #include <thread>
 #include <vector>
 
+#include <atomic>
 #include <poll.h>
 #include <unistd.h>
 #include <wayland-client.h>
@@ -45,6 +46,9 @@
 #define namespace ns_
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
+// compositor-presented feedback: per-frame latch timestamp + vblank MSC
+// (CLOCK_MONOTONIC); the photon-side anchor for the latency HUD (Session 40).
+#include "presentation-time-client-protocol.h"
 
 namespace ls::wsi {
 namespace {
@@ -101,6 +105,36 @@ void surfaceFrameEvent(void* /*data*/, wl_callback* cb, uint32_t /*time*/) {
 const wl_callback_listener surfaceFrameListener = {
     .done = surfaceFrameEvent
 };
+
+// ---- wp_presentation_feedback on the app's own surface (Session 40) ----
+/// newest presented-feedback latch timestamp (CLOCK_MONOTONIC ns). one
+/// feedback object in flight; the consumer (presentation.cpp) reads at 1 Hz.
+std::atomic<uint64_t> g_feedbackLatchNs{0};
+
+void feedbackSyncOutputNoop(void* /*data*/,
+                            struct wp_presentation_feedback* /*f*/,
+                            struct wl_output* /*o*/) {}
+void feedbackDiscarded(void* /*data*/, struct wp_presentation_feedback* f) {
+    wp_presentation_feedback_destroy(f);  // never scanned out: free the object
+}
+void feedbackPresented(void* /*data*/, struct wp_presentation_feedback* f,
+                       uint32_t tv_sec_hi, uint32_t tv_sec_lo,
+                       uint32_t tv_nsec, uint32_t refresh,
+                       uint32_t seq_hi, uint32_t seq_lo,
+                       uint32_t flags) {
+    const uint64_t latchNs = (static_cast<uint64_t>(tv_sec_hi) << 32
+        | static_cast<uint64_t>(tv_sec_lo)) * 1000000000ULL + tv_nsec;
+    g_feedbackLatchNs.store(latchNs, std::memory_order_relaxed);
+    wp_presentation_feedback_destroy(f);
+}
+const wp_presentation_feedback_listener feedbackListener = {
+    .sync_output = feedbackSyncOutputNoop,
+    .presented = feedbackPresented,
+    .discarded = feedbackDiscarded,
+};
+
+
+
 
 /// TEMP DEBUG (LSFGVK_APP_DBG): input-event probe. With the empty input
 /// region the compositor must NEVER deliver pointer events to this
@@ -235,6 +269,9 @@ struct Globals {
     zxdg_output_manager_v1* xdgOutputManager{nullptr};
     wl_seat* seat{nullptr};
     zwlr_layer_shell_v1* layerShell{nullptr};
+    // wp_presentation: compositor feedback with per-frame latch timestamp
+    // (CLOCK_MONOTONIC) + vblank MSC; the photon anchor for the latency HUD.
+    wp_presentation* presentation{nullptr};
 };
 
 /// one Wayland output plus its xdg_output wrapper
@@ -284,6 +321,9 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
     } else if (std::strcmp(interface, wl_seat_interface.name) == 0) {
         g->seat = static_cast<wl_seat*>(
             wl_registry_bind(registry, name, &wl_seat_interface, 1));
+    } else if (std::strcmp(interface, wp_presentation_interface.name) == 0) {
+        g->presentation = static_cast<wp_presentation*>(
+            wl_registry_bind(registry, name, &wp_presentation_interface, 1));
     } else if (std::strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         // The overlay-layer window type (see createWindow): bind at the
         // advertised version, capped at the protocol version we compiled
@@ -503,7 +543,7 @@ public:
             wl_registry_destroy(registry);
             wl_display_disconnect(mDisplay);
             mDisplay = nullptr;
-            mGlobals = {};
+            mGlobals = Globals{};
             std::this_thread::sleep_for(std::chrono::milliseconds(32));
         }
 
@@ -841,6 +881,26 @@ public:
         }
 
         return false;
+    }
+
+    // Session 40 latency HUD: arm one wp_presentation_feedback object for
+    // the next frame presented on our surface. feedback arrives as either
+    // 'presented' (latch time + MSC) or 'discarded' — the object is freed
+    // in both listeners and the sink keeps only the newest latch.
+    bool armPresentFeedback(WindowHandle /*handle*/) override {
+        if (!mDisplay || !mSurface || !mGlobals.presentation)
+            return false;
+        struct wp_presentation_feedback* fb = wp_presentation_feedback(
+            mGlobals.presentation, mSurface);
+        if (!fb)
+            return false;
+        wp_presentation_feedback_add_listener(fb, &feedbackListener, nullptr);
+        wl_display_flush(mDisplay);  // marshal must reach the compositor before commit
+        return true;
+    }
+
+    [[nodiscard]] uint64_t lastPresentLatchNs() const override {
+        return g_feedbackLatchNs.load(std::memory_order_relaxed);
     }
 
     void destroy() override {

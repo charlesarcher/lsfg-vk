@@ -49,6 +49,17 @@ namespace lsfgvk::gui {
         std::atomic<float> currentFpsGen{0.0f};
         std::atomic<float> currentLatencyRealMs{0.0f};
         std::atomic<float> currentLatencyGenMs{0.0f};
+        // Session 40 latency HUD: per-segment breakdown (ms, p50 over 1s window)
+        // scan->panelKwin = QueuePresentKHR submit time minus wp_presentation latch of
+        // the PREVIOUS frame (queue latency + compositor hold), approximate until the
+        // per-frame feedback lands. Gen extra = GEN scanout delay vs REAL from same capture.
+        std::atomic<float> latencyIpcMs{0.0f};
+        std::atomic<float> latencyGenSolveMs{0.0f};
+        std::atomic<float> latencyScanMs{0.0f};
+        std::atomic<float> latencyGenExtraMs{0.0f};
+        std::atomic<float> inputLatencyP50Ms{0.0f};
+        std::atomic<float> inputLatencyP99Ms{0.0f};
+        std::atomic<bool>  inputLatencyValid{false};
         std::atomic<bool> streamActive{false};
         std::string activeStreamApp{"None"};
         std::string activeStreamRes{"0x0"};
