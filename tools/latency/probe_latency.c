@@ -27,6 +27,7 @@
 #include <linux/input-event-codes.h>
 #include <glob.h>
 #include <poll.h>
+#include <time.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -380,6 +381,22 @@ int main(int argc, char **argv) {
         }
     }
     printf("RESULT n=%u", collected);
+    /* log the run to a rolling CSV for cross-session calibration reads */
+    {
+        time_t wall = time(nullptr);
+        FILE *rf = fopen("/tmp/latency_probe_results.csv", "a");
+        if (rf) {
+            fprintf(rf, "%ld,click->latch,n=%u", (long)wall, collected);
+            if (collected) {
+                for (unsigned k = 0; k < collected; ++k)
+                    fprintf(rf, ":%.2f", samples[k]);
+            }
+            fputc('\n', rf);
+            fclose(rf);
+            printf(" (logged: /tmp/latency_probe_results.csv)\n");
+            fflush(stdout);
+        }
+    }
     if (collected) {
         /* p50/p99 */
         for (unsigned i = 1; i < collected; ++i)
