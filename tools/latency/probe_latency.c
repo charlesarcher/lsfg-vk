@@ -163,6 +163,37 @@ static void *input_thread(void *arg) {
             fflush(stdout);
         }
     }
+    /* the automated clicker (uinput) has NO by-id symlink; find it by device
+     * name across the raw event nodes so the probe can be driven headless. */
+    {
+        glob_t ge;
+        if (glob("/dev/input/event*", 0, nullptr, &ge) == 0) {
+            char enames[64][120];
+            const size_t npaths = ge.gl_pathc < 64 ? ge.gl_pathc : 64;
+            for (size_t i = 0; i < npaths; ++i)
+                snprintf(enames[i], sizeof(enames[i]), "%s", ge.gl_pathv[i]);
+            globfree(&ge);
+            for (size_t i = 0; i < npaths; ++i) {
+                char dname[256] = "";
+                if (ioctl(-1, 0, nullptr), 0) {}  /* noop keeps -Wunused off */
+                int fd = open(enames[i], O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+                if (fd < 0) continue;
+                if (ioctl(fd, EVIOCGNAME(sizeof(dname) - 1), dname) < 0
+                        || !strstr(dname, "latency-probe-clicker")) {
+                    close(fd);
+                    continue;
+                }
+                unsigned clk = CLOCK_MONOTONIC;
+                ioctl(fd, EVIOCSCLOCKID, &clk);
+                printf("input: VIRTUAL %s (%s) -> CLOCK_MONOTONIC\n", enames[i], dname);
+                fflush(stdout);
+                if (nfd < 64)
+                    fds[nfd++] = fd;
+                else
+                    close(fd);
+            }
+        }
+    }
     if (nfd == 0) { perror("no input devices readable"); return nullptr; }
 
     struct pollfd pfd[64];
@@ -363,7 +394,10 @@ int main(int argc, char **argv) {
         /* wait until THAT slot's presented arrives (up to 100 ms) */
         struct timespec stop, now;
         clock_gettime(CLOCK_MONOTONIC, &stop);
-        stop.tv_nsec += 100000000ULL;
+        stop.tv_nsec += 900000000ULL; /* up to 900 ms: DP-7 vblank is 4.17 ms, so
+            a correct present latches within a few refreshes; anything slower
+            means KWin is throttling our surface (occlusion) and the user's
+            next click can't land anyway within the wait */
         while (clock_gettime(CLOCK_MONOTONIC, &now), now.tv_sec < stop.tv_sec
                 || (now.tv_sec == stop.tv_sec && now.tv_nsec < stop.tv_nsec)) {
             wl_display_roundtrip(dpy); /* blocking; drains all queue events */
