@@ -589,9 +589,17 @@ namespace {
             throw backend::error("Unable to create black image", e);
         }
     }
-    /// import timeline semaphore
+    /// import timeline semaphore. syncFd < 0 (vkcube/local probes where no
+    /// capture crosses a process boundary) = create a FRESH timeline instead:
+    /// importing OPAQUE fd -1 fails at vkImportSemaphoreFdKHR (error -13) —
+    /// the 'pre-existing' vkcube handshake failure. Same-device RADV also
+    /// rejects PERMANENT opaque imports into timelines
+    /// (VK_ERROR_IMPORT_NOT_ALLOWED; see stream.cpp note), so a local fresh
+    /// timeline is the only valid same-device state.
     vk::TimelineSemaphore importTimelineSemaphore(const vk::Vulkan& vk, int syncFd) {
         try {
+            if (syncFd < 0)
+                return{vk, 0};             // fresh local timeline, no import
             return{vk, 0, syncFd};
         } catch (const std::exception& e) {
             throw backend::error("Unable to import timeline semaphore", e);
