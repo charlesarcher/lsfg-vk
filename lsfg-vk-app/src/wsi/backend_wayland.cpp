@@ -322,8 +322,10 @@ void registryGlobal(void* data, wl_registry* registry, uint32_t name,
         g->seat = static_cast<wl_seat*>(
             wl_registry_bind(registry, name, &wl_seat_interface, 1));
     } else if (std::strcmp(interface, wp_presentation_interface.name) == 0) {
+        // v1 binding made KWin emit zero presented/discarded events (probed).
+        // mpv binds v2 and receives feedback under the same KWin — pin v2.
         g->presentation = static_cast<wp_presentation*>(
-            wl_registry_bind(registry, name, &wp_presentation_interface, 1));
+            wl_registry_bind(registry, name, &wp_presentation_interface, 2));
     } else if (std::strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
         // The overlay-layer window type (see createWindow): bind at the
         // advertised version, capped at the protocol version we compiled
@@ -901,6 +903,14 @@ public:
 
     [[nodiscard]] uint64_t lastPresentLatchNs() const override {
         return g_feedbackLatchNs.load(std::memory_order_relaxed);
+    }
+
+    // probe-verified: presented feedback only drains via a blocking roundtrip
+    // (the default queue's bytes on the shared fd lose the readability race
+    // against RADV's queue; poll(timeout 0) then reports nothing readable).
+    void drainPresentFeedback() override {
+        if (mDisplay)
+            wl_display_roundtrip(mDisplay);
     }
 
     void destroy() override {

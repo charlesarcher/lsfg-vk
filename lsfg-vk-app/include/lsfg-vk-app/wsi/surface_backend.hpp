@@ -62,6 +62,14 @@ namespace ls::wsi {
         /// newest compositor latch timestamp from the last armed feedback
         /// (CLOCK_MONOTONIC ns; 0 = no feedback delivered yet)
         [[nodiscard]] virtual uint64_t lastPresentLatchNs() const = 0;
+        /// Session 40: drain presented-feedback events. The default-queue
+        /// events arrive asynchronously after the commit and our non-blocking
+        /// pump polls the fd only for already-readable bytes (RADV's queue on
+        /// the same fd races the readability flag — the documented KWin
+        /// dispatch_pending pattern). A blocking roundtrip here reliably
+        /// drains feedback (probe-verified). Call once per present, output
+        /// thread. X11: no-op.
+        virtual void drainPresentFeedback() = 0;
         /// tear down window + surface + connection (idempotent)
         virtual void destroy() = 0;
     };

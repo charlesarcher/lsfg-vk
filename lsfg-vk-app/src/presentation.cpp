@@ -1082,6 +1082,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         const float scanMs = static_cast<float>(
                             static_cast<double>(nowNs - latchNs) / 1e6);
                         lsfgvk::gui::g_guiState.latencyScanMs.store(scanMs);
+                        if (verboseEnabled())
+                            std::cerr << "lsfg-vk-app: scanout lag " << scanMs
+                                      << " ms (wp_presentation)\n";
                     }
                 }
             }
@@ -1182,6 +1185,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
+            // Session 40: drain presented-feedback (needs the blocking
+            // roundtrip; see drainPresentFeedback docs)
+            g_overlay.wsi->drainPresentFeedback();
             if (capTsNs > 0) {
                 const uint64_t nowNs = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1392,6 +1398,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
                     if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                         throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
+                    g_overlay.wsi->drainPresentFeedback();
                     if (cur.captureTsNs > 0) {
                         const uint64_t nowNs = static_cast<uint64_t>(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(

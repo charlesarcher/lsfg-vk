@@ -363,6 +363,7 @@ public:
     // stays a Wayland-feature until an X11 Present-counter backend lands.
     bool armPresentFeedback(WindowHandle /*handle*/) override { return false; }
     [[nodiscard]] uint64_t lastPresentLatchNs() const override { return 0; }
+    void drainPresentFeedback() override {}
 
 void destroy() override {
         if (mWindow != 0 && mConn != nullptr) {
