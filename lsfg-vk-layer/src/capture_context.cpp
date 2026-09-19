@@ -1261,7 +1261,16 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // vk.queue() (first-graphics) can be a different queue handle and cause
     // the present wait to block forever on some drivers.
     try {
-        std::vector<VkSemaphore> waitSems = semaphores;
+        /* S40: in the ISOLATED (fake) path no real QueuePresent ever consumes
+         * the game's present-wait semaphores — waiting them HERE makes their
+         * timeline wait unresolved forever (gdb/strace-proven wedge: RADV
+         * syncobj timeline wait returns ETIME then re-enters forever). The
+         * pacing is owned by the isolated recycle fence instead. The capture
+         * blit still orders after the game's render via the present-order on
+         * the same queue (fam0 in-order ring). */
+        std::vector<VkSemaphore> waitSems = this->fake
+            ? std::vector<VkSemaphore>{}
+            : semaphores;
         std::vector<VkSemaphore> signalSems = this->fake
             ? std::vector<VkSemaphore>{ sigSem.handle() }
             : std::vector<VkSemaphore>{ sigSem.handle(), presentSem.handle() };
