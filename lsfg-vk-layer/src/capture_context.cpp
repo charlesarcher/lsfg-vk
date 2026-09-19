@@ -579,6 +579,12 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         static const bool noExtraQ = std::getenv("LSFGVK_NO_EXTRA_Q")
             && std::getenv("LSFGVK_NO_EXTRA_Q")[0] == '1';
         if (!noExtraQ && this->fake && getIsolatedSignalQueue(extraFam, extraIdx)) {
+            /* S40: the SIGNAL queue is the LAST created slot (idx>=1 after the
+             * fam is bumped to 2 queues); the CAPTURE blits must stay on the
+             * family's FIRST queue (idx0) so the acquire-signal empty submits
+             * never serialize behind capture blits (probe wedge evidence). */
+            if (extraIdx > 0)
+                extraIdx = 0;
             vk.df().GetDeviceQueue(vk.dev(), extraFam, extraIdx, &this->captureQ);
             const VkCommandPoolCreateInfo poolInfo{
                 .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,

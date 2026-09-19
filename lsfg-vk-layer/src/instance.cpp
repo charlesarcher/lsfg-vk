@@ -324,7 +324,31 @@ void Root::modifyDeviceCreateInfo(const vk::VulkanInstanceFuncs& funcs, VkPhysic
         bool bumped = false;
         uint32_t extraFam = ~0u;
         uint32_t extraIdx = 0;
+        /* S40: prefer a COMPUTE-only family for the isolated acquire-signal
+         * queue — an empty signal submit on a bumped GFX slot serializes with
+         * the GAME's own fam0 ring (RADV exposes one physical gfx ring) and
+         * the in-order chain deadlocked the probe after one commit
+         * (gdb: drmSyncobjTimelineWait; strace: ETIME forever, 2026-09-19). */
+        for (uint32_t f = 0; f < fams.size() && !bumped; ++f) {
+            if ((fams[f].queueFlags & VK_QUEUE_COMPUTE_BIT)
+                    && !(fams[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+                    && fams[f].queueCount > 0) {
+                const uint32_t want = fams[f].queueCount >= 2 ? 2u : 1u;
+                extraQci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+                extraQci.queueFamilyIndex = f;
+                extraQci.queueCount = want;
+                for (uint32_t k = 0; k < want; ++k)
+                    computePrio.push_back(1.0f);
+                extraQci.pQueuePriorities = computePrio.data();
+                qcis.push_back(extraQci);
+                extraFam = f;
+                extraIdx = want - 1;
+                bumped = true;
+            }
+        }
         for (size_t i = 0; i < qcis.size(); ++i) {
+            if (uint32_t(qcis[i].queueFamilyIndex) == extraFam)
+                continue;   /* the added compute slot already has its prios */
             prios[i].assign(qcis[i].pQueuePriorities,
                 qcis[i].pQueuePriorities + qcis[i].queueCount);
             qcis[i].pQueuePriorities = prios[i].data();
@@ -345,13 +369,23 @@ void Root::modifyDeviceCreateInfo(const vk::VulkanInstanceFuncs& funcs, VkPhysic
                 if ((fams[f].queueFlags & VK_QUEUE_COMPUTE_BIT)
                         && !(fams[f].queueFlags & VK_QUEUE_GRAPHICS_BIT)
                         && fams[f].queueCount > 0) {
+                    /* S40 fix: request TWO compute queues when available so the
+                     * isolated acquire-signal submit gets a DISJOINT queue
+                     * (idx 1) from the capture queue (idx 0): an in-order fam
+                     * ring shared between an acq-EMPTY-signal and capture blits
+                     * deadlocks the fam chain at high fps (probe_vk wedge:
+                     * RADV syncobj timeline wait ETIME forever after the first
+                     * commit — gdb/strace proven 2026-09-19 ~19:20). */
+                    const uint32_t want = fams[f].queueCount >= 2 ? 2u : 1u;
                     extraQci.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
                     extraQci.queueFamilyIndex = f;
-                    extraQci.queueCount = 1;
+                    extraQci.queueCount = want;
+                    for (uint32_t k = 0; k < want; ++k)
+                        computePrio.push_back(1.0f);
                     extraQci.pQueuePriorities = computePrio.data();
                     qcis.push_back(extraQci);
                     extraFam = f;
-                    extraIdx = 0;
+                    extraIdx = want - 1;   /* signal queue = LAST created slot */
                     bumped = true;
                     break;
                 }

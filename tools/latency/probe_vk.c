@@ -338,9 +338,30 @@ int main(int argc, char** argv) {
     pci.queueFamilyIndex = gfxFam;
     vkCreateCommandPool(dev, &pci, nullptr, &cpool);
     VkCommandBuffer cbs[8];
+    VkFence cbsFences[8];   /* SIGNALED: guard each cb reset (pending cb
+                              reset = UB → RADV wedged after the first
+                              magenta commit (hold path resets in <2 ms)) */
     VkCommandBufferAllocateInfo cai = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
     cai.commandPool = cpool; cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; cai.commandBufferCount = nimg;
     vkAllocateCommandBuffers(dev, &cai, cbs);
+    VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    for (uint32_t i = 0; i < 8; ++i)
+        vkCreateFence(dev, &fci, nullptr, &cbsFences[i]);
+    /* fences start UNSIGNALED (no signaled-初始 flag exists); the guard waits
+       would time out forever — pulse them: one empty submit each (idle queue). */
+    {
+        VkSubmitInfo ssi = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        for (uint32_t i = 0; i < 8; ++i)
+            vkQueueSubmit(queue, 1, &ssi, cbsFences[i]);
+        vkQueueWaitIdle(queue);
+        for (uint32_t i = 0; i < 8; ++i)
+            vkResetFences(dev, 1, &cbsFences[i]);
+        /* re-signal once more: the CORRECT initial state is signaled so the
+           first reset passes */
+        for (uint32_t i = 0; i < 8; ++i)
+            vkQueueSubmit(queue, 1, &ssi, cbsFences[i]);
+        vkQueueWaitIdle(queue);   /* fences now all SIGNALED */
+    }
 
     /* swapchain image layout → GENERAL once for clearImage */
     {
@@ -366,9 +387,10 @@ int main(int argc, char** argv) {
     }
 
     VkFormat fmt = VK_FORMAT_B8G8R8A8_UNORM;
-    VkSemaphore acqSems[3]; VkSemaphore presSems[3];
+    #define NSWSEMS 8
+    VkSemaphore acqSems[NSWSEMS]; VkSemaphore presSems[NSWSEMS];
     VkSemaphoreCreateInfo semci = { VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO };
-    for (uint32_t i = 0; i < 3; ++i) {
+    for (uint32_t i = 0; i < NSWSEMS; ++i) {
         vkCreateSemaphore(dev, &semci, nullptr, &acqSems[i]);
         vkCreateSemaphore(dev, &semci, nullptr, &presSems[i]);
     }
@@ -448,7 +470,7 @@ int main(int argc, char** argv) {
         VkResult ac = vkAcquireNextImageKHR(dev, swap, 33'333'333ULL /* 33 ms cap: an
             occluded surface can stop buffer cycling forever; without a cap the main
             loop froze after the first commit (observed: no ticks past first commit) */,
-            acqSems[frameSeq % 3], VK_NULL_HANDLE, &idx);
+            acqSems[frameSeq % NSWSEMS], VK_NULL_HANDLE, &idx);
         if (ac == VK_TIMEOUT || ac == VK_NOT_READY)
             continue;   /* keep the input thread fed; retry next pass */
         if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR)
@@ -457,6 +479,7 @@ int main(int argc, char** argv) {
         int magenta = 0;
         uint64_t thisClickT = 0;
         static uint64_t magentaUntil = 0;   /* wall-clock ns until which we hold */
+        static uint64_t lastPaceNs = 0;     /* pacing anchor for the frame loop */
         if (nClickT > 0 && magentaUntil == 0) {
             /* newest click becomes THIS frame's paint instant. The flash is
                HELD ~120 ms so it is perceivable at any frame rate; the
@@ -465,20 +488,27 @@ int main(int argc, char** argv) {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             magentaUntil = ts.tv_sec * 1000000000ULL + 120000000ULL;
             /* paint magenta for the frame from THIS swapchain image */
-            vkResetCommandBuffer(cbs[idx], 0);
+            {   /* wait for the previous use of this cb before reset: reset of a
+               PENDING cb is UB and RADV wedged exactly there (probe hold) */
+            VkFence f = cbsFences[idx];
+            if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
+                continue;   /* still in flight: present the previous image */
+            vkResetFences(dev, 1, &f);
+        }
+        vkResetCommandBuffer(cbs[idx], 0);
             VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             vkBeginCommandBuffer(cbs[idx], &bbi);
             VkClearColorValue clear = { .float32 = { 1.0f, 0.02f, 1.0f, 1.0f } };
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
             vkEndCommandBuffer(cbs[idx]);
-            VkSemaphore ws[1] = { acqSems[frameSeq % 3] };
+            VkSemaphore ws[1] = { acqSems[frameSeq % NSWSEMS] };
             VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
             si.waitSemaphoreCount = 1; si.pWaitSemaphores = ws;
             VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
             si.pWaitDstStageMask = &st;
             si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
-            VkSemaphore sg[1] = { presSems[frameSeq % 3] };
+            VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
             si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
             vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
             magenta = 1;
@@ -487,20 +517,27 @@ int main(int argc, char** argv) {
             const uint64_t nowNs = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
             if (nowNs < magentaUntil) {
                 /* HOLD: repaint magenta until expiry */
-                vkResetCommandBuffer(cbs[idx], 0);
+                {   /* wait for the previous use of this cb before reset: reset of a
+               PENDING cb is UB and RADV wedged exactly there (probe hold) */
+            VkFence f = cbsFences[idx];
+            if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
+                continue;   /* still in flight: present the previous image */
+            vkResetFences(dev, 1, &f);
+        }
+        vkResetCommandBuffer(cbs[idx], 0);
                 VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 vkBeginCommandBuffer(cbs[idx], &bbi);
                 VkClearColorValue clear = { .float32 = { 1.0f, 0.02f, 1.0f, 1.0f } };
                 vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                     &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
                 vkEndCommandBuffer(cbs[idx]);
-                VkSemaphore ws[1] = { acqSems[frameSeq % 3] };
+                VkSemaphore ws[1] = { acqSems[frameSeq % NSWSEMS] };
                 VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
                 si.waitSemaphoreCount = 1; si.pWaitSemaphores = ws;
                 VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
                 si.pWaitDstStageMask = &st;
                 si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
-                VkSemaphore sg[1] = { presSems[frameSeq % 3] };
+                VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
                 si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
                 vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
                 magenta = 1; /* held, not a new sample */
@@ -510,28 +547,35 @@ int main(int argc, char** argv) {
             }
         } else {
             /* background frame: reset the slot back to dim (cheap clear command) */
-            vkResetCommandBuffer(cbs[idx], 0);
+            {   /* wait for the previous use of this cb before reset: reset of a
+               PENDING cb is UB and RADV wedged exactly there (probe hold) */
+            VkFence f = cbsFences[idx];
+            if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
+                continue;   /* still in flight: present the previous image */
+            vkResetFences(dev, 1, &f);
+        }
+        vkResetCommandBuffer(cbs[idx], 0);
             VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             vkBeginCommandBuffer(cbs[idx], &bbi);
             VkClearColorValue clear = { .float32 = { 0.06f, 0.05f, 0.12f, 1.0f } };
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
             vkEndCommandBuffer(cbs[idx]);
-            VkSemaphore ws[1] = { acqSems[frameSeq % 3] };
+            VkSemaphore ws[1] = { acqSems[frameSeq % NSWSEMS] };
             VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
             si.waitSemaphoreCount = 1; si.pWaitSemaphores = ws;
             VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
             si.pWaitDstStageMask = &st;
             si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
-            VkSemaphore sg[1] = { presSems[frameSeq % 3] };
+            VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
             si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
-            vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+            vkQueueSubmit(queue, 1, &si, cbsFences[idx]);
         }
 
         /* restore-dim for the NEXT use of this slot is handled by the bg repaint */
 
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-        VkSemaphore sg[1] = { presSems[frameSeq % 3] };
+        VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
         pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = sg;
         pi.swapchainCount = 1; pi.pSwapchains = &swap; pi.pImageIndices = &idx;
         unsigned slot = idx & 3u;
@@ -598,6 +642,22 @@ int main(int argc, char** argv) {
             }
             else if (!latch) thisClickT = thisClickT; /* wait next cycles */
         }
+        /* PACE like a real client: a game ships ~60-240 fps; this probe at
+           ~1000 fps starves the layer/app Release path (ring ring depth 4 at
+           970 fps in-flight frames = selectFreeSlot 'no slot' freeze) and the
+           acquire side then spins VK_TIMEOUT forever (observed after the very
+           first pair). 8 ms between frames when idle; 2 ms while flashing. */
+        do {
+            struct timespec pz; clock_gettime(CLOCK_MONOTONIC, &pz);
+            const uint64_t nowNs = pz.tv_sec * 1000000000ULL + pz.tv_nsec;
+            const uint64_t target = magentaUntil ? 2 : 8;
+            if (lastPaceNs && nowNs - lastPaceNs < target * 1000000ULL) {
+                const uint64_t rest = target * 1000000ULL - (nowNs - lastPaceNs);
+                struct timespec rs = { rest / 1000000000ULL, rest % 1000000000ULL };
+                nanosleep(&rs, nullptr);
+            }
+            lastPaceNs = nowNs;
+        } while (0);
         if (collected >= wantSamples) break;
         /* instrument runtime cap (wall clock), not frame-count: the user needs
            TIME to click; the old frame-count guard (~2000 frames ≈ 8 s at
