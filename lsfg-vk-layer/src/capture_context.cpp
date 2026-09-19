@@ -1121,20 +1121,11 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                       << " (fidx " << this->fidx << ")" << phaseAbsMs() << "\n";
         phaseLog("capture skipped (no slot)");
         if (this->fake) {
-            if (!semaphores.empty()) {
-                std::vector<VkPipelineStageFlags> stages(semaphores.size(),
-                    VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-                const VkSubmitInfo submit{
-                    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
-                    .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
-                    .pWaitSemaphores = semaphores.data(),
-                    .pWaitDstStageMask = stages.data(),
-                };
-                VkQueue sig = this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue;
-                const auto res = vk.df().QueueSubmit(sig, 1, &submit, VK_NULL_HANDLE);
-                if (res != VK_SUCCESS)
-                    throw ls::vulkan_error(res, "vkQueueSubmit() failed");
-            }
+            /* S40: same rule as the blit path — the game's present-wait
+             * semaphores are never consumed by a real present in the ISOLATED
+             * path; an empty wait-submit on them blocks the fam1 ring forever
+             * (their timeline never advances → syncobj ETIME loop). The skip
+             * path's pacing is the recycle fence handled by the acquire. */
             phaseLog("isolated present (skipped capture)");
             return VK_SUCCESS;
         }

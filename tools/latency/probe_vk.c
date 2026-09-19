@@ -57,6 +57,21 @@ static const struct xdg_surface_listener xdg_surf_listener = { .configure = xdg_
 static void xdg_tl_conf(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) { (void)d;(void)t;(void)w;(void)h;(void)s; }
 static const struct xdg_toplevel_listener tl_listener = { .configure = xdg_tl_conf };
 
+static struct wl_output* g_outputs[8];
+static int32_t g_outScale[8];
+static uint32_t g_outName[8];
+static int g_nOut = 0;
+static void out_geometry(void*, struct wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t, const char*, const char*, int32_t) {}
+static void out_mode(void*, struct wl_output*, uint32_t, int32_t, int32_t, int32_t) {}
+static void out_done(void*, struct wl_output*) {}
+struct out_track { struct wl_output* o; int32_t scale; };
+static void out_scale2(void* data, struct wl_output*, int32_t scale) {
+    ((struct out_track*)data)->scale = scale;
+}
+static const struct wl_output_listener out_listener2 = {
+    .geometry = out_geometry, .mode = out_mode, .done = out_done, .scale = out_scale2,
+};
+static struct out_track g_tracks[8];
 static void global(void* d, struct wl_registry* r, uint32_t name, const char* iface, uint32_t ver) {
     (void)d;
     if (!strcmp(iface, wl_compositor_interface.name)) comp = wl_registry_bind(r, name, &wl_compositor_interface, 4);
@@ -65,6 +80,15 @@ static void global(void* d, struct wl_registry* r, uint32_t name, const char* if
     else if (!strcmp(iface, wp_presentation_interface.name)) {
         present = wl_registry_bind(r, name, &wp_presentation_interface, 2);
         wp_presentation_add_listener(present, &pres_listener, nullptr);
+    }
+    else if (strcmp(iface, wl_output_interface.name) == 0 && g_nOut < 8) {
+        struct wl_output* o = wl_registry_bind(r, name, &wl_output_interface,
+            ver < 3 ? ver : 3);
+        g_outputs[g_nOut] = o;
+        g_outName[g_nOut] = name;
+        g_tracks[g_nOut].o = o; g_tracks[g_nOut].scale = 0;
+        wl_output_add_listener(o, &out_listener2, &g_tracks[g_nOut]);
+        ++g_nOut;
     }
 }
 static void global_remove(void* d, struct wl_registry* r, uint32_t n) { (void)d;(void)r;(void)n; }
@@ -115,8 +139,9 @@ static void* input_thread_fn(void* arg) {
             ssize_t n;
             while ((n = read(g_inFds[i], ev, sizeof(ev))) > 0) {
                 for (size_t j = 0; j < (size_t)n / sizeof(ev[0]); ++j) {
-                    if (ev[j].type == EV_KEY
-                            && ev[j].code == BTN_LEFT && ev[j].value == 1) {
+                    const int code = ev[j].code;
+                    if (ev[j].type == EV_KEY && ev[j].value == 1
+                            && (code == BTN_LEFT || code == 16 /* KEY_Q (uclick --key) */)) {
                         static unsigned totalClicks = 0;
                         ++totalClicks;
                         if (totalClicks == 1)
@@ -245,9 +270,28 @@ int main(int argc, char** argv) {
     xdg_toplevel_set_fullscreen(tl, nullptr);  /* un-occludable: compositor must
         cycle our buffers (occluded = QueuePresent stalls forever, proven) */
     xdg_toplevel_set_title(tl, "probe-vk");
-    /* NOTE: do NOT fullscreen — occluding the WORK SCREEN's own output keeps
-       KWin from feeding presented events in some focus states; a small idle
-       toplevel composed on the active screen works reliably (probe_vk10). */
+    /* Session 40: put BOTH legs on the SAME display the overlay uses (DP-7,
+     * 240 Hz): click->photon must be measured where the doubler actually
+     * presents. The 240 Hz / scale-1 output is chosen via wl_output scale
+     * events (DP-7 scale=1; HDMI-A-3 scale=1.5 per KWin). */
+    {
+        wl_display_roundtrip(dpy); wl_display_roundtrip(dpy); /* drains scale events */
+        struct wl_output* target = nullptr;
+        for (int i = 0; i < g_nOut; ++i) {
+            printf("wl_output[%d] scale=%d%s\n", i, g_tracks[i].scale,
+                g_tracks[i].scale == 1 ? "  <- 240 Hz target (DP-7)" : "");
+            if (g_tracks[i].scale == 1 && target == nullptr)
+                target = g_outputs[i];
+        }
+        if (target) {
+            xdg_toplevel_set_fullscreen(tl, target);
+            wl_surface_commit(surf);
+            for (int i = 0; i < 10 && !g_surfConfigured; ++i) wl_display_roundtrip(dpy);
+            printf("fullscreen on DP-7 (scale-1 output) armed\n");
+        } else {
+            printf("WARNING: no scale-1 output found; staying windowed\n");
+        }
+    }
     wl_surface_commit(surf);
     for (int i = 0; i < 10 && !g_surfConfigured; ++i) wl_display_roundtrip(dpy);
     if (!g_surfConfigured) { fprintf(stderr, "xdg configure never arrived\n"); return 3; }
@@ -330,7 +374,13 @@ int main(int argc, char** argv) {
     if (vkCreateSwapchainKHR(dev, &swci, nullptr, &swap) != VK_SUCCESS) { fprintf(stderr, "CreateSwapchain failed\n"); return 10; }
     uint32_t nimg = 0; vkGetSwapchainImagesKHR(dev, swap, &nimg, nullptr);
     VkImage imgs[8]; vkGetSwapchainImagesKHR(dev, swap, &nimg, imgs);
-    printf("swapchain images %u, present clock %u\n", nimg, presentClock);
+    printf("swapchain images %u, present clock %u", nimg, presentClock);
+    if (presentClock != 1) {                         /* CLOCK_MONOTONIC */
+        printf(" — FATAL: compositor latch clock != CLOCK_MONOTONIC;"
+               " click->photon math would be invalid\n");
+        return 9;
+    }
+    printf(" (=CLOCK_MONOTONIC, same clock as click t0)\n");
 
     /* memory-free fill: use vkCmdClearColorImage (no vertex pipeline needed) */
     VkCommandPool cpool;
