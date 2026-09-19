@@ -25,6 +25,8 @@
 #include <fcntl.h>
 #include <linux/input.h>
 #include <linux/input-event-codes.h>
+#include <glob.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stdatomic.h>
@@ -117,41 +119,63 @@ static uint64_t now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
-/* --- input thread: one mouse device, CLICKS only -------------------------- */
+/* --- input thread: ALL mice, BTN_LEFT presses ------------------------------ */
 static _Atomic uint64_t g_click_ns[2] = { 0, 0 };
 static _Atomic int g_click_slot = 0;
 volatile _Atomic uint32_t g_paint_flag = 0; /* paint loop watches this */
 
 static void *input_thread(void *arg) {
     (void)arg;
-    char dev[80];
-    snprintf(dev, sizeof(dev), "/dev/input/by-id/usb-BY-tech_WU-mouse_A656A7D0-event-mouse");
-    int fd = open(dev, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    if (fd < 0) { perror("open input device"); return nullptr; }
-    unsigned clock = CLOCK_MONOTONIC; /* matches wp_presentation clock_id=1 */
-    /* EVIOCSCLOCKID moves evdev timestamps onto the same clock domain as the
-     * compositor's constant — the cross-layer comparability requirement. */
-    if (ioctl(fd, EVIOCSCLOCKID, &clock) != 0)
-        perror("EVIOCSCLOCKID (timestamps may be CLOCK_REALTIME!)");
+    /* open EVERY event-mouse by-id node — the box has four pointer devices
+     * (Endgame OP1, BY-tech, Azeron, Wooting); the user clicks whichever is
+     * on the desk, so listen on all of them. */
+    int fds[64];
+    int nfd = 0;
+    glob_t gg;
+    if (glob("/dev/input/by-id/*event-mouse*", 0, nullptr, &gg) == 0) {
+        for (size_t i = 0; i < gg.gl_pathc && nfd < 32; ++i) {
+            int fd = open(gg.gl_pathv[i], O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+            if (fd < 0) continue;
+            unsigned clk = CLOCK_MONOTONIC; /* matches KWin clock_id=1 */
+            if (ioctl(fd, EVIOCSCLOCKID, &clk) != 0)
+                perror("EVIOCSCLOCKID (timestamps may be CLOCK_REALTIME!)");
+            else {
+                printf("input: %s -> CLOCK_MONOTONIC\n", gg.gl_pathv[i]);
+                fflush(stdout);
+            }
+            fds[nfd++] = fd;
+        }
+        globfree(&gg);
+    }
+    if (nfd == 0) { perror("no input devices readable"); return nullptr; }
 
+    struct pollfd pfd[64];
+    for (int i = 0; i < nfd; ++i) {
+        pfd[i].fd = fds[i];
+        pfd[i].events = POLLIN;
+    }
     struct input_event ev[64];
     for (;;) {
-        const ssize_t n = read(fd, ev, sizeof(ev));
-        if (n <= 0) { usleep(2000); continue; }
-        const size_t count = (size_t)n / sizeof(ev[0]);
-        for (size_t i = 0; i < count; ++i) {
-            if (ev[i].type != EV_KEY || ev[i].value != 1)
+        const int pr = poll(pfd, (nfds_t)nfd, 250);
+        if (pr <= 0) continue;
+        for (int i = 0; i < nfd; ++i) {
+            if ((pfd[i].revents & POLLIN) == 0)
                 continue;
-            /* left click = the magic key (BUTTON_LEFT)
-             * Azeron: KEY mice report BTN_LEFT for the stick's index clone */
-            if (ev[i].code == BTN_LEFT || ev[i].code == KEY_Q) {
-                const uint64_t event_ns =
-                    (uint64_t)ev[i].time.tv_sec * 1000000000ULL
-                    + (uint64_t)ev[i].time.tv_usec * 1000ULL;
-                int slot = (atomic_load(&g_click_slot) + 1) & 1;
-                atomic_store(&g_click_ns[slot], event_ns);
-                atomic_store(&g_click_slot, slot);
-                atomic_store(&g_paint_flag, 1);
+            const ssize_t n = read(pfd[i].fd, ev, sizeof(ev));
+            if (n <= 0) continue;
+            const size_t count = (size_t)n / sizeof(ev[0]);
+            for (size_t j = 0; j < count; ++j) {
+                if (ev[j].type != EV_KEY || ev[j].value != 1)
+                    continue;
+                if (ev[j].code == BTN_LEFT) {  /* left-click press */
+                    const uint64_t event_ns =
+                        (uint64_t)ev[j].time.tv_sec * 1000000000ULL
+                        + (uint64_t)ev[j].time.tv_usec * 1000ULL;
+                    int slot = (atomic_load(&g_click_slot) + 1) & 1;
+                    atomic_store(&g_click_ns[slot], event_ns);
+                    atomic_store(&g_click_slot, slot);
+                    atomic_store(&g_paint_flag, 1);
+                }
             }
         }
     }
