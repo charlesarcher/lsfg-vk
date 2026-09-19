@@ -50,8 +50,10 @@ static void xdg_ping(void *data, struct xdg_wm_base *x, uint32_t serial) {
     (void)data; xdg_wm_base_pong(x, serial);
 }
 static const struct xdg_wm_base_listener xdg_listener = { .ping = xdg_ping };
+static int g_surfConfigured = 0;
 static void xdg_surf_configure(void *data, struct xdg_surface *s, uint32_t serial) {
     (void)data; xdg_surface_ack_configure(s, serial);
+    g_surfConfigured = 1;
 }
 static const struct xdg_surface_listener xdg_surf_listener = {
     .configure = xdg_surf_configure };
@@ -96,9 +98,13 @@ static void fb_sync_output(void *data, struct wp_presentation_feedback *f,
 static void fb_presented(void *data, struct wp_presentation_feedback *f,
         uint32_t s_hi, uint32_t s_lo, uint32_t nsec, uint32_t refresh,
         uint32_t seq_hi, uint32_t seq_lo, uint32_t flags) {
-    (void)data; (void)refresh; (void)flags;
+    (void)refresh; (void)flags;
     const uint64_t ns = ((uint64_t)s_hi << 32 | s_lo) * 1000000000ULL + nsec;
-    unsigned slot = atomic_load(&g_which) & 1;
+    /* data points at the ARM SLOT this feedback belongs to — using the live
+       g_which here stored the latch into the OTHER slot (off-by-one) because
+       main bumps g_which right after arming; the latch then landed where the
+       waiter never looked. */
+    unsigned slot = data ? *(unsigned *)data & 1u : 0u;
     atomic_store(&g_latch_ns[slot], ns);
     atomic_store(&g_seq, ((uint64_t)seq_hi << 32) | seq_lo);
     wp_presentation_feedback_destroy(f);
@@ -182,6 +188,11 @@ static void *input_thread(void *arg) {
                 printf("ev: t=%u c=%u v=%u on fd#%d\n", ev[j].type,
                        ev[j].code, ev[j].value, i);
             if (ev[j].code == BTN_LEFT) {  /* left-click press */
+                    static unsigned fires = 0;
+                    if (fires++ < 10) {
+                        printf("input: BTN_LEFT fired #%u\n", fires);
+                        fflush(stdout);
+                    }
                     const uint64_t event_ns =
                         (uint64_t)ev[j].time.tv_sec * 1000000000ULL
                         + (uint64_t)ev[j].time.tv_usec * 1000ULL;
@@ -224,9 +235,9 @@ int main(int argc, char **argv) {
     uint8_t *px = mmap(nullptr, SHM_SZ, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     memset(px, 0x20, SHM_SZ);
     struct wl_shm_pool *pool = wl_shm_create_pool(shm, fd, (int32_t)SHM_SZ);
-    struct wl_buffer *bufA = wl_shm_pool_create_buffer(pool, 0, W, H, W,
+    struct wl_buffer *bufA = wl_shm_pool_create_buffer(pool, 0, W, H, W * 4,
         WL_SHM_FORMAT_XRGB8888);
-    struct wl_buffer *bufB = wl_shm_pool_create_buffer(pool, 0, W, H, W,
+    struct wl_buffer *bufB = wl_shm_pool_create_buffer(pool, 0, W, H, W * 4,
         WL_SHM_FORMAT_XRGB8888); /* same pool, same bytes; alternates via commit */
     (void)bufB;
 
@@ -237,8 +248,56 @@ int main(int argc, char **argv) {
     xdg_toplevel_add_listener(tl, &toplevel_listener, nullptr);
     xdg_toplevel_set_app_id(tl, "probe-latency");
     xdg_toplevel_set_fullscreen(tl, nullptr);
+
+    /* XDG map contract (xdg-shell spec, learned via KWin's error 3):
+     * (1) initial commit WITHOUT a buffer requests mapping; (2) the
+     * compositor replies with xdg_surface.configure + toplevel.configure;
+     * (3) the client acks and only THEN attaches a real buffer + commits.
+     * Attaching before configure = protocol error 3 (we hit it live). */
+    wl_surface_commit(surf);          /* (1) the empty commit */
+    for (int i = 0; i < 10 && !g_surfConfigured; ++i)
+        wl_display_roundtrip(dpy);    /* (2) deliver the configure events */
+    if (!g_surfConfigured) {
+        fprintf(stderr, "xdg configure never arrived\n");
+        return 2;
+    }
+    for (uint32_t y = H / 4; y < H / 4 + 20 && y < H; ++y)
+        for (uint32_t x = W / 4; x < W / 4 + 20 && x < W; ++x) {
+            uint8_t *p = px + ((size_t)y * W + x) * 4;
+            p[0] = 0x40; p[1] = 0x10; p[2] = 0x40; p[3] = 0xFF;
+        }
+    wl_surface_attach(surf, bufA, 0, 0);          /* (3) now attach */
+    wl_surface_damage_buffer(surf, 0, 0, (int32_t)W, (int32_t)H);
     wl_surface_commit(surf);
+    wl_display_flush(dpy);
     wl_display_roundtrip(dpy);
+
+    /* SELF-TEST: one arm+commit+roundtrip proves the compositor answers
+     * presented for THIS surface (mpv differential proved KWin answers v2
+     * clients; the probe must see its own before trusting click samples). */
+    {
+        unsigned self_slot = 7; /* any distinct tag; fb writes latch slot 3? — use 0 */
+        self_slot = 0;
+        atomic_store(&g_latch_ns[0], 0);
+        unsigned arm_slot = self_slot;
+        struct wp_presentation_feedback *fb =
+            wp_presentation_feedback(present, surf);
+        wp_presentation_feedback_add_listener(fb, &fb_listener, &arm_slot);
+        wl_surface_attach(surf, bufA, 0, 0);
+        wl_surface_damage_buffer(surf, 0, 0, (int32_t)W, (int32_t)H);
+        wl_surface_commit(surf);
+        wl_display_flush(dpy);
+        for (int i = 0; i < 40; ++i) { /* ~40 roundtrips or until latch */
+            wl_display_roundtrip(dpy);
+            if (atomic_load(&g_latch_ns[0])) break;
+            struct timespec ts = { 0, 2000000 }; nanosleep(&ts, nullptr);
+        }
+        printf("self-test presented: %s (latch=%llu seq=%llu)\n",
+               atomic_load(&g_latch_ns[0]) ? "OK" : "NONE",
+               (unsigned long long)atomic_load(&g_latch_ns[0]),
+               (unsigned long long)atomic_load(&g_seq));
+        fflush(stdout);
+    }
 
     pthread_t ithr;
     pthread_create(&ithr, nullptr, input_thread, nullptr);
@@ -257,10 +316,24 @@ int main(int argc, char **argv) {
          * attach, commit, dispatch until presented arrives */
         unsigned slot = (unsigned)atomic_load(&g_click_slot) & 1;
         uint64_t click = atomic_load(&g_click_ns[slot]);
+        {
+            static unsigned clicks_seen = 0;
+            static double t0 = -1;
+            if (t0 < 0) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec / 1e9; }
+            /* update the click-rate telemetry: a click was consumed if the
+               paint flag flipped; click rate = clicks consumed / elapsed */
+        }
         if (!click) {
             static unsigned waited = 0;
-            if (waited++ % 100 == 0) {
-                fprintf(stderr, "waiting for click...\n");
+            static unsigned clicks_seen = 0;
+            static double t0 = -1;
+            if (t0 < 0) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec + ts.tv_nsec / 1e9; }
+            struct timespec ts2; clock_gettime(CLOCK_MONOTONIC, &ts2);
+            const double el = ts2.tv_sec + ts2.tv_nsec / 1e9 - t0;
+            if (waited++ % 200 == 0) {
+                fprintf(stderr, "waiting for click (%.1fs elapsed, %u samples)\n",
+                        el, collected);
+                fflush(stderr);
             }
             nanosleep(&idle, nullptr);
             continue;
@@ -276,10 +349,11 @@ int main(int argc, char **argv) {
             }
 
         unsigned fslot = atomic_fetch_add(&g_which, 1) & 1;
+        unsigned arm_slot = fslot; /* proxy-owned; fb listener reads via data */
         atomic_store(&g_latch_ns[fslot], 0);
         struct wp_presentation_feedback *fb =
             wp_presentation_feedback(present, surf);
-        wp_presentation_feedback_add_listener(fb, &fb_listener, nullptr);
+        wp_presentation_feedback_add_listener(fb, &fb_listener, &arm_slot);
         wl_surface_attach(surf, bufA, 0, 0);
         wl_surface_damage_buffer(surf, 0, 0, (int32_t)W, (int32_t)H);
         wl_surface_commit(surf);
