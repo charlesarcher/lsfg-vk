@@ -213,6 +213,7 @@ int main(int argc, char **argv) {
     }
     wp_presentation_add_listener(present, &present_listener, nullptr);
     wl_display_roundtrip(dpy);  /* clock_id */
+    printf("probe build 20260919-1456 (globfree-use-after-free fixed)\n"); fflush(stdout);
     printf("paint clock: %u\n", present_clock); fflush(stdout);
 
     const size_t SHM_SZ = (size_t)W * H * 4;
