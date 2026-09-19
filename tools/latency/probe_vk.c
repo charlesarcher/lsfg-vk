@@ -121,16 +121,22 @@ static void* input_thread_fn(void* arg) {
                         ++totalClicks;
                         if (totalClicks == 1)
                             printf("first click seen\n");
-                        else
-                            printf("click #%u armed\n", totalClicks);
+                        else {
+                            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                            printf("click #%u armed @%.3fs\n", totalClicks,
+                                ts.tv_sec % 1000 + ts.tv_nsec / 1e9);
+                        }
                         struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
                         const uint64_t t0 = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-                        unsigned head = atomic_load(&g_clickHead);
-                        unsigned tail = atomic_load(&g_clickTail);
-                        unsigned next = (head + 1) & 63;
-                        if (next != tail) {   /* drop on overflow (.Never expected) */
-                            g_clickRing[head] = t0;
+                        unsigned head2 = atomic_load(&g_clickHead);
+                        unsigned tail2 = atomic_load(&g_clickTail);
+                        unsigned next = (head2 + 1) & 63;
+                        if (next != tail2) {   /* drop on overflow (never expected) */
+                            g_clickRing[head2] = t0;
                             atomic_store(&g_clickHead, next);
+                            struct timespec ts2; clock_gettime(CLOCK_MONOTONIC, &ts2);
+                            printf("ring push head=%u @%.3fs\n", next,
+                                ts2.tv_sec % 1000 + ts2.tv_nsec / 1e9);
                         }
                     }
                 }
@@ -174,6 +180,8 @@ int main(int argc, char** argv) {
     struct xdg_toplevel* tl = xdg_surface_get_toplevel(xs);
     xdg_toplevel_add_listener(tl, &tl_listener, nullptr);
     xdg_toplevel_set_app_id(tl, "probe-vk");
+    xdg_toplevel_set_fullscreen(tl, nullptr);  /* un-occludable: compositor must
+        cycle our buffers (occluded = QueuePresent stalls forever, proven) */
     xdg_toplevel_set_title(tl, "probe-vk");
     /* NOTE: do NOT fullscreen — occluding the WORK SCREEN's own output keeps
        KWin from feeding presented events in some focus states; a small idle
@@ -251,7 +259,11 @@ int main(int argc, char** argv) {
     swci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swci.preTransform = caps.currentTransform;
     swci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    swci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;  /* un-limited, rule out FIFO pacing */
+    /* FIFO: the compositor paces us; occlusion stalls are bounded (frame
+     * wall-clock ~4 ms at 240 Hz) and buffer cycling continues even when the
+     * window is partly occluded. IMMEDIATE froze inside vkQueuePresentKHR
+     * when the compositor stopped consuming the surface (occluded). */
+    swci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
     VkSwapchainKHR swap;
     if (vkCreateSwapchainKHR(dev, &swci, nullptr, &swap) != VK_SUCCESS) { fprintf(stderr, "CreateSwapchain failed\n"); return 10; }
     uint32_t nimg = 0; vkGetSwapchainImagesKHR(dev, swap, &nimg, nullptr);
@@ -368,8 +380,14 @@ int main(int argc, char** argv) {
 
         /* acquire + draw + commit */
         uint32_t idx = 0;
-        VkResult ac = vkAcquireNextImageKHR(dev, swap, UINT64_MAX, acqSems[frameSeq % 3], VK_NULL_HANDLE, &idx);
-        if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR) continue;
+        VkResult ac = vkAcquireNextImageKHR(dev, swap, 33'333'333ULL /* 33 ms cap: an
+            occluded surface can stop buffer cycling forever; without a cap the main
+            loop froze after the first commit (observed: no ticks past first commit) */,
+            acqSems[frameSeq % 3], VK_NULL_HANDLE, &idx);
+        if (ac == VK_TIMEOUT || ac == VK_NOT_READY)
+            continue;   /* keep the input thread fed; retry next pass */
+        if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR)
+            continue;
 
         int magenta = 0;
         uint64_t thisClickT = 0;
@@ -459,7 +477,16 @@ int main(int argc, char** argv) {
         VkResult pr = vkQueuePresentKHR(queue, &pi);
         (void)pr;
         wl_display_flush(dpy);
-        wl_display_roundtrip(dpy);  /* drain presented feedback for this commit */
+        /* dispatch until THIS commit's presented arrives (KWin replies one frame
+           later at vblank); the FIFO barrier pacing needs us to keep dispatching
+           or Mesa's internal queue wedges. bounded ~50 ms. */
+        for (int k = 0; k < 12; ++k) {
+            wl_display_roundtrip(dpy);
+            if (magenta && atomic_load(&g_latch[slot])) break;
+            if (!magenta) break;   /* bg frames: one dispatch is enough */
+            struct timespec tw = { 0, 3000000 };
+            nanosleep(&tw, nullptr);
+        }
         frameSeq++;
         if (frameSeq == 1) printf("render loop ALIVE (first frame presented, slot %u)\n", slot);
         if (frameSeq % 240 == 0)
