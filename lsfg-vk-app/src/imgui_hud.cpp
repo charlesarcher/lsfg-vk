@@ -95,7 +95,10 @@ namespace ls::hud {
         return g_stats;
     }
     void ImGuiHud::toggle() { toggleImpl(); }
-    bool ImGuiHud::drawing() { return g_visible.load() || g_alpha.load() > 0.02f; }
+    static std::atomic<bool> g_everTicked{ false };
+    bool ImGuiHud::drawing() {
+        return g_everTicked.load() && (g_visible.load() || g_alpha.load() > 0.02f);
+    }
 
     ImGuiHud::ImGuiHud(const vk::Vulkan& vkIn, VkExtent2D outputExtent, VkFormat format)
         : vk(vkIn), outExtent(outputExtent), format(format), cmdbuf(vkIn) {
@@ -240,7 +243,54 @@ namespace ls::hud {
     }
 
     
+
+    VkRenderPass ImGuiHud::buildLoadRenderpass() {
+        VkAttachmentDescription color{};
+        color.format = VK_FORMAT_B8G8R8A8_UNORM;
+        color.samples = VK_SAMPLE_COUNT_1_BIT;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference ref{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &ref;
+        /* in/out deps so the LOAD sees the completed copy write */
+        VkSubpassDependency deps[2]{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT |
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].srcSubpass = 0;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        VkRenderPassCreateInfo rpci{
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .attachmentCount = 1, .pAttachments = &color,
+            .subpassCount = 1, .pSubpasses = &sub,
+            .dependencyCount = 2, .pDependencies = deps };
+        VkRenderPass rp{ VK_NULL_HANDLE };
+        PFN_vkCreateRenderPass p = devPfn<PFN_vkCreateRenderPass>(vk, "vkCreateRenderPass");
+        if (!p || p(vk.dev(), &rpci, nullptr, &rp) != VK_SUCCESS)
+            throw ls::error("imgui_hud: LOAD renderpass failed");
+        return rp;
+    }
+
     void ImGuiHud::buildPmPass() {
+        /* S40+ card-over: LOAD renderpass (draws OVER the game frame) */
+        this->overRenderpass = this->buildLoadRenderpass();
         /* dedicated PM output image (3rd slot, not the 2-slot rotation) */
         this->pmImg = std::make_unique<vk::Image>(this->vk, this->rtSize,
             VK_FORMAT_B8G8R8A8_UNORM,
@@ -277,7 +327,7 @@ namespace ls::hud {
             throw ls::error("imgui_hud: PM descriptor layout failed");
         VkPushConstantRange pc{};
         pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-        pc.offset = 0, pc.size = 4;      /* float fadeMul */
+        pc.offset = 0, pc.size = 16;     /* vec2 rtScale, vec2 rtOffsetN */
         VkPipelineLayoutCreateInfo plci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .setLayoutCount = 1, .pSetLayouts = &layout,
@@ -324,7 +374,19 @@ namespace ls::hud {
         VkPipelineDepthStencilStateCreateInfo ds{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
         VkPipelineColorBlendAttachmentState cba{};
-        /* the PM math is in the shader: blend = replace (no blend) */
+        /* S40+ card-over: PREMULT-OVER blending — src.rgb already
+           multiplied by alpha in the shader; write dst.a = 1 so the
+           surface stays opaque (no hole into the desktop). */
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.colorBlendOp = VK_BLEND_OP_ADD;
+        /* out.a = max(c.a, dst.a): with dst.a = 1 (game copy) the
+           surface stays fully opaque — KWin never blends this swapchain
+           against the desktop; the card's 40% happens IN-BUFFER. */
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        cba.alphaBlendOp = VK_BLEND_OP_MAX;
         cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
                              VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
         VkPipelineColorBlendStateCreateInfo cb{
@@ -352,6 +414,8 @@ namespace ls::hud {
         if (res != VK_SUCCESS)
             throw ls::error("imgui_hud: PM graphics pipeline failed");
         this->pmPipeline = pipe;
+        /* S40+ card-over pass uses loadOp=LOAD target (game frame) */
+        /* placement before buildPmPass to keep the helper defined first */
         /* dedicated PM framebuffer (target = pmImg) */
         {
             VkImageView iv2 = this->pmImg->imageview();       /* owned_ptr → raw */
@@ -500,13 +564,10 @@ void ImGuiHud::setupThemeAndFont() {
                 ImGui::GetDrawData()->TotalIdxCount);
         // ---- record RT renderpass + imgui vertices ------------------------
         this->cmdbuf.begin(this->vk);
-        /* DIAG: when dumping, the clear proves the copy path with RED */
-        static const bool dumpRed = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
+        /* S40: transparent-black clear always — the red a=1 DIAG clear
+           poisoned the RT alpha and made card-over render an opaque
+           square (the "giant square with a hue"). */
         VkClearValue clear{};
-        if (dumpRed) {
-            clear.color.float32[0] = 1.f;
-            clear.color.float32[3] = 1.f;
-        }
         VkRenderPassBeginInfo rbi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .renderPass = this->renderpass,
@@ -523,7 +584,7 @@ void ImGuiHud::setupThemeAndFont() {
         /* S40+ PM pass: rt[active] holds straight-alpha imgui output; render
            the PREMULTIPLIED copy into rt[other] with the pm pipeline. The
            present-side blit samples rt[other] (markRead swaps the roles). */
-        const bool pmOn = false;  /* S40: PM disabled; StraightAlpha path */
+        const bool pmOn = false; /* S40+ card-over samples the RT directly; PM tick pass unused */
         if (pmOn) {
             /* sample the slot THIS tick's imgui pass just wrote (=next) */
             const uint8_t srcSlot = next;   /* next == imgui output of now */
@@ -571,7 +632,8 @@ void ImGuiHud::setupThemeAndFont() {
         }
         /* S40+ DIAG dump: LSFGVK_IMGUI_DUMP=1 writes the PM image once. */
         static const bool dumpPm = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
-        if (dumpPm && !this->dumpedPmImage) {
+        static uint32_t dumpEvery = 0;
+        if (dumpPm && ((++dumpEvery % 8) == 0)) {
             VkBufferCreateInfo bci{
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                 .size = static_cast<VkDeviceSize>(this->rtSize.width)
@@ -628,7 +690,8 @@ void ImGuiHud::setupThemeAndFont() {
             /* DIAG smoke 1: fill the buffer 0xEE to prove host mem */
             if (auto pfn = devPfn<PFN_vkCmdFillBuffer>(vk, "vkCmdFillBuffer"); pfn)
                 pfn(this->cmdbuf.raw(), buf, 0, VK_WHOLE_SIZE, 0xEEEEEEEE);
-            if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
+         
+        if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
                 pfn(this->cmdbuf.raw(), this->pmImg->handle(),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
             /* second copy: the straight-alpha imgui slot */
@@ -673,6 +736,7 @@ void ImGuiHud::setupThemeAndFont() {
         this->rtGeneral[next] = true;
         this->rtLastAccess[next] = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         this->active = next;
+        g_everTicked.store(true);   /* gate card-over on a real placed frame */
     }
 
     void ImGuiHud::drawWidgets(const Stats& s) {
@@ -771,19 +835,134 @@ void ImGuiHud::setupThemeAndFont() {
                 nullptr, 0.f, 25.f,
                 ImVec2(ImGui::GetContentRegionAvail().x, 15.f));
         }
-        /* S40+: capture the card's live sub-rect for the present-side
-           sub-rect blit (premult-alpha-0 margins must NOT reach the
-           overlay; they punch through to whatever is below). */
-        const ImVec2 wp = ImGui::GetWindowPos();
-        const ImVec2 ws = ImGui::GetWindowSize();
-        this->mCardRect = CardRect{
-            static_cast<int32_t>(wp.x) - 4,          /* 4 px glow margin */
-            static_cast<int32_t>(wp.y) - 4,
-            static_cast<int32_t>(ws.x) + 8,
-            static_cast<int32_t>(ws.y) + 8 };
         ImGui::End();
         ImGui::PopStyleColor();
         ImGui::PopStyleVar(3);
+    }
+
+
+    /* S40+ card-over: blend the premultiplied card ONTO the game frame
+       already resident in dstImage, and WRITE ALPHA=1 (the swapchain
+       stays fully opaque to the compositor — no surface hole). Reuses
+       the pm pipeline (premult source) with premult-OVER blending:
+       out.rgb = src.rgb + dst.rgb*(1-src.a), out.a = 1. */
+    void ImGuiHud::renderCardOver(vk::CommandBuffer& cb, VkImage dstImage,
+            VkExtent2D dstExtent) {
+        if (!this->pmBuilt || !this->pmPipeline)
+            throw ls::error("imgui_hud: PM pipeline unavailable");
+        /* framebuffer cache (per dstImage) */
+        auto it = std::find_if(this->overFbs.begin(), this->overFbs.end(),
+            [&](const OverFb& o){ return o.image == dstImage; });
+        if (it == this->overFbs.end()) {
+            /* create a view + framebuffer for this swapchain image */
+            VkImageViewCreateInfo vci{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = dstImage,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = VK_FORMAT_B8G8R8A8_UNORM,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 } };
+            VkImageView view{ VK_NULL_HANDLE };
+            PFN_vkCreateImageView cIv = devPfn<PFN_vkCreateImageView>(vk, "vkCreateImageView");
+            if (!cIv || cIv(vk.dev(), &vci, nullptr, &view) != VK_SUCCESS)
+                throw ls::error("imgui_hud: card-over view failed");
+            VkFramebufferCreateInfo fci{
+                .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                .renderPass = this->renderpass,
+                .attachmentCount = 1, .pAttachments = &view,
+                .width = dstExtent.width, .height = dstExtent.height,
+                .layers = 1 };
+            VkFramebuffer fb{ VK_NULL_HANDLE };
+            PFN_vkCreateFramebuffer cFb = devPfn<PFN_vkCreateFramebuffer>(vk, "vkCreateFramebuffer");
+            if (!cFb || cFb(vk.dev(), &fci, nullptr, &fb) != VK_SUCCESS)
+                throw ls::error("imgui_hud: card-over fb failed");
+            if (this->overFbs.size() >= 8) {   /* ring of 8, destroy oldest */
+                PFN_vkDestroyFramebuffer dFb = devPfn<PFN_vkDestroyFramebuffer>(vk, "vkDestroyFramebuffer");
+                PFN_vkDestroyImageView dIv = devPfn<PFN_vkDestroyImageView>(vk, "vkDestroyImageView");
+                if (dFb) dFb(vk.dev(), this->overFbs.front().fb, nullptr);
+                if (dIv) dIv(vk.dev(), this->overFbs.front().view, nullptr);
+                this->overFbs.pop_front();
+            }
+            this->overFbs.push_back(OverFb{ dstImage, view, fb });
+            it = std::prev(this->overFbs.end());
+        }
+        /* barriers: src rt (straight alpha imgui slot) readable, dst into
+           COLOR attachment state */
+        const VkImageMemoryBarrier srcBar = makeImgBarrier(
+            this->rt[this->active]->handle(),
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        const VkImageMemoryBarrier dstBar = makeImgBarrier(dstImage,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const VkImageMemoryBarrier bars[2] = { srcBar, dstBar };
+        PFN_vkCmdPipelineBarrier barrier = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier");
+        if (barrier)
+            barrier(cb.raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                              VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                0, 0, nullptr, 0, nullptr, 2, bars);
+        VkRenderPassBeginInfo rbi{
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .renderPass = this->overRenderpass,   /* LOAD, not clear */
+            .framebuffer = it->fb,
+            .renderArea = { {0,0}, { dstExtent.width, dstExtent.height } } };
+        if (auto p = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass"); p)
+            p(cb.raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        if (auto p = devPfn<PFN_vkCmdBindPipeline>(vk, "vkCmdBindPipeline"); p)
+            p(cb.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS, this->pmPipeline);
+        VkViewport vp{ 0.f, 0.f, (float)dstExtent.width, (float)dstExtent.height, 0, 1 };
+        VkRect2D sc{ {0,0}, { dstExtent.width, dstExtent.height } };
+        if (auto p = devPfn<PFN_vkCmdSetViewport>(vk, "vkCmdSetViewport"); p)
+            p(cb.raw(), 0, 1, &vp);
+        if (auto p = devPfn<PFN_vkCmdSetScissor>(vk, "vkCmdSetScissor"); p)
+            p(cb.raw(), 0, 1, &sc);
+        if (auto p = devPfn<PFN_vkCmdBindDescriptorSets>(vk, "vkCmdBindDescriptorSets"); p) {
+            VkDescriptorSet set = this->pmSet[this->active];
+            p(cb.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                this->pmPipelineLayout, 0, 1, &set, 0, nullptr);
+        }
+        /* S40+ card window in normalized dst coords: the card's RT rect
+           maps 1:1 into the dst (origin = outExtent - rtW - 8, 8) */
+        const ImVec2 rtOff{
+            static_cast<float>(this->outExtent.width)
+                - static_cast<float>(this->rtSize.width) - 8.f, 8.f };
+        const float rtScaleX = static_cast<float>(this->rtSize.width)
+            / static_cast<float>(dstExtent.width);
+        const float rtScaleY = static_cast<float>(this->rtSize.height)
+            / static_cast<float>(dstExtent.height);
+        float pcv[4] = { rtScaleX, rtScaleY, rtOff.x, rtOff.y };
+        /* the shader's rtOffsetN expects NORMALIZED origin (matching the
+           normalized uv (0..1) space): convert. */
+        pcv[2] = rtOff.x / static_cast<float>(dstExtent.width);
+        pcv[3] = rtOff.y / static_cast<float>(dstExtent.height);
+        const VkRect2D scFull{ {0,0}, { dstExtent.width, dstExtent.height } };
+        (void)scFull;
+        if (auto p = devPfn<PFN_vkCmdPushConstants>(vk, "vkCmdPushConstants"); p)
+            p(cb.raw(), this->pmPipelineLayout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                0, 16, pcv);
+        /* THE DRAW only covers the card rect: keep the fullscreen tri
+           (the fragment discards outside the window) */
+        if (auto p = devPfn<PFN_vkCmdDraw>(vk, "vkCmdDraw"); p)
+            p(cb.raw(), 3, 1, 0, 0);
+        if (auto p = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); p)
+            p(cb.raw());
+        /* leave the dst in its caller-declared layout (TRANSFER_DST) for
+           the caller's present barrier chain */
+        const VkImageMemoryBarrier backBar = makeImgBarrier(dstImage,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        const VkImageMemoryBarrier backs[1] = { backBar };
+        if (barrier)
+            barrier(cb.raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, backs);
     }
 
     VkImage ImGuiHud::rtImage() const {
@@ -800,13 +979,6 @@ void ImGuiHud::setupThemeAndFont() {
                 static_cast<int32_t>(this->rtSize.width) - 8,
             8,
         };
-    }
-
-    /// S40+: the card's occupied sub-rect, updated by drawWidgets each
-    /// tick via GetWindowPos/GetWindowPos+Size. Lazy-init: if nothing has
-    /// drawn yet, fall back to a conservative top-right anchor box.
-    ImGuiHud::CardRect ImGuiHud::cardRect() const {
-        return this->mCardRect;
     }
 
 } // namespace ls::hud

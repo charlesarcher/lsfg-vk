@@ -726,11 +726,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
        blend the card over the game. PRE_MULTIPLIED now PREFERRED whenever
        supported (KWin layer-shell supports it); OPAQUE stays the legal
        fallback (card renders as its cpu-y 40%-brightness color there). */
-    VkCompositeAlphaFlagBitsKHR compositingAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
-        compositingAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
-    else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
-        compositingAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    /* S40+ card-over: the card is pre-blended into the game buffer
+       (dst.a = 1 everywhere) — the compositor sees a fully opaque
+       surface, so OPAQUE is correct and the desktop hole is gone. */
+    VkCompositeAlphaFlagBitsKHR compositingAlpha =
+        VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     std::fprintf(stderr, "lsfg-vk-app: overlay compositeAlpha=0x%x (supported=0x%x)\n",
         (unsigned)compositingAlpha, (unsigned)caps.supportedCompositeAlpha);
 
@@ -996,62 +996,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // TRANSFER_DST_OPTIMAL with in-flight write access, and is left in that same
     // layout so the caller's post barrier transitions it to PRESENT_SRC.
     auto drawHud = [&](vk::CommandBuffer& cb, VkImage dstImage) {
-        // S40+ imgui first (top-most card); cheap no-op when hidden.
-        if (g_imguiHud && ls::hud::ImGuiHud::drawing()) {
-            const VkImage srcImg = g_imguiHud->rtImage();
-            /* S40+: blit ONLY the card's live sub-rect. The RT's
-               premult-alpha-0 margins punching through the OVERLAY
-               surface were Charles's "clips through, I can see the
-               desktop" bug: any copied pixel with a=0 shows whatever is
-               below the overlay layer (desktop where the game window
-               doesn't sit). The card rect tracks GetWindowPos/Size. */
-            const auto cr = g_imguiHud->cardRect();
-            const VkExtent2D rtE = g_imguiHud->rtExtent();
-            const VkExtent2D b{ static_cast<uint32_t>(
-                    cr.w > 0 ? cr.w : rtE.width), static_cast<uint32_t>(
-                    cr.h > 0 ? cr.h : rtE.height) };
-            /* origin() is the full-RT anchor; the card sits at the RT's
-               top-right, so the on-screen origin = anchor + (rtW - cardX
-               - cardW, cardY). When cardRect is still zeroed (first
-               frames), fall back to the full-RT blit. */
-            const auto oFull = g_imguiHud->origin();
-            /* the RT maps 1:1 at the origin: a card drawn at RT (cr.x,
-               cr.y) belongs on screen at (oFull + cr) = the true
-               upper-right corner (outW - 8 - cardW). */
-            const VkOffset2D o{
-                static_cast<int32_t>(cr.w > 0 ? oFull.x + cr.x : oFull.x),
-                static_cast<int32_t>(cr.w > 0 ? oFull.y + cr.y : oFull.y) };
-            const VkImageMemoryBarrier sBar = makeBlitBarrier(srcImg,
-                g_imguiHud->lastAccess(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-            const VkImageMemoryBarrier dB = makeBlitBarrier(dstImage,
-                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            const VkImageMemoryBarrier bars[2] = { sBar, dB };
-            vk.df().CmdPipelineBarrier(cb.raw(),
-                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                0, nullptr, 0, nullptr, 2, bars);
-            const int32_t sx = cr.w > 0 ? cr.x : 0;
-            const int32_t sy = cr.w > 0 ? cr.y : 0;
-            const VkImageBlit bl{
-                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0,0,1 },
-                .srcOffsets = {
-                    { sx, sy, 0 },
-                    { sx + static_cast<int32_t>(b.width),
-                      sy + static_cast<int32_t>(b.height), 1 } },
-                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0,0,1 },
-                .dstOffsets = {
-                    { o.x, o.y, 0 },
-                    { o.x + static_cast<int32_t>(b.width),
-                      o.y + static_cast<int32_t>(b.height), 1 } },
-            };
-            vk.df().CmdBlitImage(cb.raw(), srcImg,
-                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dstImage,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+        // S40+ card-over: blend the premultiplied card OVER the game
+        // frame already resident in this swapchain image; dst.a = 1
+        // everywhere (the surface stays opaque to the compositor — no
+        // desktop hole). 40% look happens IN the buffer, not at the
+        // surface alpha level.
+        if (g_imguiHud && ls::hud::ImGuiHud::drawing()
+                && g_imguiHud->cardOverReady()) {
+            static bool blitLogged = false;
+            if (!blitLogged) { blitLogged = true;
+                std::cerr << "lsfg-vk-app: card-over branch active\n"; }
+            g_imguiHud->renderCardOver(cb, dstImage, imgExtent);
             g_imguiHud->markRead();
         }
         if (!hud)
