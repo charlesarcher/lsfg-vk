@@ -247,6 +247,42 @@ static int ledger_pair(uint64_t ts0, uint64_t* presented) {
     return 0;
 }
 
+
+/* --- S40 "CLICK!" overlay: 5x7 bitmap font (C L I C K !), row-major,
+   5 px/row MSB-left --- */
+#define TXT_COLS 6
+#define TXT_GW 6   /* 5 px glyph + 1 px gap */
+#define TXT_GH 7
+#define TXT_SCALE 8
+static const unsigned char GLYPH57[TXT_COLS][TXT_GH] = {
+    {0x0e,0x11,0x11,0x1f,0x11,0x11,0x11}, /* C */
+    {0x12,0x12,0x12,0x1e,0x12,0x12,0x12}, /* L */
+    {0x0e,0x04,0x04,0x04,0x04,0x04,0x0e}, /* I */
+    {0x0e,0x11,0x11,0x1f,0x11,0x11,0x11}, /* C */
+    {0x11,0x11,0x0a,0x04,0x04,0x04,0x04}, /* K */
+    {0x1f,0x11,0x12,0x0c,0x09,0x11,0x1f}, /* ! */
+};
+#define TXTW (TXT_COLS * TXT_GW * TXT_SCALE)   /* 288 px */
+#define TXTH (TXT_GH * TXT_SCALE)              /*  56 px */
+#define TXTB (TXTW * TXTH * 4u)
+/* compose: white glyphs over (r,g,b) backdrop */
+static void txt_compose(unsigned char *map, float r, float g, float b)
+{
+    for (uint32_t y = 0; y < TXTH; ++y)
+        for (uint32_t x = 0; x < TXTW; ++x) {
+            const uint32_t gx = x / TXT_SCALE, gy = y / TXT_SCALE;
+            const uint32_t col = gx / TXT_GW;
+            const uint32_t incol = gx % TXT_GW;
+            unsigned char *px = map + ((size_t)y * TXTW + x) * 4;
+            if (incol < 5) {
+                const unsigned char on = (GLYPH57[col][gy] >> (4 - incol)) & 1u;
+                if (on) { px[0]=0xff; px[1]=0xff; px[2]=0xff; px[3]=0xff; continue; }
+            }
+            px[0]=(unsigned char)(b*255.0f); px[1]=(unsigned char)(g*255.0f);
+            px[2]=(unsigned char)(r*255.0f); px[3]=0xff;
+        }
+}
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
     /* optional side-log: LSFGVK_PROBE_LOG=/path — lets a second reader (agent)
@@ -488,6 +524,28 @@ int main(int argc, char** argv) {
         vkCreateSemaphore(dev, &semci, nullptr, &presSems[i]);
     }
 
+
+    /* --- S40: "CLICK!" overlay staging buffer (host-visible, coherent) --- */
+    VkBuffer txtBuf; VkDeviceMemory txtMem; unsigned char *txtMap = nullptr;
+    {
+        VkBufferCreateInfo bci = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+        bci.size = TXTB; bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        if (vkCreateBuffer(dev, &bci, nullptr, &txtBuf) != VK_SUCCESS) { fprintf(stderr, "txt buffer\n"); return 11; }
+        VkMemoryRequirements mr; vkGetBufferMemoryRequirements(dev, txtBuf, &mr);
+        VkMemoryAllocateInfo mai = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+        mai.allocationSize = mr.size;
+        VkPhysicalDeviceMemoryProperties mp; vkGetPhysicalDeviceMemoryProperties(chosen, &mp);
+        for (uint32_t t = 0; t < mp.memoryTypeCount; ++t)
+            if ((mr.memoryTypeBits & (1u << t)) &&
+                (mp.memoryTypes[t].propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                 (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) { mai.memoryTypeIndex = t; break; }
+        if (vkAllocateMemory(dev, &mai, nullptr, &txtMem) != VK_SUCCESS) { fprintf(stderr, "txt mem\n"); return 12; }
+        vkBindBufferMemory(dev, txtBuf, txtMem, 0);
+        vkMapMemory(dev, txtMem, 0, TXTB, 0, (void**)&txtMap);
+        txt_compose(txtMap, 0.06f, 0.05f, 0.12f);   /* initial bg */
+        printf("CLICK! overlay %ux%u staged\n", TXTW, TXTH);
+    }
     /* --- input thread: SAME discovery as probe_latency (all mice + virtual clicker) --- */
     int fds[64]; int nfd = 0;  /* copies; handed to the input thread below */
     glob_t gg;
@@ -617,6 +675,16 @@ int main(int argc, char** argv) {
             VkClearColorValue clear = { .float32 = { clearR, clearG, clearB, 1.0f } };
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
+                {   /* S40 "CLICK!" overlay: centered copy onto the frame */
+                    txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2]);
+                    VkBufferImageCopy cpy = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+                        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                        .imageOffset = { (int32_t)(ext.width > TXTW ? (ext.width - TXTW) / 2 : 0),
+                                         (int32_t)(ext.height > TXTH ? (ext.height - TXTH) / 2 : 0), 0 },
+                        .imageExtent = { ext.width > TXTW ? TXTW : ext.width,
+                                         ext.height > TXTH ? TXTH : ext.height, 1 } };
+                    vkCmdCopyBufferToImage(cbs[idx], txtBuf, imgs[idx], VK_IMAGE_LAYOUT_GENERAL, 1, &cpy);
+                }
             vkEndCommandBuffer(cbs[idx]);
             /* fence-acquire: the CB needs no sem wait; exclusivity comes
                from the acquire (KWin cannot present an acquired image). */
@@ -647,6 +715,16 @@ int main(int argc, char** argv) {
                 VkClearColorValue clear = { .float32 = { clearR, clearG, clearB, 1.0f } };
                 vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                     &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
+                    {   /* S40 "CLICK!" overlay: centered copy onto the frame */
+                        txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2]);
+                        VkBufferImageCopy cpy = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+                            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                            .imageOffset = { (int32_t)(ext.width > TXTW ? (ext.width - TXTW) / 2 : 0),
+                                             (int32_t)(ext.height > TXTH ? (ext.height - TXTH) / 2 : 0), 0 },
+                            .imageExtent = { ext.width > TXTW ? TXTW : ext.width,
+                                             ext.height > TXTH ? TXTH : ext.height, 1 } };
+                        vkCmdCopyBufferToImage(cbs[idx], txtBuf, imgs[idx], VK_IMAGE_LAYOUT_GENERAL, 1, &cpy);
+                    }
                 vkEndCommandBuffer(cbs[idx]);
                 /* fence-acquire path: no wait semaphore (see main-loop note) */
                 VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
@@ -681,6 +759,16 @@ int main(int argc, char** argv) {
                 0.12f + 0.004f * (float)(frameSeq & 1), 1.0f } };
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
+                {   /* S40 "CLICK!" overlay: centered copy onto the frame */
+                    txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2]);
+                    VkBufferImageCopy cpy = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
+                        .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                        .imageOffset = { (int32_t)(ext.width > TXTW ? (ext.width - TXTW) / 2 : 0),
+                                         (int32_t)(ext.height > TXTH ? (ext.height - TXTH) / 2 : 0), 0 },
+                        .imageExtent = { ext.width > TXTW ? TXTW : ext.width,
+                                         ext.height > TXTH ? TXTH : ext.height, 1 } };
+                    vkCmdCopyBufferToImage(cbs[idx], txtBuf, imgs[idx], VK_IMAGE_LAYOUT_GENERAL, 1, &cpy);
+                }
             vkEndCommandBuffer(cbs[idx]);
             /* fence-acquire: the CB needs no sem wait; exclusivity comes
                from the acquire (KWin cannot present an acquired image). */
