@@ -320,7 +320,7 @@ namespace ls::hud {
                 static_cast<int>(s.frameTimesCount),
                 static_cast<int>(s.frameTimesIdx % 180),
                 nullptr, 0.f, 25.f,
-                ImVec2(84.f, 15.f));
+                ImVec2(ImGui::GetContentRegionAvail().x, 15.f));
         }
         // click->photon percentiles from the live ring (dash while empty)
         ImGui::Spacing();
