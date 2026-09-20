@@ -727,10 +727,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
        supported (KWin layer-shell supports it); OPAQUE stays the legal
        fallback (card renders as its cpu-y 40%-brightness color there). */
     VkCompositeAlphaFlagBitsKHR compositingAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
-        compositingAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
-    else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
-        compositingAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    /* S40+ card-over: in-buffer blend => OPAQUE ONLY (KWin must not
+       blend card pixels against the desktop beneath the layer). */
     std::fprintf(stderr, "lsfg-vk-app: overlay compositeAlpha=0x%x (supported=0x%x)\n",
         (unsigned)compositingAlpha, (unsigned)caps.supportedCompositeAlpha);
 
@@ -996,10 +994,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // TRANSFER_DST_OPTIMAL with in-flight write access, and is left in that same
     // layout so the caller's post barrier transitions it to PRESENT_SRC.
     auto drawHud = [&](vk::CommandBuffer& cb, VkImage dstImage) {
-        // S40+: gas-gauge — in-buffer card-over parked (RADV refuses
-        // the premult-over render-pass blend on this swapchain: opaque
-        // constant-color test draws never reach the visible image).
-        // Fall back to the PROVEN surface-alpha sub-rect blit.
+        // S40+ card-over: blend the premult card into the game frame.
+        if (g_imguiHud) {
+            static bool logged = false;
+            if (!logged) { logged = true;
+                std::cerr << "lsfg-vk-app: card-over branch active\n"; }
+            g_imguiHud->renderCardOver(cb, dstImage, imgExtent);
+            return;
+        }
         if (g_imguiHud && ls::hud::ImGuiHud::drawing()) {
             const VkImage srcImg = g_imguiHud->rtImage();
             const VkExtent2D b = g_imguiHud->rtExtent();

@@ -403,17 +403,16 @@ namespace ls::hud {
     /* ============ S40+ card-over: the two-pass in-buffer blend ============ */
     void ImGuiHud::syncTick() {
         /* present side must not sample rt[active] until the tick's
-           cmdbuf is GPU-finished. NEVER block indefinitely here: an
-           unsignaled fence here means the FIRST present raced the first
-           tick (empty RT = harmless (0,0,0,0)-over). Bounded wait only,
-           and skip the fence-reset ownership: the tick owns its fence. */
+           cmdbuf is GPU-finished: wait the fence of the active slot;
+           once signaled this is ~free. */
         const uint8_t s = this->active;
+        const auto& f = *this->rtFence[s];
         if (this->rtFenceSignaled[s])
             return;
-        /* rare: present before first tick — wait up to 4 ms, else draw
-           with whatever the clock has (empty-black = no-op blend). */
-        const auto& f = *this->rtFence[s];
-        (void)f.wait(this->vk, 4'000'000ull);   /* 4 ms nanos */
+        /* NEVER unbounded: an unsignaled fence here means the first
+           present raced the first tick (RT = empty = harmless no-op
+           blend). Bounded 4 ms, do NOT claim signaled ownership. */
+        (void)f.wait(this->vk, 4'000'000ull);
     }
 
     void ImGuiHud::buildCardOver() {
@@ -445,7 +444,7 @@ namespace ls::hud {
         VkPushConstantRange pc{};
         pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         pc.offset = 0;
-        pc.size = 32;   /* vec4 rtScale + vec4 rtOffset */
+        pc.size = 16;   /* vec4 (offX, offY, scX, scY) */
         VkPipelineLayoutCreateInfo plci{
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .setLayoutCount = 1, .pSetLayouts = &layout,
@@ -557,8 +556,8 @@ namespace ls::hud {
         color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color.initialLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        color.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         VkAttachmentReference ref{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
         VkSubpassDescription sub{};
         sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
@@ -609,23 +608,35 @@ namespace ls::hud {
         if (res != VK_SUCCESS)
             throw ls::error("imgui_hud: card-over graphics pipeline failed");
         this->coPipeline = pipe;
+        /* DIAG2: same pipeline but for the RT renderpass (in-tick draw) */
+        {
+            VkGraphicsPipelineCreateInfo gpi2{gpi};
+            gpi2.renderPass = this->renderpass;
+            VkPipeline pipe2{};
+            VkResult res2 = cGp(vk.dev(), VK_NULL_HANDLE, 1, &gpi2, nullptr, &pipe2);
+            if (res2 == VK_SUCCESS) {
+                this->coDiPipeline = pipe2;
+                std::fprintf(stderr, "imgui_hud: DIAG pipeline built\n");
+            }
+        }
         this->coBuilt = true;
         std::fprintf(stderr, "imgui_hud: card-over built (2-pass in-buffer)\n");
     }
 
     void ImGuiHud::renderCardOver(vk::CommandBuffer& cb, VkImage dstImage,
             VkExtent2D dstExtent) {
-        static unsigned coDbgN = 0;
-        const bool dbg = coDbgN++ < 6;
+        static std::atomic<unsigned> rcoN{0};
+        const bool dbg = rcoN.fetch_add(1) < 4;
         if (dbg)
-            std::fprintf(stderr, "imgui_hud: renderCardOver enter #%u\n", coDbgN);
+            std::fprintf(stderr, "imgui_hud: rco enter #%u\n",
+                rcoN.load());
         if (!this->coBuilt || !this->coPipeline)
             return;   /* silently skip until built */
         if (!ls::hud::ImGuiHud::drawing())
             return;
         this->syncTick();
         if (dbg)
-            std::fprintf(stderr, "imgui_hud: renderCardOver post-syncTick\n");
+            std::fprintf(stderr, "imgui_hud: rco post-syncTick\n");
         /* framebuffer cache per dst image (swapchain image handoff) */
         auto it = std::find_if(this->coFbs.begin(), this->coFbs.end(),
             [&](const CoFb& o){ return o.image == dstImage; });
@@ -670,28 +681,24 @@ namespace ls::hud {
             this->coFbs.push_back(CoFb{ dstImage, view, fb });
             it = std::prev(this->coFbs.end());
         }
-        /* barriers: rt[active] stays SHADER_READ; dst: the game blit's
-           post-barrier already handed the image to PRESENT_SRC (then NOT
-           to TRANSFER_DST) — take it from PRESENT_SRC into the render. */
+        /* barriers: rt[active] stays SHADER_READ (shader-read discipline);
+           dst: TRANSFER_DST (game frame just blitted) -> COLOR_ATTACHMENT */
         const VkImageMemoryBarrier srcBar = makeImgBarrier(
             this->rt[this->active]->handle(),
             this->rtLastAccess[this->active],
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
             VK_ACCESS_SHADER_READ_BIT,
             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        const VkImageMemoryBarrier dstBar = makeImgBarrier(
-            dstImage,
-            VK_ACCESS_MEMORY_READ_BIT,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
-        const VkImageMemoryBarrier bars[2] = { srcBar, dstBar };
+        /* dst needs NO entry barrier: the renderpass itself declares
+           the attachment in PRESENT_SRC (in and out), per the game
+           blit's actual handoff layout. */
+        const VkImageMemoryBarrier bars[1] = { srcBar };
         if (auto bar = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier");
                 bar)
             bar(cb.raw(),
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 0, nullptr, 0, nullptr, 2, bars);
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, bars);
         VkRenderPassBeginInfo rbi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .renderPass = this->coRenderpass,
@@ -726,27 +733,16 @@ namespace ls::hud {
             static_cast<float>(dstExtent.width);
         const float offY = static_cast<float>(o.y) /
             static_cast<float>(dstExtent.height);
-        float pcv[8] = { scX, scY, offX, offY, 0.f, 0.f, 0.f, 0.f };
+        /* pack = shader PC layout: (offX, offY, scX, scY) in ONE vec4 */
+        float pcv[4] = { offX, offY, scX, scY };
         if (auto ppc = devPfn<PFN_vkCmdPushConstants>(vk, "vkCmdPushConstants"); ppc)
-            ppc(cb.raw(), this->coLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pcv);
+            ppc(cb.raw(), this->coLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pcv);
         if (auto draw = devPfn<PFN_vkCmdDraw>(vk, "vkCmdDraw"); draw)
             draw(cb.raw(), 3, 1, 0, 0);
         if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
             erp(cb.raw());
-        /* hand dst straight back to PRESENT_SRC (= how the blit left it;
-           the caller's acquire/present logic already expects this). */
-        const VkImageMemoryBarrier outBar = makeImgBarrier(
-            dstImage,
-            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_ACCESS_MEMORY_READ_BIT,
-            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        if (auto bar = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier");
-                bar)
-            bar(cb.raw(),
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &outBar);
+        /* no exit barrier: the renderpass's finalLayout = PRESENT_SRC
+           already restored the exact handoff layout for the present. */
     }
 
 void ImGuiHud::setupThemeAndFont() {
@@ -763,7 +759,7 @@ void ImGuiHud::setupThemeAndFont() {
         const ImVec4 purpleH{ 0.61f, 0.19f, 1.00f, 1.00f };
         colors[ImGuiCol_Text]          = ImVec4(0.95f, 0.96f, 0.98f, 1.00f);
         colors[ImGuiCol_TextDisabled]  = ImVec4(0.50f, 0.55f, 0.60f, 1.00f);
-        colors[ImGuiCol_WindowBg]      = ImVec4(0.10f, 0.11f, 0.14f, 0.40f); // S40+ 40% cardr game
+        colors[ImGuiCol_WindowBg]      = ImVec4(0.10f, 0.11f, 0.14f, 0.40f); // S40+ 40% card body
         colors[ImGuiCol_ChildBg]       = ImVec4(0.16f, 0.17f, 0.21f, 0.90f);
         colors[ImGuiCol_Border]        = ImVec4(1.00f, 1.00f, 1.00f, 0.08f);
         colors[ImGuiCol_FrameBg]       = ImVec4(0.13f, 0.15f, 0.18f, 1.00f);
@@ -851,12 +847,8 @@ void ImGuiHud::setupThemeAndFont() {
         // ---- record RT renderpass + imgui vertices ------------------------
         this->cmdbuf.begin(this->vk);
         /* DIAG: when dumping, the clear proves the copy path with RED */
-        static const bool dumpRed = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
+        /* S40+ card-over: transparent-black clear (premult zeros). */
         VkClearValue clear{};
-        if (dumpRed) {
-            clear.color.float32[0] = 1.f;
-            clear.color.float32[3] = 1.f;
-        }
         VkRenderPassBeginInfo rbi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .renderPass = this->renderpass,
@@ -868,6 +860,10 @@ void ImGuiHud::setupThemeAndFont() {
         if (auto brp = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass"); brp)
             brp(this->cmdbuf.raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf.raw());
+        /* DIAG: after draw, CmdClearColorImage cyan to prove the
+           canvas accepts writes in THIS pass sequence (runs before
+           EndRenderPass = inside the pass = attachment write) */
+        (void)0;
         if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
             erp(this->cmdbuf.raw());
         /* S40+ PM pass: rt[active] holds straight-alpha imgui output; render
@@ -1019,8 +1015,6 @@ void ImGuiHud::setupThemeAndFont() {
         this->cmdbuf.end(this->vk);
         this->cmdbuf.submit(this->vk, {}, VK_NULL_HANDLE, 0,
             {}, VK_NULL_HANDLE, 0, fence.handle());
-        { static unsigned tN = 0; if (++tN <= 4)
-            std::fprintf(stderr, "imgui_hud: tick submit #%u\n", tN); }
         this->rtFenceSignaled[next] = true;
         this->rtGeneral[next] = true;
         this->rtLastAccess[next] = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
