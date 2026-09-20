@@ -9,6 +9,7 @@
 
 #include "lsfg-vk-app/imgui_hud.hpp"
 #include "imgui_hud_pm_spv.hpp"
+#include "imgui_hud_co_spv.hpp"
 #include <algorithm>
 #include <cfloat>
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -399,6 +400,355 @@ namespace ls::hud {
         this->pmBuilt = true;
     }
 
+    /* ============ S40+ card-over: the two-pass in-buffer blend ============ */
+    void ImGuiHud::syncTick() {
+        /* present side must not sample rt[active] until the tick's
+           cmdbuf is GPU-finished. NEVER block indefinitely here: an
+           unsignaled fence here means the FIRST present raced the first
+           tick (empty RT = harmless (0,0,0,0)-over). Bounded wait only,
+           and skip the fence-reset ownership: the tick owns its fence. */
+        const uint8_t s = this->active;
+        if (this->rtFenceSignaled[s])
+            return;
+        /* rare: present before first tick — wait up to 4 ms, else draw
+           with whatever the clock has (empty-black = no-op blend). */
+        const auto& f = *this->rtFence[s];
+        (void)f.wait(this->vk, 4'000'000ull);   /* 4 ms nanos */
+    }
+
+    void ImGuiHud::buildCardOver() {
+        /* linear-clamped sampler (RT -> dst is 1:1 at the anchor) */
+        VkSamplerCreateInfo sci{
+            .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = VK_FILTER_LINEAR,
+            .minFilter = VK_FILTER_LINEAR,
+            .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
+        PFN_vkCreateSampler cSamp = devPfn<PFN_vkCreateSampler>(vk, "vkCreateSampler");
+        if (!cSamp || cSamp(vk.dev(), &sci, nullptr, &this->coSampler) != VK_SUCCESS)
+            throw ls::error("imgui_hud: card-over sampler failed");
+        /* descriptor: set 0 binding 0 = sampled premult card (rt[slot]) */
+        VkDescriptorSetLayoutBinding b{};
+        b.binding = 0;
+        b.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        b.descriptorCount = 1;
+        b.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        VkDescriptorSetLayoutCreateInfo dsl{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1, .pBindings = &b };
+        PFN_vkCreateDescriptorSetLayout cDsl =
+            devPfn<PFN_vkCreateDescriptorSetLayout>(vk, "vkCreateDescriptorSetLayout");
+        VkDescriptorSetLayout layout{};
+        if (!cDsl || cDsl(vk.dev(), &dsl, nullptr, &layout) != VK_SUCCESS)
+            throw ls::error("imgui_hud: card-over descriptor layout failed");
+        VkPushConstantRange pc{};
+        pc.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+        pc.offset = 0;
+        pc.size = 32;   /* vec4 rtScale + vec4 rtOffset */
+        VkPipelineLayoutCreateInfo plci{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1, .pSetLayouts = &layout,
+            .pushConstantRangeCount = 1, .pPushConstantRanges = &pc };
+        PFN_vkCreatePipelineLayout cPl =
+            devPfn<PFN_vkCreatePipelineLayout>(vk, "vkCreatePipelineLayout");
+        if (!cPl || cPl(vk.dev(), &plci, nullptr, &this->coLayout) != VK_SUCCESS)
+            throw ls::error("imgui_hud: card-over pipeline layout failed");
+        this->coSetLayout = layout;
+        /* descriptors: one set per RT slot, chosen at record time */
+        VkDescriptorPoolSize poolSize{};
+        poolSize.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSize.descriptorCount = 2;
+        VkDescriptorPoolCreateInfo pool{
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &poolSize };
+        PFN_vkCreateDescriptorPool cDp =
+            devPfn<PFN_vkCreateDescriptorPool>(vk, "vkCreateDescriptorPool");
+        if (!cDp || cDp(vk.dev(), &pool, nullptr, &this->coPool) != VK_SUCCESS)
+            throw ls::error("imgui_hud: card-over descriptor pool failed");
+        PFN_vkAllocateDescriptorSets cAl =
+            devPfn<PFN_vkAllocateDescriptorSets>(vk, "vkAllocateDescriptorSets");
+        for (uint8_t i = 0; i < 2; ++i) {
+            VkDescriptorImageInfo di{
+                .sampler = this->coSampler,
+                .imageView = this->rt[i]->imageview(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet w{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = VK_NULL_HANDLE, .dstBinding = 0,
+                .descriptorCount = 1, .pImageInfo = &di };
+            VkDescriptorSetAllocateInfo ai{
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = this->coPool,
+                .descriptorSetCount = 1, .pSetLayouts = &this->coSetLayout };
+            VkDescriptorSet set{};
+            if (!cAl || cAl(vk.dev(), &ai, &set) != VK_SUCCESS)
+                throw ls::error("imgui_hud: card-over descriptor alloc failed");
+            w.dstSet = set;
+            PFN_vkUpdateDescriptorSets cUp =
+                devPfn<PFN_vkUpdateDescriptorSets>(vk, "vkUpdateDescriptorSets");
+            if (cUp) cUp(vk.dev(), 1, &w, 0, nullptr);
+            this->coSet2[i] = set;
+        }
+        /* shaders (branch-free: sample + alpha does everything) */
+        VkShaderModule vs{}, fs{};
+        PFN_vkCreateShaderModule cSm =
+            devPfn<PFN_vkCreateShaderModule>(vk, "vkCreateShaderModule");
+        VkShaderModuleCreateInfo sm{
+            .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        sm.codeSize = sizeof(coVert);
+        sm.pCode = coVert;
+        if (!cSm || cSm(vk.dev(), &sm, nullptr, &vs) != VK_SUCCESS)
+            throw ls::error("imgui_hud: card-over vert shader failed");
+        sm.codeSize = sizeof(coFrag);
+        sm.pCode = coFrag;
+        if (!cSm || cSm(vk.dev(), &sm, nullptr, &fs) != VK_SUCCESS) {
+            PFN_vkDestroyShaderModule dSm =
+                devPfn<PFN_vkDestroyShaderModule>(vk, "vkDestroyShaderModule");
+            if (dSm) dSm(vk.dev(), vs, nullptr);
+            throw ls::error("imgui_hud: card-over frag shader failed");
+        }
+        VkPipelineShaderStageCreateInfo st[2]{};
+        st[0] = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main" };
+        st[1] = { .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+            .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main" };
+        VkPipelineVertexInputStateCreateInfo vi{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
+        VkPipelineInputAssemblyStateCreateInfo ia{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST };
+        VkPipelineViewportStateCreateInfo vp{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            .viewportCount = 1, .scissorCount = 1 };
+        VkPipelineRasterizationStateCreateInfo rs{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            .polygonMode = VK_POLYGON_MODE_FILL,
+            .cullMode = VK_CULL_MODE_NONE,
+            .lineWidth = 1.0f };
+        VkPipelineMultisampleStateCreateInfo ms{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT };
+        VkPipelineDepthStencilStateCreateInfo ds{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO };
+        /* premult-over: rgb = src + dst*(1-src.a); alpha = 1 (OPAQUE out) */
+        VkPipelineColorBlendAttachmentState cba{};
+        cba.blendEnable = VK_TRUE;
+        cba.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        cba.colorBlendOp = VK_BLEND_OP_ADD;
+        cba.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+        cba.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+        cba.alphaBlendOp = VK_BLEND_OP_ADD;
+        cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                             VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo cb{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            .attachmentCount = 1, .pAttachments = &cba };
+        VkDynamicState dyn[2] = { VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR };
+        VkPipelineDynamicStateCreateInfo dy{
+            .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            .dynamicStateCount = 2, .pDynamicStates = dyn };
+        /* dedicated renderpass: LOAD (game frame resident), no clobber */
+        VkAttachmentDescription color{};
+        color.format = this->format;
+        color.samples = VK_SAMPLE_COUNT_1_BIT;
+        color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+        color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        VkAttachmentReference ref{ 0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL };
+        VkSubpassDescription sub{};
+        sub.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+        sub.colorAttachmentCount = 1;
+        sub.pColorAttachments = &ref;
+        VkSubpassDependency deps[2]{};
+        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        deps[0].dstSubpass = 0;
+        deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        deps[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                VK_ACCESS_SHADER_READ_BIT;
+        deps[1].srcSubpass = 0;
+        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        deps[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        VkRenderPassCreateInfo rci{
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            .attachmentCount = 1, .pAttachments = &color,
+            .subpassCount = 1, .pSubpasses = &sub,
+            .dependencyCount = 2, .pDependencies = deps };
+        PFN_vkCreateRenderPass cRp =
+            devPfn<PFN_vkCreateRenderPass>(vk, "vkCreateRenderPass");
+        if (!cRp || cRp(vk.dev(), &rci, nullptr, &this->coRenderpass) != VK_SUCCESS)
+            throw ls::error("imgui_hud: card-over renderpass failed");
+        VkGraphicsPipelineCreateInfo gpi{
+            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            .stageCount = 2, .pStages = st,
+            .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+            .pViewportState = &vp, .pRasterizationState = &rs,
+            .pMultisampleState = &ms, .pDepthStencilState = &ds,
+            .pColorBlendState = &cb, .pDynamicState = &dy,
+            .layout = this->coLayout,
+            .renderPass = this->coRenderpass, .subpass = 0 };
+        PFN_vkCreateGraphicsPipelines cGp =
+            devPfn<PFN_vkCreateGraphicsPipelines>(vk, "vkCreateGraphicsPipelines");
+        VkPipeline pipe{};
+        VkResult res = cGp ? cGp(vk.dev(), VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe)
+                           : VK_ERROR_INITIALIZATION_FAILED;
+        PFN_vkDestroyShaderModule dSm =
+            devPfn<PFN_vkDestroyShaderModule>(vk, "vkDestroyShaderModule");
+        if (dSm) { dSm(vk.dev(), vs, nullptr); dSm(vk.dev(), fs, nullptr); }
+        if (res != VK_SUCCESS)
+            throw ls::error("imgui_hud: card-over graphics pipeline failed");
+        this->coPipeline = pipe;
+        this->coBuilt = true;
+        std::fprintf(stderr, "imgui_hud: card-over built (2-pass in-buffer)\n");
+    }
+
+    void ImGuiHud::renderCardOver(vk::CommandBuffer& cb, VkImage dstImage,
+            VkExtent2D dstExtent) {
+        static unsigned coDbgN = 0;
+        const bool dbg = coDbgN++ < 6;
+        if (dbg)
+            std::fprintf(stderr, "imgui_hud: renderCardOver enter #%u\n", coDbgN);
+        if (!this->coBuilt || !this->coPipeline)
+            return;   /* silently skip until built */
+        if (!ls::hud::ImGuiHud::drawing())
+            return;
+        this->syncTick();
+        if (dbg)
+            std::fprintf(stderr, "imgui_hud: renderCardOver post-syncTick\n");
+        /* framebuffer cache per dst image (swapchain image handoff) */
+        auto it = std::find_if(this->coFbs.begin(), this->coFbs.end(),
+            [&](const CoFb& o){ return o.image == dstImage; });
+        if (it == this->coFbs.end()) {
+            VkImageViewCreateInfo vci{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = dstImage,
+                .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                .format = this->format,
+                .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+            VkImageView view{ VK_NULL_HANDLE };
+            PFN_vkCreateImageView cIv =
+                devPfn<PFN_vkCreateImageView>(vk, "vkCreateImageView");
+            if (!cIv || cIv(vk.dev(), &vci, nullptr, &view) != VK_SUCCESS)
+                return;
+            VkFramebufferCreateInfo fci{
+                .sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO,
+                .renderPass = this->coRenderpass,
+                .attachmentCount = 1, .pAttachments = &view,
+                .width = dstExtent.width, .height = dstExtent.height,
+                .layers = 1 };
+            VkFramebuffer fb{ VK_NULL_HANDLE };
+            PFN_vkCreateFramebuffer cFb =
+                devPfn<PFN_vkCreateFramebuffer>(vk, "vkCreateFramebuffer");
+            VkResult fr = VK_ERROR_INITIALIZATION_FAILED;
+            if (cFb) fr = cFb(vk.dev(), &fci, nullptr, &fb);
+            if (fr != VK_SUCCESS) {
+                PFN_vkDestroyImageView dIv =
+                    devPfn<PFN_vkDestroyImageView>(vk, "vkDestroyImageView");
+                if (dIv) dIv(vk.dev(), view, nullptr);
+                return;
+            }
+            if (this->coFbs.size() >= 8) {   /* swapchain keeps a handful */
+                PFN_vkDestroyFramebuffer dFb =
+                    devPfn<PFN_vkDestroyFramebuffer>(vk, "vkDestroyFramebuffer");
+                PFN_vkDestroyImageView dIv =
+                    devPfn<PFN_vkDestroyImageView>(vk, "vkDestroyImageView");
+                if (dFb) dFb(vk.dev(), this->coFbs.front().fb, nullptr);
+                if (dIv) dIv(vk.dev(), this->coFbs.front().view, nullptr);
+                this->coFbs.erase(this->coFbs.begin());
+            }
+            this->coFbs.push_back(CoFb{ dstImage, view, fb });
+            it = std::prev(this->coFbs.end());
+        }
+        /* barriers: rt[active] stays SHADER_READ; dst: the game blit's
+           post-barrier already handed the image to PRESENT_SRC (then NOT
+           to TRANSFER_DST) — take it from PRESENT_SRC into the render. */
+        const VkImageMemoryBarrier srcBar = makeImgBarrier(
+            this->rt[this->active]->handle(),
+            this->rtLastAccess[this->active],
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            VK_ACCESS_SHADER_READ_BIT,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        const VkImageMemoryBarrier dstBar = makeImgBarrier(
+            dstImage,
+            VK_ACCESS_MEMORY_READ_BIT,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+        const VkImageMemoryBarrier bars[2] = { srcBar, dstBar };
+        if (auto bar = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier");
+                bar)
+            bar(cb.raw(),
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0, 0, nullptr, 0, nullptr, 2, bars);
+        VkRenderPassBeginInfo rbi{
+            .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+            .renderPass = this->coRenderpass,
+            .framebuffer = it->fb,
+            .renderArea = { { 0, 0 }, { dstExtent.width, dstExtent.height } } };
+        if (auto brp = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass");
+                brp)
+            brp(cb.raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        if (auto bp = devPfn<PFN_vkCmdBindPipeline>(vk, "vkCmdBindPipeline"); bp)
+            bp(cb.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS, this->coPipeline);
+        VkViewport vp{ 0.f, 0.f,
+            static_cast<float>(dstExtent.width),
+            static_cast<float>(dstExtent.height), 0.f, 1.f };
+        VkRect2D sc{ { 0, 0 }, { dstExtent.width, dstExtent.height } };
+        if (auto sv = devPfn<PFN_vkCmdSetViewport>(vk, "vkCmdSetViewport"); sv)
+            sv(cb.raw(), 0, 1, &vp);
+        if (auto ss = devPfn<PFN_vkCmdSetScissor>(vk, "vkCmdSetScissor"); ss)
+            ss(cb.raw(), 0, 1, &sc);
+        /* descriptor = set for the ACTIVE slot (premult card image) */
+        VkDescriptorSet set = this->coSet2[this->active];
+        if (auto bds = devPfn<PFN_vkCmdBindDescriptorSets>(vk, "vkCmdBindDescriptorSets");
+                bds)
+            bds(cb.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                this->coLayout, 0, 1, &set, 0, nullptr);
+        /* push constants: RT pos/size in dst-normalized coords */
+        const auto o = this->origin();
+        const float scX = static_cast<float>(this->rtSize.width) /
+            static_cast<float>(dstExtent.width);
+        const float scY = static_cast<float>(this->rtSize.height) /
+            static_cast<float>(dstExtent.height);
+        const float offX = static_cast<float>(o.x) /
+            static_cast<float>(dstExtent.width);
+        const float offY = static_cast<float>(o.y) /
+            static_cast<float>(dstExtent.height);
+        float pcv[8] = { scX, scY, offX, offY, 0.f, 0.f, 0.f, 0.f };
+        if (auto ppc = devPfn<PFN_vkCmdPushConstants>(vk, "vkCmdPushConstants"); ppc)
+            ppc(cb.raw(), this->coLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 32, pcv);
+        if (auto draw = devPfn<PFN_vkCmdDraw>(vk, "vkCmdDraw"); draw)
+            draw(cb.raw(), 3, 1, 0, 0);
+        if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
+            erp(cb.raw());
+        /* hand dst straight back to PRESENT_SRC (= how the blit left it;
+           the caller's acquire/present logic already expects this). */
+        const VkImageMemoryBarrier outBar = makeImgBarrier(
+            dstImage,
+            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            VK_ACCESS_MEMORY_READ_BIT,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        if (auto bar = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier");
+                bar)
+            bar(cb.raw(),
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &outBar);
+    }
+
 void ImGuiHud::setupThemeAndFont() {
         ImGuiStyle& style = ImGui::GetStyle();
         ImVec4* colors = style.Colors;
@@ -669,6 +1019,8 @@ void ImGuiHud::setupThemeAndFont() {
         this->cmdbuf.end(this->vk);
         this->cmdbuf.submit(this->vk, {}, VK_NULL_HANDLE, 0,
             {}, VK_NULL_HANDLE, 0, fence.handle());
+        { static unsigned tN = 0; if (++tN <= 4)
+            std::fprintf(stderr, "imgui_hud: tick submit #%u\n", tN); }
         this->rtFenceSignaled[next] = true;
         this->rtGeneral[next] = true;
         this->rtLastAccess[next] = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;

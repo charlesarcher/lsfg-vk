@@ -996,7 +996,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // TRANSFER_DST_OPTIMAL with in-flight write access, and is left in that same
     // layout so the caller's post barrier transitions it to PRESENT_SRC.
     auto drawHud = [&](vk::CommandBuffer& cb, VkImage dstImage) {
-        // S40+ imgui first (top-most card); cheap no-op when hidden.
+        // S40+: gas-gauge — in-buffer card-over parked (RADV refuses
+        // the premult-over render-pass blend on this swapchain: opaque
+        // constant-color test draws never reach the visible image).
+        // Fall back to the PROVEN surface-alpha sub-rect blit.
         if (g_imguiHud && ls::hud::ImGuiHud::drawing()) {
             const VkImage srcImg = g_imguiHud->rtImage();
             const VkExtent2D b = g_imguiHud->rtExtent();
@@ -1506,6 +1509,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                     g_imguiHud = new ls::hud::ImGuiHud{ vk,
                                         extent, static_cast<VkFormat>(
                                             g_overlay.imageFormat) };
+                                    g_imguiHud->buildCardOver();
                                     installImguiToggle();
                                 } catch (const std::exception& e) {
                                     g_imguiInitDone.store(false);

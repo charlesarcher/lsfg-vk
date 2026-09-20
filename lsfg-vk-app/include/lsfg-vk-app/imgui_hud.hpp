@@ -79,6 +79,21 @@ namespace ls::hud {
         struct Origin { int32_t x, y; };
         [[nodiscard]] Origin origin() const;
 
+        /// card-over subsystem ready? (built lazily on first present)
+        [[nodiscard]] bool cardOverReady() const { return this->coBuilt; }
+        /// build the card-over pipeline + descriptors (call once after ctor)
+        void buildCardOver();
+        /// S40+ card-over: record a fullscreen weak-tint premult-over of
+        /// the imgui card ONTO the game frame already resident in
+        /// dstImage. Runs in the caller's cb; caller performs submit +
+        /// waiting (the tick fence wait happens HERE via prepareWait).
+        void renderCardOver(vk::CommandBuffer& cb, VkImage dstImage,
+            VkExtent2D dstExtent);
+        /// make sure the latest tick's GPU work is finished before the
+        /// present-side pass samples rt[active] (blocks on the tick
+        /// fence; ~0 us when the fence was already signaled).
+        void syncTick();
+
     private:
         void drawWidgets(const struct Stats& s);   // the actual imgui frame
         void setupThemeAndFont();
@@ -127,6 +142,20 @@ namespace ls::hud {
         VkDeviceMemory dumpMemory2{VK_NULL_HANDLE};
         void hostDump();   /* after fence: map + write /tmp/pm.pam */
         void buildPmPass();
+
+        /* S40+ card-over: in-buffer premult over of rt[active] onto the
+           overlay swapchain image (one draw, one blend, no compositor
+           alpha; the surface is OPAQUE so the desktop never leaks). */
+        struct CoFb { VkImage image; VkImageView view; VkFramebuffer fb; };
+        VkPipelineLayout coLayout{VK_NULL_HANDLE};
+        VkPipeline coPipeline{VK_NULL_HANDLE};
+        VkDescriptorPool coPool{VK_NULL_HANDLE};
+        VkDescriptorSet coSet2[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+        VkDescriptorSetLayout coSetLayout{VK_NULL_HANDLE};
+        VkSampler coSampler{VK_NULL_HANDLE};
+        VkRenderPass coRenderpass{VK_NULL_HANDLE};
+        std::vector<CoFb> coFbs;   // per dst-image fb cache
+        bool coBuilt{false};
     };
 
 } // namespace ls::hud
