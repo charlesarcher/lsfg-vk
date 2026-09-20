@@ -859,7 +859,8 @@ void ImGuiHud::setupThemeAndFont() {
         rbi.pClearValues = &clear;
         if (auto brp = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass"); brp)
             brp(this->cmdbuf.raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf.raw());
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf.raw(),
+            this->coDiPipeline);   /* DIAG: my pipeline for the imgui draws */
         /* DIAG: after draw, CmdClearColorImage cyan to prove the
            canvas accepts writes in THIS pass sequence (runs before
            EndRenderPass = inside the pass = attachment write) */
