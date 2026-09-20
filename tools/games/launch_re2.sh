@@ -24,11 +24,21 @@ export LSFGVK_APP_SOCK="${LSFGVK_APP_SOCK:-$HOME/.local/state/lsfg-vk/app.sock}"
 APP_BIN="$REPO_ROOT/build/lsfg-vk-app/lsfg-vk-app"
 APP_PID=""
 
-if ! pgrep -x lsfg-vk-app >/dev/null; then
+# S42i: the pgrep gate must ignore zombies — a dead-but-unreaped
+# instance satisfies pgrep-plain and silently SKIPS the app start
+# (RE2 2026-09-20: stale zombie → no sock → game's layer can't
+# connect → native-speed + dead overlay). A LIVE check = stat=, not
+# zombie, AND an actual socket file after start.
+LIVE_APP=""
+for p in $(pgrep -x lsfg-vk-app 2>/dev/null); do
+    st=$(ps -o stat= -p "$p" 2>/dev/null | head -c2)
+    [[ "$st" != Z* ]] && LIVE_APP="$p" && break
+done
+if [[ -z "$LIVE_APP" ]]; then
     mkdir -p "$(dirname "$LSFGVK_APP_SOCK")"
     rm -f "$LSFGVK_APP_SOCK"
     env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH -u LSFGVK_LAYER_DBG \
-        LSFGVK_APP_DBG=1 \
+        LSFGVK_APP_DBG="${LSFGVK_APP_DBG:-0}" \
         LSFGVK_LAYER_SHELL=1 \
         LSFGVK_CONFIG="$LSFGVK_CONFIG" \
         LSFGVK_APP_SOCK="$LSFGVK_APP_SOCK" \
