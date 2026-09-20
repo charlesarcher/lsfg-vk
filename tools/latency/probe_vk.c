@@ -375,7 +375,24 @@ int main(int argc, char** argv) {
      * wall-clock ~4 ms at 240 Hz) and buffer cycling continues even when the
      * window is partly occluded. IMMEDIATE froze inside vkQueuePresentKHR
      * when the compositor stopped consuming the surface (occluded). */
-    swci.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    /* S40 strict A/B: MAILBOX when supported — the FIFO ETIME spin traced
+       in decay runs lives in Mesa's WSI FIFO pacing; MAILBOX removes the
+       pending-queue pacing without changing the click semantics. */
+    {
+        PFN_vkGetPhysicalDeviceSurfacePresentModesKHR gpm =
+            (PFN_vkGetPhysicalDeviceSurfacePresentModesKHR)
+                vkGetInstanceProcAddr(inst, "vkGetPhysicalDeviceSurfacePresentModesKHR");
+        uint32_t nmodes = 0;
+        if (gpm) gpm(chosen, vsurf, &nmodes, nullptr);
+        VkPresentModeKHR modes[8];
+        int mailbox = 0;
+        if (gpm && nmodes && nmodes <= 8) {
+            gpm(chosen, vsurf, &nmodes, modes);
+            for (uint32_t m = 0; m < nmodes; ++m) if (modes[m] == VK_PRESENT_MODE_MAILBOX_KHR) mailbox = 1;
+        }
+        swci.presentMode = (mailbox && getenv("LSFGVK_PROBE_FIFO") == nullptr)
+            ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    }
     VkSwapchainKHR swap;
     if (vkCreateSwapchainKHR(dev, &swci, nullptr, &swap) != VK_SUCCESS) { fprintf(stderr, "CreateSwapchain failed\n"); return 10; }
     uint32_t nimg = 0; vkGetSwapchainImagesKHR(dev, swap, &nimg, nullptr);
