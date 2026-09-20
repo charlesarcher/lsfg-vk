@@ -1008,23 +1008,20 @@ void ImGuiHud::setupThemeAndFont() {
     void ImGuiHud::tick(float dt) {
         this->ensureFade(dt);
         if (this->fadeLock <= 0.02f) return;          // zero-cost hidden path
-        /* S42f anti-coupling: the RT card pass shares the graphics queue
-           with GEN/REAL present submits (single graphics family on
-           RDNA4); a 20 Hz billboard rebuild = queue-time stolen from
-           the present loop = the frame-rate/input-latency hit Charles
-           measured in RE2. Rebuild ONLY when the displayed content
-           changes = the values move (fps/ms/spark shift). */
+        /* S42f-v2: cadence-only gate (no content hash — the hash-gate
+           variant starved ALL paints in the field: RE2 15:11 grab +
+           present-dump X6/X7 = solid-black card over live stream,
+           reproduced; the RT dump (X8 imgui_pm) = empty despite imgui
+           reporting vtx — the gate's early-returns interact with the
+           ping-pong fence discipline the tick relies on. A plain
+           4 Hz floor keeps queue-time at the S42c levels (4 submits/s)
+           while guaranteeing the paint path actually executes. */
         {
-            static uint64_t lastContent = 0;
-            const Stats& s = latest();
-            uint64_t h = 1469598103934665603ull;
-            for (float v : { s.gameFps, s.presentedFps, s.ipcMs,
-                             s.genMs, s.scanMs, s.genExtraMs })
-                h = (h ^ static_cast<uint64_t>(static_cast<int32_t>(v * 8))) * 1099511628211ull;
-            h ^= static_cast<uint64_t>(std::lround(s.genExtraLive * 2));
-            if (h == lastContent)
-                return;    /* unchanged → frozen queue-time */
-            lastContent = h;
+            static float sincePaint = 0.0f;
+            sincePaint += dt;
+            if (sincePaint < 0.24f)
+                return;
+            sincePaint = 0.0f;
         }
         // pick inactive slot + fence discipline (S40: submit WITH fence, wait
         // BLOCKING on the fence of the slot we are about to overwrite)

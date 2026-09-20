@@ -18,7 +18,9 @@ fi
 
 export LSFGVK_CONFIG="${LSFGVK_CONFIG:-$HOME/.config/lsfg-vk/conf.toml}"
 export LSFGVK_APP_SOCK="${LSFGVK_APP_SOCK:-$HOME/.local/state/lsfg-vk/app.sock}"
-export LSFGVK_APP_DBG="${LSFGVK_APP_DBG:-1}"
+# S42f-v2: debug spam defaulted OFF (the dbg() fprintf-per-present
+# cost real frame time; opt in explicitly for a diagnostics run).
+export LSFGVK_APP_DBG="${LSFGVK_APP_DBG:-0}"
 # Layer-shell OVERLAY keeps the doubler window above the game toplevel on KWin.
 # Default xdg_toplevel makes two fullscreen windows fight over focus/stacking
 # (click-through raises the game's black window over the doubler picture).
