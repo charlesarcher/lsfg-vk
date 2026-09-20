@@ -1159,8 +1159,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         uint64_t presentIdx{ 0 };      // rolling index into the signal pool
 
         Clock::time_point statsLastTime = Clock::now();
-        const auto statsInterval = std::chrono::seconds(1);
-        // 1 Hz HUD/stats update from the output thread.
+        /* S42c: 4 Hz stats (was 1 s; the 1 Hz cadence ALSO paced the
+           card tick = the RE2 play-test choppy-card complaint). */
+        const auto statsInterval = std::chrono::milliseconds(250);
         auto maybeStats = [&](Clock::time_point now) {
             if (now - statsLastTime < statsInterval)
                 return;
@@ -1251,35 +1252,34 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     std::cerr << "lsfg-vk-app: hud update failed: " << e.what() << "\n";
                 }
             }
-            /* S40+ imgui overlay tick: publish the freshest numbers first —
-               the widget content changes every state change while the render
-               stays 15 Hz (frame pacing inside imgui_hud's own dt). */
-            if (g_imguiHud) {
-                ls::hud::ImGuiHud::Stats st{};
-                st.gameFps = static_cast<float>(gameFps);
-                st.presentedFps = static_cast<float>(presentedFps);
-                st.ipcMs = lsfgvk::gui::g_guiState.latencyIpcMs.load();
-                st.genMs = lsfgvk::gui::g_guiState.latencyGenSolveMs.load();
-                st.scanMs = lsfgvk::gui::g_guiState.latencyScanMs.load();
-                st.genExtraMs = lsfgvk::gui::g_guiState.latencyGenExtraMs.load();
-                st.genExtraLive = st.genExtraMs != 0.0f;
-                // click->photon rows are probe-session live values from the
-                // dual-shm ledger (imgui_hud reads them directly); publish
-                // the frame times ring from REAL/GEN present MEASURED rows.
-                ls::hud::ImGuiHud::publish(st);
-                try {
-                    if (g_imguiToggleReq != 0) {
-                        g_imguiToggleReq = 0;
-                        ls::hud::ImGuiHud::toggle();
-                    }
-                    if (g_imguiHud)
-                        g_imguiHud->tick(static_cast<float>(dt));
-                } catch (const std::exception& e) {
-                    std::cerr << "lsfg-vk-app: imgui hud tick failed: "
-                              << e.what() << "\n";
+            try {
+                if (g_imguiToggleReq != 0) {
+                    g_imguiToggleReq = 0;
+                    ls::hud::ImGuiHud::toggle();
                 }
+            } catch (const std::exception& e) {
+                std::cerr << "lsfg-vk-app: imgui toggle failed: " << e.what() << "\n";
             }
             statsLastTime = now;
+        };
+        /* S42c: the overlay CARD repaint must run at present cadence, not
+           the 1 Hz stats cadence (user-visible 1 Hz choppy card found in
+           RE2 play-test). tick() self-paces via its own dt; the pub()
+           numbers still refresh from maybeStats at 1 Hz. */
+        auto maybeHud = [&](Clock::time_point now) {
+            static Clock::time_point hudLast = now;
+            const double hdt = std::chrono::duration<double>(now - hudLast).count();
+            if (hdt < 0.05) return;          /* ≥20 Hz repaint ceiling */
+            hudLast = now;
+            if (!g_imguiHud || !g_imguiInitDone.load()) return;
+            ls::hud::ImGuiHud::Stats st = ls::hud::ImGuiHud::latest();
+            try {
+                ls::hud::ImGuiHud::publish(st);
+                if (g_imguiHud)
+                    g_imguiHud->tick(static_cast<float>(hdt));
+            } catch (const std::exception& e) {
+                std::cerr << "lsfg-vk-app: imgui hud tick failed: " << e.what() << "\n";
+            }
         };
 
         // present one swapchain image that blits the private snapshot of the
@@ -1732,6 +1732,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
 
                 maybeStats(Clock::now());
+                maybeHud(Clock::now());
 
                 // stop on a window resize/close (processEvents returns true).
                 // Close ends the loop. Resize/configure must NOT — xdg_toplevel
