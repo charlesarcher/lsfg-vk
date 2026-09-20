@@ -311,17 +311,6 @@ namespace ls::hud {
             ImGui::Text("%u  (2x)", static_cast<unsigned>(std::lround(s.presentedFps)));
         else
             ImGui::Text("%u", static_cast<unsigned>(std::lround(s.presentedFps)));
-        // frametime sparkline, fixed y-range (0..25 ms) — the shape can't lie
-        if (s.frameTimesCount > 2) {
-            ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f),
-                "frametime (ms)");
-            ImGui::PlotLines("##ft", s.frameTimesMs,
-                static_cast<int>(s.frameTimesCount),
-                static_cast<int>(s.frameTimesIdx % 180),
-                nullptr, 0.f, 25.f,
-                ImVec2(ImGui::GetContentRegionAvail().x, 15.f));
-        }
         // click->photon percentiles from the live ring (dash while empty)
         ImGui::Spacing();
         if (s.latencySamplesCount >= 8) {
@@ -350,6 +339,18 @@ namespace ls::hud {
                 static_cast<double>(s.ipcMs), static_cast<double>(s.genMs),
                 static_cast<double>(s.scanMs));
         ImGui::TextDisabled("%s", pipe);
+        // frametime sparkline LAST, clamped to the widest TEXT row so the
+        // card width is set by the words, never by the graph:
+        if (s.frameTimesCount > 2) {
+            const float w = ImGui::CalcTextSize(
+                "doubled fps 478 (2x)").x;  // row-realistic max
+            ImGui::Spacing();
+            ImGui::PlotLines("##ft", s.frameTimesMs,
+                static_cast<int>(s.frameTimesCount),
+                static_cast<int>(s.frameTimesIdx % 180),
+                nullptr, 0.f, 25.f,
+                ImVec2(std::min(w, ImGui::GetContentRegionAvail().x), 15.f));
+        }
         ImGui::End();
         ImGui::PopStyleColor();
         ImGui::PopStyleVar(3);
