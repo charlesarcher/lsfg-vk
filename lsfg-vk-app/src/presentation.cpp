@@ -263,6 +263,7 @@ void dbg(const char* fmt, ...) {
     /// success the fd is consumed by the implementation, on failure it is closed
     /// before throwing (exact body of the layer's swapchain.cpp:57-73 importSyncFd).
     void importSyncFd(const vk::Vulkan& vk, VkSemaphore semaphore, int fd) {
+        static unsigned importFailures = 0;
         const VkImportSemaphoreFdInfoKHR importInfo{
             .sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR,
             .semaphore = semaphore,
@@ -272,6 +273,20 @@ void dbg(const char* fmt, ...) {
         };
         const auto res = vk.df().ImportSemaphoreFdKHR(vk.dev(), &importInfo);
         if (res != VK_SUCCESS) {
+            /* S42g diagnostics: fd identity + per-fd rc; count instead
+               of spamming (RE2 2026-09-20: the repeated -13 = handshake
+               starvation; with the S42e cap the retry pump stops). */
+            const unsigned n = importFailures++;
+            if (n < 16 || (n % 256) == 0) {
+                struct stat st{};
+                char node[96] = "(stat failed)";
+                if (::fstat(fd, &st) == 0)
+                    std::snprintf(node, sizeof(node), "dev%lu inode%lu",
+                        (unsigned long)st.st_dev, (unsigned long)st.st_ino);
+                std::cerr << "lsfg-vk-app: importSyncFd failed rc=" << (int)res
+                          << " fd=" << fd << " " << node
+                          << " (n=" << n << ")\n";
+            }
             close(fd);
             throw ls::vulkan_error(res, "vkImportSemaphoreFdKHR() failed");
         }

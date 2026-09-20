@@ -1008,6 +1008,24 @@ void ImGuiHud::setupThemeAndFont() {
     void ImGuiHud::tick(float dt) {
         this->ensureFade(dt);
         if (this->fadeLock <= 0.02f) return;          // zero-cost hidden path
+        /* S42f anti-coupling: the RT card pass shares the graphics queue
+           with GEN/REAL present submits (single graphics family on
+           RDNA4); a 20 Hz billboard rebuild = queue-time stolen from
+           the present loop = the frame-rate/input-latency hit Charles
+           measured in RE2. Rebuild ONLY when the displayed content
+           changes = the values move (fps/ms/spark shift). */
+        {
+            static uint64_t lastContent = 0;
+            const Stats& s = latest();
+            uint64_t h = 1469598103934665603ull;
+            for (float v : { s.gameFps, s.presentedFps, s.ipcMs,
+                             s.genMs, s.scanMs, s.genExtraMs })
+                h = (h ^ static_cast<uint64_t>(static_cast<int32_t>(v * 8))) * 1099511628211ull;
+            h ^= static_cast<uint64_t>(std::lround(s.genExtraLive * 2));
+            if (h == lastContent)
+                return;    /* unchanged → frozen queue-time */
+            lastContent = h;
+        }
         // pick inactive slot + fence discipline (S40: submit WITH fence, wait
         // BLOCKING on the fence of the slot we are about to overwrite)
         const uint8_t next = static_cast<uint8_t>(this->active ^ 1);
