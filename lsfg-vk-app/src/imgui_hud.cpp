@@ -626,10 +626,10 @@ namespace ls::hud {
     void ImGuiHud::renderCardOver(vk::CommandBuffer& cb, VkImage dstImage,
             VkExtent2D dstExtent) {
         static std::atomic<unsigned> rcoN{0};
-        const bool dbg = rcoN.fetch_add(1) < 4;
+        const unsigned n = rcoN.fetch_add(1);
+        const bool dbg = (n % 256) == 0;
         if (dbg)
-            std::fprintf(stderr, "imgui_hud: rco enter #%u\n",
-                rcoN.load());
+            std::fprintf(stderr, "imgui_hud: rco enter #%u\n", n);
         if (!this->coBuilt || !this->coPipeline)
             return;   /* silently skip until built */
         if (!ls::hud::ImGuiHud::drawing())
@@ -718,7 +718,8 @@ namespace ls::hud {
         if (auto ss = devPfn<PFN_vkCmdSetScissor>(vk, "vkCmdSetScissor"); ss)
             ss(cb.raw(), 0, 1, &sc);
         /* descriptor = set for the ACTIVE slot (premult card image) */
-        VkDescriptorSet set = this->coSet2[this->active];
+        static const bool d5Other = ::getenv("LSFGVK_CO_OTHER") != nullptr;
+        VkDescriptorSet set = this->coSet2[d5Other ? (this->active ^ 1) : this->active];
         if (auto bds = devPfn<PFN_vkCmdBindDescriptorSets>(vk, "vkCmdBindDescriptorSets");
                 bds)
             bds(cb.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -738,7 +739,7 @@ namespace ls::hud {
         if (auto ppc = devPfn<PFN_vkCmdPushConstants>(vk, "vkCmdPushConstants"); ppc)
             ppc(cb.raw(), this->coLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pcv);
         if (auto draw = devPfn<PFN_vkCmdDraw>(vk, "vkCmdDraw"); draw)
-            draw(cb.raw(), 3, 1, 0, 0);
+            draw(cb.raw(), 6, 1, 0, 0);   /* co10: two-tri fullscreen */
         if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
             erp(cb.raw());
         /* no exit barrier: the renderpass's finalLayout = PRESENT_SRC
@@ -859,8 +860,7 @@ void ImGuiHud::setupThemeAndFont() {
         rbi.pClearValues = &clear;
         if (auto brp = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass"); brp)
             brp(this->cmdbuf.raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf.raw(),
-            this->coDiPipeline);   /* DIAG: my pipeline for the imgui draws */
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf.raw());
         /* DIAG: after draw, CmdClearColorImage cyan to prove the
            canvas accepts writes in THIS pass sequence (runs before
            EndRenderPass = inside the pass = attachment write) */
@@ -918,7 +918,8 @@ void ImGuiHud::setupThemeAndFont() {
         }
         /* S40+ DIAG dump: LSFGVK_IMGUI_DUMP=1 writes the PM image once. */
         static const bool dumpPm = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
-        if (dumpPm && !this->dumpedPmImage) {
+        static unsigned dumpTickN = 0;
+        if (dumpPm && (dumpTickN++ % 4) == 0) {
             VkBufferCreateInfo bci{
                 .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
                 .size = static_cast<VkDeviceSize>(this->rtSize.width)
@@ -1003,11 +1004,10 @@ void ImGuiHud::setupThemeAndFont() {
             if (auto pfn = devPfn<PFN_vkBindBufferMemory>(vk, "vkBindBufferMemory"); pfn)
                 pfn(vk.dev(), buf2, mem2, 0);
             if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
-                pfn(this->cmdbuf.raw(), this->rt[next]->handle(),
+                pfn(this->cmdbuf.raw(), this->rt[this->active]->handle(),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf2, 1, &reg2);
             this->dumpBuffer2 = buf2;
             this->dumpMemory2 = mem2;
-            this->dumpedPmImage = true;
             // read after the fence below:
             this->dumpBuffer = buf;
             this->dumpMemory = mem;

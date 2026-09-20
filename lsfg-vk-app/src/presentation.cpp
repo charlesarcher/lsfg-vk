@@ -995,12 +995,23 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // layout so the caller's post barrier transitions it to PRESENT_SRC.
     auto drawHud = [&](vk::CommandBuffer& cb, VkImage dstImage) {
         // S40+ card-over: blend the premult card into the game frame.
-        if (g_imguiHud) {
-            static bool logged = false;
+        // coBlit chooses: co pass (new) vs proven blit (a3501c3) — env-co
+        // behaves like: LSFGVK_CO_DISABLE=1 → blit.
+        static const bool coDisable = [] {
+            const char* e = std::getenv("LSFGVK_CO_DISABLE");
+            return e && e[0] == '1' && !e[1];
+        }();
+        static bool logged = false;
+        if (g_imguiHud && !coDisable) {
             if (!logged) { logged = true;
                 std::cerr << "lsfg-vk-app: card-over branch active\n"; }
             g_imguiHud->renderCardOver(cb, dstImage, imgExtent);
             return;
+        }
+        if (g_imguiHud && coDisable) {
+            static bool logged2 = false;
+            if (!logged2) { logged2 = true;
+                std::cerr << "lsfg-vk-app: blit fallback active\n"; }
         }
         if (g_imguiHud && ls::hud::ImGuiHud::drawing()) {
             const VkImage srcImg = g_imguiHud->rtImage();
@@ -1412,7 +1423,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 void* p = nullptr;
                 if (::posix_memalign(&p, 4096, nb) == 0) {
                     try {
-                        vk::Image dumpImg(vk, extent, VK_FORMAT_R8G8B8A8_UNORM,
+                        vk::Image dumpImg(vk, extent, VK_FORMAT_B8G8R8A8_UNORM,
                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                             p, nb);
                         vk::CommandBuffer dcb(vk);
@@ -1444,9 +1455,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             const size_t npx = static_cast<size_t>(extent.width) * extent.height;
                             std::vector<uint8_t> rgb(npx * 3);
                             for (size_t i = 0; i < npx; ++i) {
-                                rgb[i * 3 + 0] = px[i * 4 + 0];
-                                rgb[i * 3 + 1] = px[i * 4 + 1];
-                                rgb[i * 3 + 2] = px[i * 4 + 2];
+                                rgb[i * 3 + 0] = px[i * 4 + 2];   /* R */
+                                rgb[i * 3 + 1] = px[i * 4 + 1];   /* G */
+                                rgb[i * 3 + 2] = px[i * 4 + 0];   /* B */
                             }
                             std::fwrite(rgb.data(), 1, rgb.size(), out);
                             std::fclose(out);
