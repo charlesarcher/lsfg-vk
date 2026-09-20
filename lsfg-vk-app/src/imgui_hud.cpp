@@ -8,6 +8,7 @@
  * on an unrefreshed slot parks forever. */
 
 #include "lsfg-vk-app/imgui_hud.hpp"
+#include <algorithm>
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
@@ -43,9 +44,33 @@ namespace ls::hud {
         }
     }
 
-    void ImGuiHud::publish(const Stats& s) {
+    void ImGuiHud::pushLatencyMs(float ms) {
         std::lock_guard<std::mutex> lk(g_statsMtx);
-        g_stats = s;
+        const uint32_t idx = g_stats.latencySamplesIdx % 256;
+        g_stats.latencySamples[idx] = ms;
+        g_stats.latencySamplesIdx++;
+        g_stats.latencySamplesCount = std::min<uint32_t>(256, g_stats.latencySamplesCount + 1);
+    }
+    void ImGuiHud::pushFrameMs(float ms) {
+        std::lock_guard<std::mutex> lk(g_statsMtx);
+        const uint32_t idx = g_stats.frameTimesIdx % 180;
+        g_stats.frameTimesMs[idx] = ms;
+        g_stats.frameTimesIdx = (g_stats.frameTimesIdx + 1) % 100000;
+        g_stats.frameTimesCount = std::min<uint32_t>(180, g_stats.frameTimesCount + 1);
+    }
+    void ImGuiHud::publish(const Stats& s) {
+        /* S40+ merge: the gears of the ring counters (frametime/latency
+           rings) belong to the OUTPUT thread; the 1 Hz stats publish MUST
+           NOT clobber them (was: whole-struct → ring wiped every second =
+           sparkline/latency never visible). Merge only the scalar fields. */
+        std::lock_guard<std::mutex> lk(g_statsMtx);
+        g_stats.gameFps = s.gameFps;
+        g_stats.presentedFps = s.presentedFps;
+        g_stats.ipcMs = s.ipcMs;
+        g_stats.genMs = s.genMs;
+        g_stats.scanMs = s.scanMs;
+        g_stats.genExtraMs = s.genExtraMs;
+        g_stats.genExtraLive = s.genExtraLive;
     }
     ImGuiHud::Stats ImGuiHud::latest() {
         std::lock_guard<std::mutex> lk(g_statsMtx);
@@ -254,64 +279,79 @@ namespace ls::hud {
 
     void ImGuiHud::drawWidgets(const Stats& s) {
         ImGuiIO& io = ImGui::GetIO();
-        ImGui::SetNextWindowPos(ImVec2(8, 8), ImGuiCond_Once);
-        ImGui::SetNextWindowSize(ImVec2(330, 210), ImGuiCond_Once);
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg,
-            ImVec4(0.10f, 0.11f, 0.14f, 0.82f * this->fadeLock));
+        /* S40+ review pass: NeverClip + corner-anchor. The card auto-sizes to
+           its content; anchored by the (1,0) pivot so it hugs the top-right
+           with a 12 px inset on ANY resolution. No scrollbar, ever. */
+        ImGui::SetNextWindowPos(ImVec2(
+            static_cast<float>(this->rtSize.width) - 12.f, 12.f),
+            ImGuiCond_Always, ImVec2(1.f, 0.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 10.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.f, 5.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 0.f);
+        ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0,0,0,0));
         ImGui::Begin("lsfg-vk", nullptr,
             ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
             ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs);
-        ImGui::TextUnformatted("FRAME GENERATOR");
-        ImGui::SameLine();
-        ImGui::TextDisabled("(lsfg-vk)");
-        ImGui::Separator();
-        // big FPS line
-        char buf[96];
-        std::snprintf(buf, sizeof buf, "%u fps game  ·  %u fps doubled",
-            static_cast<unsigned>(std::lround(s.gameFps)),
-            static_cast<unsigned>(std::lround(s.presentedFps)));
-        ImGui::TextUnformatted(buf);
-        ImGui::SameLine(0.f, 16.f);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.54f, 0.17f, 0.89f, 1.f));
-        ImGui::TextUnformatted(s.presentedFps > s.gameFps + 1.f ? "2×" : "—");
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-        // frametime sparkline
-        ImGui::PlotLines("##ft", s.frameTimesMs,
-            static_cast<int>(s.frameTimesCount > 0 ? s.frameTimesCount : 1),
-            static_cast<int>(s.frameTimesIdx % 180),
-            "frametimes (measured, game)",
-            0.f, 25.f, ImVec2(310, 42));
-        ImGui::Spacing();
-        // click->photon card
-        ImGui::BeginChild("latency", ImVec2(0, 74), true);
-        ImGui::TextColored(ImVec4(0.61f, 0.19f, 1.00f, 1.f), "latency (click→photon, measured)");
-        if (s.clickP50 > 0.f)
-            ImGui::Text("p50 %.2f ms   ·   p99 %.2f ms",
-                static_cast<double>(s.clickP50), static_cast<double>(s.clickP99));
+            ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize |
+            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs |
+            ImGuiWindowFlags_NoNav);
+        // FPS table: label dim-left, value white-right (tabular alignment)
+        ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "game");
+        ImGui::SameLine(110.f);
+        ImGui::TextUnformatted("fps");
+        ImGui::SameLine(150.f);
+        ImGui::Text("%u", static_cast<unsigned>(std::lround(s.gameFps)));
+        ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "doubled");
+        ImGui::SameLine(110.f);
+        ImGui::TextUnformatted("fps");
+        ImGui::SameLine(150.f);
+        if (s.presentedFps > s.gameFps + 1.f)
+            ImGui::Text("%u  (2x)", static_cast<unsigned>(std::lround(s.presentedFps)));
         else
-            ImGui::TextDisabled("p50 --          ·   p99 --  (no probe session)");
-        // pipeline row (optional when live)
-        if (s.ipcMs > 0 || s.genMs > 0 || s.scanMs > 0) {
-            ImGui::TextDisabled("I %.1f  G %.1f  S %.1f%s",
-                static_cast<double>(s.ipcMs), static_cast<double>(s.genMs),
-                static_cast<double>(s.scanMs),
-                s.genExtraLive ? "" : "  E --");
-            if (s.genExtraLive)
-                ImGui::SameLine();
-            if (s.genExtraLive) {
-                char eb[64];
-                std::snprintf(eb, sizeof eb, "E%+.1f ms",
-                    static_cast<double>(s.genExtraMs));
-                ImGui::TextUnformatted(eb);
-            }
+            ImGui::Text("%u", static_cast<unsigned>(std::lround(s.presentedFps)));
+        // frametime sparkline, fixed y-range (0..25 ms) — the shape can't lie
+        if (s.frameTimesCount > 2) {
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "frametime");
+            ImGui::SameLine(150.f);
+            ImGui::TextDisabled("ms");
+            ImGui::PlotLines("##ft", s.frameTimesMs,
+                static_cast<int>(s.frameTimesCount),
+                static_cast<int>(s.frameTimesIdx % 180),
+                nullptr, 0.f, 25.f,
+                ImVec2(196.f, 34.f));
         }
-        ImGui::EndChild();
+        // click->photon percentiles from the live ring (dash while empty)
+        ImGui::Spacing();
+        if (s.latencySamplesCount >= 8) {
+            float ls[256];
+            for (uint32_t k = 0; k < s.latencySamplesCount; ++k)
+                ls[k] = s.latencySamples[k];
+            std::sort(ls, ls + s.latencySamplesCount);
+            const float p50 = ls[s.latencySamplesCount / 2];
+            const float p99 = ls[static_cast<uint32_t>(
+                std::min<uint32_t>(255, s.latencySamplesCount * 99 / 100))];
+            ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "latency");
+            ImGui::SameLine(150.f);
+            ImGui::TextDisabled("ms");
+            ImGui::Text("p50 %.2f   p99 %.2f",
+                static_cast<double>(p50), static_cast<double>(p99));
+        }
+        // pipeline segments (I=ipc G=gen S=scan E=GEN adds), fixed 4 slots
+        // width so the line never wraps: E shows "--" when not live.
+        char pipe[160];
+        if (s.genExtraLive)
+            std::snprintf(pipe, sizeof(pipe), "I %.1f  G %.1f  S %.1f  E %+.1f",
+                static_cast<double>(s.ipcMs), static_cast<double>(s.genMs),
+                static_cast<double>(s.scanMs), static_cast<double>(s.genExtraMs));
+        else
+            std::snprintf(pipe, sizeof(pipe), "I %.1f  G %.1f  S %.1f  E--",
+                static_cast<double>(s.ipcMs), static_cast<double>(s.genMs),
+                static_cast<double>(s.scanMs));
+        ImGui::TextDisabled("%s", pipe);
         ImGui::End();
         ImGui::PopStyleColor();
-        ImGui::PopStyleVar();
+        ImGui::PopStyleVar(3);
     }
 
     VkImage ImGuiHud::rtImage() const { return this->rt[this->active]->handle(); }

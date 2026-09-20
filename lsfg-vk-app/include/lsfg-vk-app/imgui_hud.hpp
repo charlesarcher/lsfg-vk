@@ -45,9 +45,15 @@ namespace ls::hud {
             bool  genExtraLive{false};
             float frameTimesMs[180]{};            // sparkline ring
             uint32_t frameTimesIdx{0}, frameTimesCount{0};
+            float latencySamples[256]{};          // click->photon ring (ms)
+            uint32_t latencySamplesIdx{0}, latencySamplesCount{0};
         };
         /// thread-safe snapshot setter (producer = present/stats thread)
         static void publish(const Stats& s);
+        /// thread-safe frametime ring push (per REAL present, output thread)
+        static void pushFrameMs(float ms);
+        /// thread-safe per-present latency sample ring (for p50/p99)
+        static void pushLatencyMs(float ms);
         [[nodiscard]] static Stats latest();
 
         /// queue a toggle (any thread): fade-out -> hidden, fade-in -> shown

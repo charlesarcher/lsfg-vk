@@ -1367,6 +1367,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         Clock::now().time_since_epoch()).count());
                 const double latMs = (nowNs > capTsNs) ? (nowNs - capTsNs) / 1e6 : 0.0;
                 lsfgvk::gui::g_guiState.currentLatencyRealMs.store(static_cast<float>(latMs));
+                ls::hud::ImGuiHud::pushLatencyMs(static_cast<float>(latMs));
+                /* S40+ Phase A: feed the frametime ring (per-REAL-present dt).
+                   static prevNs lives in this output loop scope; rings the
+                   delta even between stats ticks so the sparkline is honest. */
+                {
+                    static thread_local uint64_t prevPresentNs{ 0 };
+                    if (prevPresentNs != 0) {
+                        const double dtN = static_cast<double>(nowNs > prevPresentNs
+                            ? nowNs - prevPresentNs : 0);
+                        if (dtN > 0.0 && dtN < 1e9)
+                            ls::hud::ImGuiHud::pushFrameMs(
+                                static_cast<float>(dtN / 1e6));
+                    }
+                    prevPresentNs = nowNs;
+                }
                 dbg("MEASURED LATENCY: REAL present slot %d latency %.2f ms", stagingIdx, latMs);
             }
             ++presentIdx;
