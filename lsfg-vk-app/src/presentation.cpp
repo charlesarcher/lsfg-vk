@@ -1015,10 +1015,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                - cardW, cardY). When cardRect is still zeroed (first
                frames), fall back to the full-RT blit. */
             const auto oFull = g_imguiHud->origin();
+            /* the RT maps 1:1 at the origin: a card drawn at RT (cr.x,
+               cr.y) belongs on screen at (oFull + cr) = the true
+               upper-right corner (outW - 8 - cardW). */
             const VkOffset2D o{
-                static_cast<int32_t>(cr.w > 0
-                    ? oFull.x + g_imguiHud->rtExtent().width
-                        - cr.x - cr.w : oFull.x),
+                static_cast<int32_t>(cr.w > 0 ? oFull.x + cr.x : oFull.x),
                 static_cast<int32_t>(cr.w > 0 ? oFull.y + cr.y : oFull.y) };
             const VkImageMemoryBarrier sBar = makeBlitBarrier(srcImg,
                 g_imguiHud->lastAccess(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
