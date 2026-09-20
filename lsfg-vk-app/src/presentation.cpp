@@ -1192,6 +1192,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             // maybeHud re-publishes latest() and never carried these).
             ls::hud::ImGuiHud::publishFps(
                 static_cast<float>(gameFps), static_cast<float>(presentedFps));
+            /* S42k: stats-window tracer (throttled to 1 line/s) — proves the
+               compute side of the fps pipeline independently of the card. */
+            {
+                static uint32_t lastG = 0, lastD = 0; static int logThrottle = 0;
+                if ((gameFps != lastG || presentedFps != lastD) && logThrottle++ < 240)
+                    dbg("stats win: gf=%u df=%u dt=%.3f", gameFps, presentedFps, dt);
+                if (gameFps != lastG || presentedFps != lastD) { lastG = gameFps; lastD = presentedFps; }
+            }
             lsfgvk::gui::g_guiState.currentFpsReal.store(static_cast<float>(gameFps));
             lsfgvk::gui::g_guiState.currentFpsGen.store(static_cast<float>(presentedFps));
             lsfgvk::gui::g_guiState.streamActive.store(true);

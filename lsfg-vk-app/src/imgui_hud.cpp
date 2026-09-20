@@ -916,6 +916,18 @@ namespace ls::hud {
             std::lock_guard<std::mutex> lk(g_statsMtx);
             gFpsF = g_stats.gameFps; dFpsF = g_stats.presentedFps;
         }
+        /* S42k: state-change tracer — one stderr line when the card's read
+           values change (0<->nonzero or step). Scoped dbg is shadowed by
+           a local `const bool dbg` in this fn, so print directly. */
+        {
+            static float lg = -1.f, ld = -1.f;
+            if (gFpsF != lg || dFpsF != ld) {
+                std::fprintf(stderr, "imgui_hud: hud read gf=%u df=%u\n",
+                    static_cast<uint32_t>(gFpsF + 0.5f),
+                    static_cast<uint32_t>(dFpsF + 0.5f));
+                lg = gFpsF; ld = dFpsF;
+            }
+        }
         const uint32_t gFps = static_cast<uint32_t>(gFpsF + 0.5f);
         const uint32_t dFps = static_cast<uint32_t>(dFpsF + 0.5f);
         struct { float a[4]; float b[4]; float c[4]; } pcData = {
