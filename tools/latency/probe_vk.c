@@ -33,6 +33,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <math.h>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -584,7 +585,9 @@ int main(int argc, char** argv) {
 
         int magenta = 0;
         uint64_t thisClickT = 0;
-        static uint64_t magentaUntil = 0;   /* wall-clock ns until which we hold */
+        static uint64_t magentaUntil = 0;
+        static float clearR = 1.0f, clearG = 0.02f, clearB = 1.0f; /* unique per-click color */
+        static unsigned nClickSeq = 0;   /* wall-clock ns until which we hold */
         static uint64_t lastPaceNs = 0;     /* pacing anchor for the frame loop */
         if (nClickT > 0 && magentaUntil == 0) {
             /* newest click becomes THIS frame's paint instant. The flash is
@@ -593,18 +596,26 @@ int main(int argc, char** argv) {
             thisClickT = clickT[--nClickT];
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             magentaUntil = ts.tv_sec * 1000000000ULL + 120000000ULL;
-            /* paint magenta for the frame from THIS swapchain image */
+            /* paint the UNIQUE click color. User requirement (S40): each
+               click paints its own distinct color so the measurement is
+               provably looking at THAT click's frame, never a stale one. */
+            thisClickT = clickT[--nClickT];
+            const float clickHue = (float)(nClickSeq % 12) / 12.0f;  /* 12 hues */
+            clearR = 0.5f + 0.5f * (sinf(clickHue * 6.2831853f) * 0.5f + 0.5f);
+            clearG = 0.5f + 0.5f * (sinf(clickHue * 6.2831853f + 2.0943951f) * 0.5f + 0.5f);
+            clearB = 0.5f + 0.5f * (sinf(clickHue * 6.2831853f + 4.1887902f) * 0.5f + 0.5f);
+            nClickSeq++;
             {   /* wait for the previous use of this cb before reset: reset of a
-               PENDING cb is UB and RADV wedged exactly there (probe hold) */
-            VkFence f = cbsFences[idx];
-            if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
-                continue;   /* still in flight: present the previous image */
-            vkResetFences(dev, 1, &f);
-        }
+                   PENDING cb is UB and RADV wedged exactly there (probe hold) */
+                VkFence f = cbsFences[idx];
+                if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
+                    continue;   /* still in flight: present the previous image */
+                vkResetFences(dev, 1, &f);
+            }
         vkResetCommandBuffer(cbs[idx], 0);
             VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             vkBeginCommandBuffer(cbs[idx], &bbi);
-            VkClearColorValue clear = { .float32 = { 1.0f, 0.02f, 1.0f, 1.0f } };
+            VkClearColorValue clear = { .float32 = { clearR, clearG, clearB, 1.0f } };
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
             vkEndCommandBuffer(cbs[idx]);
@@ -634,7 +645,7 @@ int main(int argc, char** argv) {
         vkResetCommandBuffer(cbs[idx], 0);
                 VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
                 vkBeginCommandBuffer(cbs[idx], &bbi);
-                VkClearColorValue clear = { .float32 = { 1.0f, 0.02f, 1.0f, 1.0f } };
+                VkClearColorValue clear = { .float32 = { clearR, clearG, clearB, 1.0f } };
                 vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                     &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
                 vkEndCommandBuffer(cbs[idx]);
@@ -740,8 +751,8 @@ int main(int argc, char** argv) {
                     const double ms = (double)(presented - thisClickT) / 1e6;
                     if (ms > 0.0 && ms < 500.0 && collected < wantSamples && collected < 512) {
                         samples[collected++] = ms;
-                        printf("sample %u: click->photon %.2f ms (ledger slot=%llu fidx=%llu)\n",
-                            collected, ms, (unsigned long long)capTs, (unsigned long long)fidx);
+                        printf("sample %u: click->photon %.2f ms (colorId=%u, ledger slot=%llu fidx=%llu)\n",
+                            collected, ms, nClickSeq - 1, (unsigned long long)capTs, (unsigned long long)fidx);
                     }
                     thisClickT = 0;
                     atomic_store(&g_latch[slot], 0);
