@@ -387,7 +387,10 @@ int main(int argc, char** argv) {
     swci.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     swci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     swci.preTransform = caps.currentTransform;
-    swci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    /* S40: INHERIT + non-opaque clears defeat DIRECT SCANOUT (the wedge
+   shape dies when KWin composites instead of handing our buffer to
+   the display engine) */
+    swci.compositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
     /* FIFO: the compositor paces us; occlusion stalls are bounded (frame
      * wall-clock ~4 ms at 240 Hz) and buffer cycling continues even when the
      * window is partly occluded. IMMEDIATE froze inside vkQueuePresentKHR
