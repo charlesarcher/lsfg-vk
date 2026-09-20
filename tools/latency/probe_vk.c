@@ -55,7 +55,12 @@ static void xdg_surf_conf(void* d, struct xdg_surface* s, uint32_t serial) {
     (void)d; xdg_surface_ack_configure(s, serial); g_surfConfigured = 1;
 }
 static const struct xdg_surface_listener xdg_surf_listener = { .configure = xdg_surf_conf };
-static void xdg_tl_conf(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) { (void)d;(void)t;(void)w;(void)h;(void)s; }
+static int32_t g_tlW = 0, g_tlH = 0; /* last toplevel configure size; 0 = client-decides */
+static void xdg_tl_conf(void* d, struct xdg_toplevel* t, int32_t w, int32_t h, struct wl_array* s) {
+    (void)d; (void)t; (void)s;
+    if (w > 0) g_tlW = w;
+    if (h > 0) g_tlH = h;   /* S40: real-game resolution — honor compositor's size */
+}
 static const struct xdg_toplevel_listener tl_listener = { .configure = xdg_tl_conf };
 
 static struct wl_output* g_outputs[8];
@@ -359,6 +364,17 @@ int main(int argc, char** argv) {
     VkSurfaceCapabilitiesKHR caps; vkGetPhysicalDeviceSurfaceCapabilitiesKHR(chosen, vsurf, &caps);
     VkExtent2D ext = caps.currentExtent;
     if (ext.width == UINT32_MAX) { ext.width = 320; ext.height = 180; }
+    /* S40: a real game renders at the compositor-configured size (fullscreen =
+       display res). The toplevel configure carries that size; use it. */
+    if (g_tlW > 0 && g_tlH > 0) { ext.width = (uint32_t)g_tlW; ext.height = (uint32_t)g_tlH; }
+    /* User directive (S40): render at the DISPLAY resolution like a real game —
+       the dating value of a 320x180 synthetic (sub-ms blit) vs a real 2560x1440
+       workload. Fullscreen present extent comes from the compositor = the
+       display size; keep it unless LSFGVK_PROBE_SIZE overrides. */
+    {
+        const char *sz = getenv("LSFGVK_PROBE_SIZE");
+        if (sz) { unsigned w = 0, h = 0; if (sscanf(sz, "%ux%u", &w, &h) == 2 && w && h) { ext.width = w; ext.height = h; } }
+    }
     printf("swapchain extent %ux%u minImages=%u\n", ext.width, ext.height, caps.minImageCount);
 
     VkSwapchainCreateInfoKHR swci = { VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR };
@@ -545,41 +561,22 @@ int main(int argc, char** argv) {
            acq-sem waits can wedge inside RADV's syncobj path (gdb main-frames
            deep in libvulkan_radeon in every 'decay' run); a fence keeps the
            wait on the host where nothing can hide it. */
-        VkFence acqFence = cbsFences[(8 + (frameSeq & 7)) & 7];  /* host poll */
-        VkResult ac = vkAcquireNextImageKHR(dev, swap, 0 /*host polls*/,
-            VK_NULL_HANDLE,
-            acqFence, &idx);
-        if (ac == VK_SUCCESS || ac == VK_SUBOPTIMAL_KHR) {
-            const VkResult w = vkWaitForFences(dev, 1, &acqFence, VK_FALSE, 12'000'000ULL);
-            if (w != VK_SUCCESS && w != VK_TIMEOUT) { }
-            if (w != VK_SUCCESS) {
-                /* give the fence a chance; on timeout also reset so the next
-                   acquire can signal it again */
-                vkResetFences(dev, 1, &acqFence);
-                printf("acquire signaled but fence late (w=%d)\n", w);
+        VkResult ac = vkAcquireNextImageKHR(dev, swap, 33'333'333ULL /*33 ms BLOCK: park in Mesa*/,
+            VK_NULL_HANDLE, VK_NULL_HANDLE, &idx);
+        if (ac == VK_TIMEOUT || ac == VK_NOT_READY) {
+            static unsigned acqFail = 0;
+            ++acqFail;
+            if (acqFail % 240 == 0)
+                printf("acquire spinning: %u timeouts (33 ms cap each)\n", acqFail);
+            {   /* keep WSI queues serviced while parked */
+                wl_display_dispatch_pending(dpy);
+                struct timespec pz = { 0, 4'000'000 };
+                nanosleep(&pz, nullptr);
             }
-        }
-        if (ac == VK_TIMEOUT || ac == VK_NOT_READY)
-            continue;   /* host-paced spin keeps going */
-        if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR) {
-            printf("acquire FAILED ac=%d (fallthrough continue)\n", ac);
             continue;
         }
-                /* (old acquire-sem path removed; fence-poll acquire above is canonical) */
-        if (ac == VK_TIMEOUT || ac == VK_NOT_READY) {
-            static unsigned acqFail = 0; static uint64_t lastReport = 0;
-            ++acqFail;
-            struct timespec rn; clock_gettime(CLOCK_MONOTONIC, &rn);
-            const uint64_t nowNs = rn.tv_sec * 1000000000ULL + rn.tv_nsec;
-            if (nowNs - lastReport > 2000000000ULL) {
-                printf("acquire spinning: %u failures since last report (ac=%d)\n",
-                    acqFail, ac);
-                acqFail = 0; lastReport = nowNs;
-            }
-            continue;   /* keep the input thread fed; retry next pass */
-        }
         if (ac != VK_SUCCESS && ac != VK_SUBOPTIMAL_KHR) {
-            printf("acquire FAILED ac=%d (fallthrough continue)\n", ac);
+            printf("acquire FAILED ac=%d\n", ac);
             continue;
         }
 
