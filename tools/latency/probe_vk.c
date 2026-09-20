@@ -219,15 +219,19 @@ static void ledger_reader_init(void) {
 }
 /* newest layer row (capTs slot published AFTER COMMIT ARM: the row matching our
    magenta frame is the newest capTs >= commit-arm time) */
-static int layer_latest(uint64_t* capTs, uint64_t* fidx) {
+static int layer_first_after(uint64_t t0, uint64_t* capTs, uint64_t* fidx) {
     if (!g_layerMap) return 0;
-    const uint64_t head = g_layerMap[1];
+    const uint64_t head = g_layerMap[1];   /* 1-based next-write */
     if (!head) return 0;
-    const size_t off = 16 + ((head - 1) % 254) * 16;
-    const uint64_t* row = (const uint64_t*)((const char*)g_layerMap + off);
-    if (!row[0]) return 0;
-    *capTs = row[0]; *fidx = row[1];
-    return 1;
+    const uint64_t COUNT = head - 1;
+    const uint64_t back = COUNT > 254 ? 254 : COUNT;
+    for (uint64_t k = head - back; k < head; ++k) {
+        const uint64_t* row = (const uint64_t*)((const char*)g_layerMap
+            + 16 + (k % 254) * 16);
+        if (!row[0]) continue;
+        if (row[0] >= t0) { *capTs = row[0]; *fidx = row[1]; return 1; }
+    }
+    return 0;
 }
 /* scan the ledger ring for the FIRST row with captureTs >= ts0 (chronological);
    returns presentedNs via *presented. Window: 512 newest rows. */
@@ -248,38 +252,69 @@ static int ledger_pair(uint64_t ts0, uint64_t* presented) {
 }
 
 
-/* --- S40 "CLICK!" overlay: 5x7 bitmap font (C L I C K !), row-major,
-   5 px/row MSB-left --- */
-#define TXT_COLS 6
-#define TXT_GW 6   /* 5 px glyph + 1 px gap */
+/* --- S40 "CLICK!" overlay: 5x7 bitmap font, "CLICK! <n>" where <n> is the
+   click counter (up to 3 digits); row-major, bit4=leftmost. --- */
+#define TXT_COLS 10        /* max glyphs painted: C L I C K ! sp d d d */
+#define TXT_GW 6           /* 5 px glyph + 1 px gap */
 #define TXT_GH 7
 #define TXT_SCALE 8
-static const unsigned char GLYPH57[TXT_COLS][TXT_GH] = {
-    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, /* C  .###. #...# #.... #.... #.... #...# .###. */
-    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, /* L  #.... x7 + ##### */
-    {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}, /* I  ##### ..#.. ..#.. ..#.. ..#.. ..#.. ##### */
-    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, /* C */
-    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, /* K  #...# #..#. #.#.. ##... #.#.. #..#. #...# */
-    {0x04,0x04,0x04,0x04,0x04,0x00,0x04}, /* !  ..#.. x5 blank ..#.. */
+static const unsigned char GLYPH57[24][TXT_GH] = {   /* 0..5 = CLICK! glyphs, 6=space, 10..19 digits */
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, /* 0: C */
+    {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}, /* 1: L */
+    {0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}, /* 2: I */
+    {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}, /* 3: C */
+    {0x11,0x12,0x14,0x18,0x14,0x12,0x11}, /* 4: K */
+    {0x04,0x04,0x04,0x04,0x04,0x00,0x04}, /* 5: ! */
+    {0x00,0x00,0x00,0x00,0x00,0x00,0x00}, /* 6: space */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 7 + */
+    {0x1F,0x11,0x11,0x11,0x11,0x11,0x1F}, /* 8 - */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 9 + */
+    {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}, /* 10: 0 */
+    {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}, /* 11: 1 */
+    {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}, /* 12: 2 */
+    {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}, /* 13: 3 */
+    {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}, /* 14: 4 */
+    {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}, /* 15: 5 */
+    {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}, /* 16: 6 */
+    {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}, /* 17: 7 */
+    {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}, /* 18: 8 */
+    {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}, /* 19: 9 */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 20 + */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 21 + */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 22 + */
+    {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}, /* 23 + */
 };
-#define TXTW (TXT_COLS * TXT_GW * TXT_SCALE)   /* 288 px */
+#define TEXT_GLYPHS 7   /* C L I C K ! ␣ */
+#define TXTW (TXT_COLS * TXT_GW * TXT_SCALE)   /* 480 px */
 #define TXTH (TXT_GH * TXT_SCALE)              /*  56 px */
 #define TXTB (TXTW * TXTH * 4u)
-/* compose: white glyphs over (r,g,b) backdrop */
-static void txt_compose(unsigned char *map, float r, float g, float b)
+/* compose: paint "CLICK! <n>" — white glyphs over (r,g,b) backdrop;
+   clickNo clamps to 3 digits. */
+static void txt_compose(unsigned char *map, float r, float g, float b, unsigned clickNo)
 {
+    unsigned digits[3]; unsigned nd = 0;
+    unsigned n = clickNo > 999u ? 999u : clickNo;
+    do { unsigned d = n % 10u; digits[nd++] = 10u + d? 10u + d : 10u; n /= 10u; if (nd >= 3) break; } while (n);
+    if (nd == 0) { digits[nd++] = 10u; }
+    /* glyph plan: 6 text glyphs + space + nd digits */
+    unsigned glyphIdx[TXT_COLS]; unsigned nglyph = 0;
+    glyphIdx[nglyph++] = 0; glyphIdx[nglyph++] = 1; glyphIdx[nglyph++] = 2;
+    glyphIdx[nglyph++] = 0; glyphIdx[nglyph++] = 4; glyphIdx[nglyph++] = 5;
+    glyphIdx[nglyph++] = 6;               /* space */
+    for (int k = (int)nd - 1; k >= 0; --k) glyphIdx[nglyph++] = digits[k];
+    for (unsigned gi = nglyph; gi < TXT_COLS; ++gi) glyphIdx[gi] = 6; /* trailing space */
     for (uint32_t y = 0; y < TXTH; ++y)
         for (uint32_t x = 0; x < TXTW; ++x) {
             const uint32_t gx = x / TXT_SCALE, gy = y / TXT_SCALE;
             const uint32_t col = gx / TXT_GW;
             const uint32_t incol = gx % TXT_GW;
             unsigned char *px = map + ((size_t)y * TXTW + x) * 4;
-            if (incol < 5) {
-                const unsigned char on = (GLYPH57[col][gy] >> (4 - incol)) & 1u;
-                if (on) { px[0]=0xff; px[1]=0xff; px[2]=0xff; px[3]=0xff; continue; }
-            }
-            px[0]=(unsigned char)(b*255.0f); px[1]=(unsigned char)(g*255.0f);
-            px[2]=(unsigned char)(r*255.0f); px[3]=0xff;
+            unsigned gi = glyphIdx[col > 9 ? 9 : col];
+            unsigned char on = 0;
+            if (incol < 5 && col < TXT_COLS) on = (GLYPH57[gi][gy] >> (4 - incol)) & 1u;
+            if (on) { px[0]=0xff; px[1]=0xff; px[2]=0xff; px[3]=0xff; }
+            else    { px[0]=(unsigned char)(b*255.0f); px[1]=(unsigned char)(g*255.0f);
+                      px[2]=(unsigned char)(r*255.0f); px[3]=0xff; }
         }
 }
 
@@ -543,7 +578,7 @@ int main(int argc, char** argv) {
         if (vkAllocateMemory(dev, &mai, nullptr, &txtMem) != VK_SUCCESS) { fprintf(stderr, "txt mem\n"); return 12; }
         vkBindBufferMemory(dev, txtBuf, txtMem, 0);
         vkMapMemory(dev, txtMem, 0, TXTB, 0, (void**)&txtMap);
-        txt_compose(txtMap, 0.0f, 0.0f, 0.0f);   /* initial bg: black */
+        txt_compose(txtMap, 0.0f, 0.0f, 0.0f, 0u);   /* initial bg: black */
         printf("CLICK! overlay %ux%u staged\n", TXTW, TXTH);
     }
     /* --- input thread: SAME discovery as probe_latency (all mice + virtual clicker) --- */
@@ -586,7 +621,7 @@ int main(int argc, char** argv) {
 
     /* --- main loop: render + feedback + click pairing --- */
     printf("click the mouse (or run uclick) — %u samples wanted\n", wantSamples);
-    uint64_t samples[512]; unsigned collected = 0;
+    double samples[512]; unsigned collected = 0;
     uint64_t thisClickT2 = 0;            /* pending pairing (declared outer scope) */
     uint64_t clickT[64]; unsigned nClickT = 0;
     for (uint32_t i = 0; i < nfd; ++i) {
@@ -676,7 +711,7 @@ int main(int argc, char** argv) {
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
                 {   /* S40 "CLICK!" overlay: centered copy onto the frame */
-                    txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2]);
+                    txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2], nClickSeq);
                     VkBufferImageCopy cpy = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
                         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                         .imageOffset = { (int32_t)(ext.width > TXTW ? (ext.width - TXTW) / 2 : 0),
@@ -735,7 +770,7 @@ int main(int argc, char** argv) {
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
                 {   /* S40 "CLICK!" overlay: centered copy onto the frame */
-                    txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2]);
+                    txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2], nClickSeq);
                     VkBufferImageCopy cpy = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
                         .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                         .imageOffset = { (int32_t)(ext.width > TXTW ? (ext.width - TXTW) / 2 : 0),
@@ -813,12 +848,17 @@ int main(int argc, char** argv) {
                presented on the app's overlay surface; the probe's own surface
                sits occluded and KWin posts no presented-feedback for it). */
             uint64_t capTs = 0, fidx = 0;
-            if (layer_latest(&capTs, &fidx)) {
+            /* the click's OWN frame = FIRST row captured at/after the click */
+            if (layer_first_after(thisClickT, &capTs, &fidx)) {
+                printf("pair-layer: click=%llu firstCapTs=%llu fidx=%llu\n",
+                    (unsigned long long)thisClickT, (unsigned long long)capTs, (unsigned long long)fidx);
                 uint64_t presented = 0;
                 /* scan a few dispatch cycles: the app's drain lags ~1 frame */
                 for (int k = 0; k < 3 && !ledger_pair(capTs, &presented); ++k) {
-                    struct timespec tw = { 0, 2500000 };
+                    struct timespec tw = { 0, 2'500'000 };
                     nanosleep(&tw, nullptr);
+                    if (!ledger_pair(capTs, &presented) && k == 2)
+                        printf("pair-layer: NO ledger row for capTs=%llu\n", (unsigned long long)capTs);
                 }
                 if (presented) {
                     const double ms = (double)(presented - thisClickT) / 1e6;
@@ -906,7 +946,7 @@ int main(int argc, char** argv) {
     if (collected > 1) {
         for (unsigned i = 1; i < collected; ++i)
             for (unsigned j = i; j && samples[j] < samples[j - 1]; --j) {
-                uint64_t t = samples[j]; samples[j] = samples[j - 1]; samples[j - 1] = t;
+                double t = samples[j]; samples[j] = samples[j - 1]; samples[j - 1] = t;
             }
         printf(" p50=%.2f ms p99=%.2f ms min=%.2f ms max=%.2f ms",
             samples[collected / 2],
