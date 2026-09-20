@@ -622,7 +622,7 @@ int main(int argc, char** argv) {
            acq-sem waits can wedge inside RADV's syncobj path (gdb main-frames
            deep in libvulkan_radeon in every 'decay' run); a fence keeps the
            wait on the host where nothing can hide it. */
-        VkResult ac = vkAcquireNextImageKHR(dev, swap, 33'333'333ULL /*33 ms BLOCK: park in Mesa*/,
+        VkResult ac = vkAcquireNextImageKHR(dev, swap, 100'000'000ULL /*100 ms cap*/,
             VK_NULL_HANDLE, VK_NULL_HANDLE, &idx);
         if (ac == VK_TIMEOUT || ac == VK_NOT_READY) {
             static unsigned acqFail = 0;
@@ -653,7 +653,7 @@ int main(int argc, char** argv) {
                MEASUREMENT pairs with the FIRST magenta commit only. */
             thisClickT = clickT[--nClickT];
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            magentaUntil = ts.tv_sec * 1000000000ULL + 120000000ULL;
+            magentaUntil = ts.tv_sec * 1000000000ULL + 25000000ULL; /* S40: 25 ms hold — long holds overcycled the FIFO in-flight */
             /* paint the UNIQUE click color. User requirement (S40): each
                click paints its own distinct color so the measurement is
                provably looking at THAT click's frame, never a stale one. */
@@ -665,7 +665,7 @@ int main(int argc, char** argv) {
             {   /* wait for the previous use of this cb before reset: reset of a
                    PENDING cb is UB and RADV wedged exactly there (probe hold) */
                 VkFence f = cbsFences[idx];
-                if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
+                if (vkWaitForFences(dev, 1, &f, VK_TRUE, UINT64_MAX) /* S40: INFINITE — the cb is already queued (GPU clear <0.2 ms); a capped wait that TIMEOUTS led to a 'continue' = an ACQUIRED-BUT-NEVER-PRESENTED image (lost present) → the FIFO drains and the acquire starves */ /* S40: generous — a tight cap turned in-flight cbs into LOST PRESENTS (acquired-but-never-presented images starve the acquire) */ != VK_SUCCESS)
                     continue;   /* still in flight: present the previous image */
                 vkResetFences(dev, 1, &f);
             }
@@ -693,9 +693,9 @@ int main(int argc, char** argv) {
             VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
             si.pWaitDstStageMask = &st;
             si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
-            VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
-            si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
-            vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+            /* S40 WEDGE FIX 2: the last presSems[] signal fires but NOTHING waits it; each stale (gen,val) parks RADV's present-internal retire wait (decoded in the parked strace: timeout=infinite, point=0xd0000000d, handle spins). Present waits nothing (ordering = cbsFences + acquire), so the cb signals nothing. */
+            si.signalSemaphoreCount = 0; si.pSignalSemaphores = nullptr;
+            vkQueueSubmit(queue, 1, &si, cbsFences[idx]); /* S40: EVERY in-loop cb signals its slot fence — a held-path VK_NULL submit left the next guard's wait unsatisfiable (infinite park, T9) */
             magenta = 1;
         } else if (magentaUntil) {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -705,7 +705,7 @@ int main(int argc, char** argv) {
                 {   /* wait for the previous use of this cb before reset: reset of a
                PENDING cb is UB and RADV wedged exactly there (probe hold) */
             VkFence f = cbsFences[idx];
-            if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
+            if (vkWaitForFences(dev, 1, &f, VK_TRUE, UINT64_MAX) /* S40: INFINITE — the cb is already queued (GPU clear <0.2 ms); a capped wait that TIMEOUTS led to a 'continue' = an ACQUIRED-BUT-NEVER-PRESENTED image (lost present) → the FIFO drains and the acquire starves */ /* S40: generous — a tight cap turned in-flight cbs into LOST PRESENTS (acquired-but-never-presented images starve the acquire) */ != VK_SUCCESS)
                 continue;   /* still in flight: present the previous image */
             vkResetFences(dev, 1, &f);
         }
@@ -732,9 +732,9 @@ int main(int argc, char** argv) {
                 VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
                 si.pWaitDstStageMask = &st;
                 si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
-                VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
-                si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
-                vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE);
+                /* S40 WEDGE FIX 2: the last presSems[] signal fires but NOTHING waits it; each stale (gen,val) parks RADV's present-internal retire wait (decoded in the parked strace: timeout=infinite, point=0xd0000000d, handle spins). Present waits nothing (ordering = cbsFences + acquire), so the cb signals nothing. */
+                si.signalSemaphoreCount = 0; si.pSignalSemaphores = nullptr;
+                vkQueueSubmit(queue, 1, &si, cbsFences[idx]); /* S40: re-seat the per-slot fence */
                 magenta = 1; /* held, not a new sample */
             } else {
                 magentaUntil = 0;
@@ -745,7 +745,7 @@ int main(int argc, char** argv) {
             {   /* wait for the previous use of this cb before reset: reset of a
                PENDING cb is UB and RADV wedged exactly there (probe hold) */
             VkFence f = cbsFences[idx];
-            if (vkWaitForFences(dev, 1, &f, VK_FALSE, 8'000'000ULL) != VK_SUCCESS)
+            if (vkWaitForFences(dev, 1, &f, VK_TRUE, UINT64_MAX) /* S40: INFINITE — the cb is already queued (GPU clear <0.2 ms); a capped wait that TIMEOUTS led to a 'continue' = an ACQUIRED-BUT-NEVER-PRESENTED image (lost present) → the FIFO drains and the acquire starves */ /* S40: generous — a tight cap turned in-flight cbs into LOST PRESENTS (acquired-but-never-presented images starve the acquire) */ != VK_SUCCESS)
                 continue;   /* still in flight: present the previous image */
             vkResetFences(dev, 1, &f);
         }
@@ -777,22 +777,33 @@ int main(int argc, char** argv) {
             VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
             si.pWaitDstStageMask = &st;
             si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
-            VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
-            si.signalSemaphoreCount = 1; si.pSignalSemaphores = sg;
+            /* S40 WEDGE FIX 2: the last presSems[] signal fires but NOTHING waits it; each stale (gen,val) parks RADV's present-internal retire wait (decoded in the parked strace: timeout=infinite, point=0xd0000000d, handle spins). Present waits nothing (ordering = cbsFences + acquire), so the cb signals nothing. */
+            si.signalSemaphoreCount = 0; si.pSignalSemaphores = nullptr;
             vkQueueSubmit(queue, 1, &si, cbsFences[idx]);
         }
 
         /* restore-dim for the NEXT use of this slot is handled by the bg repaint */
 
         VkPresentInfoKHR pi = { VK_STRUCTURE_TYPE_PRESENT_INFO_KHR };
-        VkSemaphore sg[1] = { presSems[frameSeq % NSWSEMS] };
-        pi.waitSemaphoreCount = 1; pi.pWaitSemaphores = sg;
+        /* S40 WEDGE FIX: the present waits NO semaphore — RADV's WSI
+           internalized our binary signaled sem into a TIMELINE wait with
+           a CORRUPT point (mem-read of the args: handle 13, point
+           0xdda31200000055b4 — pointer bytes) → instant ETIME spin at
+           timeout=0 → present parks forever. Ordering is already
+           guaranteed by cbsFences (cb complete before use) + acquire
+           exclusivity; the sem added nothing but the wedge. */
+        pi.waitSemaphoreCount = 0; pi.pWaitSemaphores = nullptr;
         pi.swapchainCount = 1; pi.pSwapchains = &swap; pi.pImageIndices = &idx;
         unsigned slot = idx & 3u;
         if (magenta) printf("magenta commit (slot %u)\n", slot);
         atomic_store(&g_latch[slot], 0);
-        struct wp_presentation_feedback* fb = wp_presentation_feedback(present, surf);
-        wp_presentation_feedback_add_listener(fb, &fb_listener, (void*)(uintptr_t)slot);
+        /* S40 DISCRIMINATOR: LSFGVK_PROBE_NOFB=1 stops wp_presentation
+           arming once samples are collected — isolates whether the
+           post-sample acquire-starve is KWin's feedback channel. */
+        if (getenv("LSFGVK_PROBE_NOFB") == nullptr || collected == 0) {
+            struct wp_presentation_feedback* fb = wp_presentation_feedback(present, surf);
+            wp_presentation_feedback_add_listener(fb, &fb_listener, (void*)(uintptr_t)slot);
+        }
         if (magenta) atomic_store(&g_plantSlot, slot);
         VkResult pr = vkQueuePresentKHR(queue, &pi);
         (void)pr;
@@ -846,7 +857,21 @@ int main(int argc, char** argv) {
                 }
             }
             /* fallback: own-surface feedback (baseline mode, no layer) */
-            const uint64_t latch = atomic_load(&g_latch[slot]);
+            uint64_t latch = atomic_load(&g_latch[slot]);
+            if (!latch) {   /* S40: KWin delivers 'presented' with the NEXT
+               output frame(s); bounded recheck — roundtrip (dispatches the
+               frame) ×3 with one 5 ms snooze; catches ~2 vblank periods
+               without re-arming anything. */
+                for (int k = 0; k < 3 && !latch; ++k) {
+                    wl_display_roundtrip(dpy);
+                    latch = atomic_load(&g_latch[slot]);
+                    if (!latch) {
+                        struct timespec tw = { 0, 5'000'000 };
+                        nanosleep(&tw, nullptr);
+                    }
+                }
+                wl_display_flush(dpy);
+            }
             printf("magenta latch=%llu\n", (unsigned long long)latch);
             if (latch && collected < wantSamples && collected < 512) {
                 const double ms = (double)(latch - thisClickT) / 1e6;
@@ -866,7 +891,13 @@ int main(int argc, char** argv) {
         do {
             struct timespec pz; clock_gettime(CLOCK_MONOTONIC, &pz);
             const uint64_t nowNs = pz.tv_sec * 1000000000ULL + pz.tv_nsec;
-            const uint64_t target = magentaUntil ? 2 : 8;
+            const uint64_t target = magentaUntil ? 8 : 8;
+            /* S40: hold pacing == bg pacing: at 2 ms the cb (≈4-8 ms flight)
+               can't complete between hold frames → the guard's 8 ms fence
+               wait times out → 'continue' skips the present → all swapchain
+               images end up acquired-unpresented → acquire starves (the
+               post-'hold expired' wedge). 8 ms odd frames keep the cb
+               retired. */
             if (lastPaceNs && nowNs - lastPaceNs < target * 1000000ULL) {
                 /* S40 FINAL LOCK: dispatch while waiting — Mesa's WSI owns a
                    PRIVATE wayland queue whose callbacks deliver buffer
