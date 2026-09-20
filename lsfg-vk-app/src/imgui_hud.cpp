@@ -95,6 +95,11 @@ namespace ls::hud {
         std::lock_guard<std::mutex> lk(g_statsMtx);
         return g_stats;
     }
+    void ImGuiHud::publishFps(float gameFps, float presentedFps) {
+        std::lock_guard<std::mutex> lk(g_statsMtx);
+        g_stats.gameFps = gameFps;
+        g_stats.presentedFps = presentedFps;
+    }
     void ImGuiHud::toggle() { toggleImpl(); }
     bool ImGuiHud::drawing() { return g_visible.load() || g_alpha.load() > 0.02f; }
 

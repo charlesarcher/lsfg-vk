@@ -50,6 +50,10 @@ namespace ls::hud {
         };
         /// thread-safe snapshot setter (producer = present/stats thread)
         static void publish(const Stats& s);
+        /// S42j: publish only the fps scalars from the stats window
+        /// (maybeStats computes them from the frame counters; the echo
+        /// publish(latest()) loop in maybeHud never carried them).
+        static void publishFps(float gameFps, float presentedFps);
         /// thread-safe frametime ring push (per REAL present, output thread)
         static void pushFrameMs(float ms);
         /// thread-safe per-present latency sample ring (for p50/p99)

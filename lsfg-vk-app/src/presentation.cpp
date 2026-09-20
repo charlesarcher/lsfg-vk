@@ -1188,6 +1188,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             const double dt = std::chrono::duration<double>(now - statsLastTime).count();
             const uint32_t gameFps = static_cast<uint32_t>(frameCount.exchange(0) / dt);
             const uint32_t presentedFps = static_cast<uint32_t>(presentedFrames.exchange(0) / dt);
+            // S42j: feed the ImGui card directly (the echo publish in
+            // maybeHud re-publishes latest() and never carried these).
+            ls::hud::ImGuiHud::publishFps(
+                static_cast<float>(gameFps), static_cast<float>(presentedFps));
             lsfgvk::gui::g_guiState.currentFpsReal.store(static_cast<float>(gameFps));
             lsfgvk::gui::g_guiState.currentFpsGen.store(static_cast<float>(presentedFps));
             lsfgvk::gui::g_guiState.streamActive.store(true);
