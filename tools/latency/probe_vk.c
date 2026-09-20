@@ -504,7 +504,7 @@ int main(int argc, char** argv) {
             b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED; b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             b.image = imgs[i]; b.subresourceRange = (VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 };
             vkCmdPipelineBarrier(cbs[0], VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0,0,0,0,1,&b);
-            VkClearColorValue clear = { .float32 = { 0.06f, 0.05f, 0.12f, 1.0f } };
+            VkClearColorValue clear = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } }; /* S40: black default */
             vkCmdClearColorImage(cbs[0], imgs[i], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
         }
@@ -543,7 +543,7 @@ int main(int argc, char** argv) {
         if (vkAllocateMemory(dev, &mai, nullptr, &txtMem) != VK_SUCCESS) { fprintf(stderr, "txt mem\n"); return 12; }
         vkBindBufferMemory(dev, txtBuf, txtMem, 0);
         vkMapMemory(dev, txtMem, 0, TXTB, 0, (void**)&txtMap);
-        txt_compose(txtMap, 0.06f, 0.05f, 0.12f);   /* initial bg */
+        txt_compose(txtMap, 0.0f, 0.0f, 0.0f);   /* initial bg: black */
         printf("CLICK! overlay %ux%u staged\n", TXTW, TXTH);
     }
     /* --- input thread: SAME discovery as probe_latency (all mice + virtual clicker) --- */
@@ -696,50 +696,27 @@ int main(int argc, char** argv) {
             /* S40 WEDGE FIX 2: the last presSems[] signal fires but NOTHING waits it; each stale (gen,val) parks RADV's present-internal retire wait (decoded in the parked strace: timeout=infinite, point=0xd0000000d, handle spins). Present waits nothing (ordering = cbsFences + acquire), so the cb signals nothing. */
             si.signalSemaphoreCount = 0; si.pSignalSemaphores = nullptr;
             vkQueueSubmit(queue, 1, &si, cbsFences[idx]); /* S40: EVERY in-loop cb signals its slot fence — a held-path VK_NULL submit left the next guard's wait unsatisfiable (infinite park, T9) */
+            magentaUntil = 0;   /* user spec: ONE colored frame then back to black */
             magenta = 1;
         } else if (magentaUntil) {
-            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-            const uint64_t nowNs = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-            if (nowNs < magentaUntil) {
-                /* HOLD: repaint magenta until expiry */
-                {   /* wait for the previous use of this cb before reset: reset of a
-               PENDING cb is UB and RADV wedged exactly there (probe hold) */
-            VkFence f = cbsFences[idx];
-            if (vkWaitForFences(dev, 1, &f, VK_TRUE, UINT64_MAX) /* S40: INFINITE — the cb is already queued (GPU clear <0.2 ms); a capped wait that TIMEOUTS led to a 'continue' = an ACQUIRED-BUT-NEVER-PRESENTED image (lost present) → the FIFO drains and the acquire starves */ /* S40: generous — a tight cap turned in-flight cbs into LOST PRESENTS (acquired-but-never-presented images starve the acquire) */ != VK_SUCCESS)
-                continue;   /* still in flight: present the previous image */
-            vkResetFences(dev, 1, &f);
-        }
-        vkResetCommandBuffer(cbs[idx], 0);
-                VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-                vkBeginCommandBuffer(cbs[idx], &bbi);
-                VkClearColorValue clear = { .float32 = { clearR, clearG, clearB, 1.0f } };
-                vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
-                    &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
-                    {   /* S40 "CLICK!" overlay: centered copy onto the frame */
-                        txt_compose(txtMap, clear.float32[0], clear.float32[1], clear.float32[2]);
-                        VkBufferImageCopy cpy = { .bufferOffset = 0, .bufferRowLength = 0, .bufferImageHeight = 0,
-                            .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                            .imageOffset = { (int32_t)(ext.width > TXTW ? (ext.width - TXTW) / 2 : 0),
-                                             (int32_t)(ext.height > TXTH ? (ext.height - TXTH) / 2 : 0), 0 },
-                            .imageExtent = { ext.width > TXTW ? TXTW : ext.width,
-                                             ext.height > TXTH ? TXTH : ext.height, 1 } };
-                        vkCmdCopyBufferToImage(cbs[idx], txtBuf, imgs[idx], VK_IMAGE_LAYOUT_GENERAL, 1, &cpy);
-                    }
-                vkEndCommandBuffer(cbs[idx]);
-                /* fence-acquire path: no wait semaphore (see main-loop note) */
-                VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                si.waitSemaphoreCount = 0; si.pWaitSemaphores = nullptr;
-                VkPipelineStageFlags st = VK_PIPELINE_STAGE_TRANSFER_BIT;
-                si.pWaitDstStageMask = &st;
-                si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
-                /* S40 WEDGE FIX 2: the last presSems[] signal fires but NOTHING waits it; each stale (gen,val) parks RADV's present-internal retire wait (decoded in the parked strace: timeout=infinite, point=0xd0000000d, handle spins). Present waits nothing (ordering = cbsFences + acquire), so the cb signals nothing. */
-                si.signalSemaphoreCount = 0; si.pSignalSemaphores = nullptr;
-                vkQueueSubmit(queue, 1, &si, cbsFences[idx]); /* S40: re-seat the per-slot fence */
-                magenta = 1; /* held, not a new sample */
-            } else {
-                magentaUntil = 0;
-                printf("hold expired (nClickT=%u)\n", nClickT);
+            /* S40: (dead by design — arm now one-shots) plain black frame */
+            {   VkFence f = cbsFences[idx];
+                if (vkWaitForFences(dev, 1, &f, VK_TRUE, UINT64_MAX) != VK_SUCCESS)
+                    continue;
+                vkResetFences(dev, 1, &f);
             }
+            vkResetCommandBuffer(cbs[idx], 0);
+            VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            vkBeginCommandBuffer(cbs[idx], &bbi);
+            VkClearColorValue clear = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
+            vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
+                &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
+            vkEndCommandBuffer(cbs[idx]);
+            VkSubmitInfo si = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            si.waitSemaphoreCount = 0; si.pWaitSemaphores = nullptr;
+            si.commandBufferCount = 1; si.pCommandBuffers = &cbs[idx];
+            si.signalSemaphoreCount = 0; si.pSignalSemaphores = nullptr;
+            vkQueueSubmit(queue, 1, &si, cbsFences[idx]);
         } else {
             /* background frame: reset the slot back to dim (cheap clear command) */
             {   /* wait for the previous use of this cb before reset: reset of a
@@ -752,11 +729,9 @@ int main(int argc, char** argv) {
         vkResetCommandBuffer(cbs[idx], 0);
             VkCommandBufferBeginInfo bbi = { VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
             vkBeginCommandBuffer(cbs[idx], &bbi);
-            /* S40: KWin skips presenting IDENTICAL surfaces — a static bg
-               stops compositor buffer retirement and the acquire starves
-               (the whole 'decay' traced here). 1-bit jitter forces damage. */
-            VkClearColorValue clear = { .float32 = { 0.06f, 0.05f,
-                0.12f + 0.004f * (float)(frameSeq & 1), 1.0f } };
+            /* S40 UX: black screen by default (the 'identical content'
+               damage fear was disproven — swapchain flips retire fine) */
+            VkClearColorValue clear = { .float32 = { 0.0f, 0.0f, 0.0f, 1.0f } };
             vkCmdClearColorImage(cbs[idx], imgs[idx], VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                 &(VkImageSubresourceRange){ VK_IMAGE_ASPECT_COLOR_BIT, 0,1,0,1 });
                 {   /* S40 "CLICK!" overlay: centered copy onto the frame */
