@@ -378,7 +378,7 @@ namespace ls::hud {
         poolSize.descriptorCount = 2;
         VkDescriptorPoolCreateInfo pool{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-            .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &poolSize };
+            .maxSets = 512, .poolSizeCount = 1, .pPoolSizes = &poolSize };
         std::fprintf(stderr, "imgui_hud: bco4 desc-pool\n");
         PFN_vkCreateDescriptorPool cDp = devPfn<PFN_vkCreateDescriptorPool>(vk, "vkCreateDescriptorPool");
         if (!cDp || cDp(vk.dev(), &pool, nullptr, &this->pmPool) != VK_SUCCESS)
@@ -847,6 +847,32 @@ namespace ls::hud {
         /* S41+ seam test: re-write the desc INK per present (static
            coSet2 may hold a stale/too-early view→ suspect #1). Env:
            LSFGVK_CO_REUPD=1. */
+        /* S41-NEW: re-alloc fresh sets per present (kills any stale
+           descriptor-set-object state once and for all). */
+        static const bool reallocSets = ::getenv("LSFGVK_CO_REALLOC") != nullptr;
+        if (reallocSets) {
+            VkDescriptorImageInfo diu{
+                .sampler = this->coSampler,
+                .imageView = this->rt[this->active]->imageview(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkDescriptorSetAllocateInfo ai2{
+                .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                .descriptorPool = this->coPool,
+                .descriptorSetCount = 1, .pSetLayouts = &this->coSetLayout };
+            VkDescriptorSet ns{};
+            PFN_vkAllocateDescriptorSets cAl2 =
+                devPfn<PFN_vkAllocateDescriptorSets>(vk, "vkAllocateDescriptorSets");
+            if (cAl2 && cAl2(vk.dev(), &ai2, &ns) == VK_SUCCESS) {
+                VkWriteDescriptorSet wu{
+                    .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                    .dstSet = ns, .dstBinding = 0,
+                    .descriptorCount = 1, .pImageInfo = &diu };
+                PFN_vkUpdateDescriptorSets cUp3 =
+                    devPfn<PFN_vkUpdateDescriptorSets>(vk, "vkUpdateDescriptorSets");
+                if (cUp3) cUp3(vk.dev(), 1, &wu, 0, nullptr);
+                set = ns;
+            }
+        }
         static const bool reupd = ::getenv("LSFGVK_CO_REUPD") != nullptr;
         if (reupd) {
             VkDescriptorImageInfo diu{
@@ -875,9 +901,25 @@ namespace ls::hud {
         const float offY = static_cast<float>(o.y) /
             static_cast<float>(dstExtent.height);
         /* pack = shader PC layout: (offX, offY, scX, scY) in ONE vec4 */
-        float pcv[4] = { offX, offY, scX, scY };
+        const float rtW = static_cast<float>(this->rtSize.width);
+        const float rtH = static_cast<float>(this->rtSize.height);
+        /* imgui window rect inside the RT (px): x 463..627, y 13..112 */
+        const float winX0 = 463.f / rtW, winY0 = 13.f / rtH;
+        const float winX1 = 627.f / rtW, winY1 = 112.f / rtH;
+        float gFpsF = 0.f, dFpsF = 0.f;
+        {
+            std::lock_guard<std::mutex> lk(g_statsMtx);
+            gFpsF = g_stats.gameFps; dFpsF = g_stats.presentedFps;
+        }
+        const uint32_t gFps = static_cast<uint32_t>(gFpsF + 0.5f);
+        const uint32_t dFps = static_cast<uint32_t>(dFpsF + 0.5f);
+        struct { float a[4]; float b[4]; float c[4]; } pcData = {
+            { offX, offY, scX, scY },
+            { winX0, winY0, winX1, winY1 },
+            { static_cast<float>(gFps), static_cast<float>(dFps),
+              this->fadeLock, 0.f } };   /* text.z = fade alpha */
         if (auto ppc = devPfn<PFN_vkCmdPushConstants>(vk, "vkCmdPushConstants"); ppc)
-            ppc(cb.raw(), this->coLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pcv);
+            ppc(cb.raw(), this->coLayout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, 48, &pcData);
         if (auto draw = devPfn<PFN_vkCmdDraw>(vk, "vkCmdDraw"); draw)
             draw(cb.raw(), 6, 1, 0, 0);   /* co10: two-tri fullscreen */
         if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
