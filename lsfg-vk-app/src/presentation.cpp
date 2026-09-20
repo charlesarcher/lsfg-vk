@@ -1121,7 +1121,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         const float solve = lsfgvk::gui::g_guiState.latencyGenSolveMs.load();
                         const float scan = lsfgvk::gui::g_guiState.latencyScanMs.load();
                         if (ipc > 0 || solve > 0 || scan > 0)
-                            std::snprintf(lat, sizeof(lat), "%.1f+%.1f+%.1fms",
+                            /* S40 labels: I=IPC(ms) G=GEN-solve S=SCAN */
+                            std::snprintf(lat, sizeof(lat), "I%.1fG%.1fS%.1f",
                                 static_cast<double>(ipc), static_cast<double>(solve),
                                 static_cast<double>(scan));
                         // Opt-in experience row (LSFGVK_LATENCY_HUD=experience|all):
@@ -1141,18 +1142,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             const float p99 = lsfgvk::gui::g_guiState.
                                 inputLatencyP99Ms.load();
                             if (genExtra != 0.0f)
-                                std::snprintf(lat, sizeof(lat), "%.1f+%.1f+%.1f E%+.1f",
+                                std::snprintf(lat, sizeof(lat), "I%.1fG%.1fS%.1f E%+.1f",
                                     static_cast<double>(ipc), static_cast<double>(solve),
                                     static_cast<double>(scan),
                                     static_cast<double>(genExtra));
                             else
-                                std::snprintf(lat, sizeof(lat), "%.1f+%.1f+%.1f E--",
+                                std::snprintf(lat, sizeof(lat), "I%.1fG%.1fS%.1f E--",
                                     static_cast<double>(ipc), static_cast<double>(solve),
                                     static_cast<double>(scan));
                             (void)p50; (void)p99; // click→photon row rides step 4 calibration
                         }
-                        hud->update(std::to_string(gameFps) + "/" + std::to_string(presentedFps),
-                            lat);
+                        /* S40: labeled rows — 'FPS a/b' = game/presented;
+                           second row labels each segment (I=IPC G=GEN
+                           S=SCAN) + 'E' = GEN adds, dashes until live. */
+                        hud->update("FPS " + std::to_string(gameFps)
+                            + "/" + std::to_string(presentedFps), lat);
                     }
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk-app: hud update failed: " << e.what() << "\n";

@@ -68,7 +68,35 @@ namespace {
         default: return false;
         }
     }
+    /// generic 5x7 bitmap glyphs (bit4 = leftmost pixel) for HUD labels
+    struct Glyph57 { uint8_t rows[7]; };
+    constexpr Glyph57 kGlyphs[]{
+        {{0x1F,0x10,0x1E,0x10,0x10,0x10,0x10}}, // F
+        {{0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}}, // P
+        {{0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}}, // S
+        {{0x10,0x10,0x10,0x10,0x10,0x10,0x1F}}, // L
+        {{0x1F,0x04,0x04,0x04,0x04,0x04,0x1F}}, // I
+        {{0x0E,0x11,0x10,0x17,0x11,0x11,0x0E}}, // G
+        {{0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}}, // C
+        {{0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}}, // D
+        {{0x11,0x1B,0x15,0x15,0x11,0x11,0x11}}, // M
+        {{0x11,0x19,0x15,0x13,0x11,0x11,0x11}}, // N
+        {{0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}}, // A
+        {{0x02,0x04,0x08,0x10,0x08,0x04,0x02}}, // V
+        {{0x07,0x05,0x05,0x05,0x09,0x0D,0x11}}, // R — approximate
+    };
+    bool labelPixel(char c, int x, int y) {
+        const char* set = "FPSLIGCDMNAV R";
+        for (int i = 0; set[i]; ++i)
+            if (set[i] == c && c != ' ') {
+                const uint8_t row = kGlyphs[i > 12 ? 12 : i].rows[y & 7];
+                return x < 5 && ((row >> (4 - x)) & 1u) != 0;
+            }
+        return false;
+    }
     bool glyphPixel(char c, int x, int y) {
+        if (c >= 'A' && c <= 'Z')
+            return labelPixel(c, x, y);
         if (c == '.')
             return dotPixel(x, y);
         if (c == '-')
@@ -201,9 +229,14 @@ void Hud::rasterize(std::string_view text, std::vector<uint8_t>& out,
     const uint32_t w = this->boxExtent.width;
     const uint32_t h = this->twoRows ? this->boxExtent.height / 2 : this->boxExtent.height;
     const uint32_t yOff = topHalf ? 0 : this->boxExtent.height / 2;
-    for (uint32_t i = 0; i < static_cast<uint32_t>(out.size() / 4); ++i)
-        storePxl(this->format, out.data() + static_cast<size_t>(i) * 4,
-            kBox[0], kBox[1], kBox[2]);
+    /* S40 FIX: clear ONLY this row's half — the old loop wiped the whole
+       box each call, so the second rasterize() erased the fps row (the
+       overlay showed latency digits only and the fps row read 'empty'). */
+    for (uint32_t y = yOff; y < yOff + h; ++y)
+        for (uint32_t x = 0; x < w; ++x)
+            storePxl(this->format,
+                out.data() + (static_cast<size_t>(y) * w + x) * 4,
+                kBox[0], kBox[1], kBox[2]);
 
     const uint32_t len = text.empty() ? 1 : static_cast<uint32_t>(text.size());
     // fit the text into the fixed box: scale down for longer texts, never
