@@ -4,6 +4,7 @@ set(APP_SOURCES
     "src/stream.cpp"
     "src/presentation.cpp"
     "src/hud.cpp"
+    "src/imgui_hud.cpp"
     "src/wsi/backend_x11.cpp"
     "src/wsi/backend_wayland.cpp")
 
@@ -14,7 +15,12 @@ add_executable(lsfg-vk-app ${APP_SOURCES})
 # exchange layout, import the game's staging images and open real cross-device
 # frame-generation contexts (wsi/output still belong to later tasks).
 target_link_libraries(lsfg-vk-app
-    PUBLIC lsfg-vk-common lsfg-vk-backend imgui)
+    PUBLIC lsfg-vk-common lsfg-vk-backend imgui imgui_vk)
+# imgui_vk (and imgui_hud's PFN calls) hit the REAL vulkan loader — the app's
+# own dispatch is dlopen-based, and the loader here is the standard one this
+# box's RADV/mangohud already use (this does NOT redirect the app's exchange
+# traffic: the device objects arrive pre-made from main.cpp's vk::Vulkan).
+target_link_libraries(lsfg-vk-app PUBLIC ${CMAKE_DL_LIBS} vulkan)
 
 # X11/xcb (task 7a): the SurfaceBackend X11 implementation links the xcb and
 # xcb-randr client libraries. Declared here so the build fails loudly if the

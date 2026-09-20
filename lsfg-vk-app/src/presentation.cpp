@@ -23,6 +23,19 @@
 #include "gui.hpp"
 
 #include "lsfg-vk-app/hud.hpp"
+#include "lsfg-vk-app/imgui_hud.hpp"
+#include <csignal>
+
+/* S40+ Phase A: dear imgui overlay. picks up the same swapchain extent +
+ * format as the legacy hud; ticked from the stats interval; toggled by
+ * SIGUSR1 (fade). hidden = no NewFrame/no blit — present cost zero.
+ * These live at file scope (signal handler + function-scope extern rules). */
+static ls::hud::ImGuiHud* g_imguiHud{ nullptr };
+static std::atomic<bool> g_imguiInitDone{ false };
+static volatile std::sig_atomic_t g_imguiToggleReq{ 0 };
+static void installImguiToggle() {
+std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
+}
 #include "lsfg-vk-app/wsi/surface_backend.hpp"
 
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -837,6 +850,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 static_cast<VkFormat>(g_overlay.imageFormat));
     };
 
+
+
     struct SwapchainGuard {
         const vk::Vulkan* vk;
         bool* drop;
@@ -975,8 +990,43 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // TRANSFER_DST_OPTIMAL with in-flight write access, and is left in that same
     // layout so the caller's post barrier transitions it to PRESENT_SRC.
     auto drawHud = [&](vk::CommandBuffer& cb, VkImage dstImage) {
+        // S40+ imgui first (top-most card); cheap no-op when hidden.
+        if (g_imguiHud && ls::hud::ImGuiHud::drawing()) {
+            const VkImage srcImg = g_imguiHud->rtImage();
+            const VkExtent2D b = g_imguiHud->rtExtent();
+            const auto o = g_imguiHud->origin();
+            const VkImageMemoryBarrier sBar = makeBlitBarrier(srcImg,
+                g_imguiHud->lastAccess(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            const VkImageMemoryBarrier dB = makeBlitBarrier(dstImage,
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            const VkImageMemoryBarrier bars[2] = { sBar, dB };
+            vk.df().CmdPipelineBarrier(cb.raw(),
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                0, nullptr, 0, nullptr, 2, bars);
+            const VkImageBlit bl{
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0,0,1 },
+                .srcOffsets = {
+                    { 0, 0, 0 },
+                    { static_cast<int32_t>(b.width), static_cast<int32_t>(b.height), 1 } },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0,0,1 },
+                .dstOffsets = {
+                    { o.x, o.y, 0 },
+                    { o.x + static_cast<int32_t>(b.width),
+                      o.y + static_cast<int32_t>(b.height), 1 } },
+            };
+            vk.df().CmdBlitImage(cb.raw(), srcImg,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dstImage,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &bl, VK_FILTER_LINEAR);
+            g_imguiHud->markRead();
+        }
         if (!hud)
-            return;
+            return;   /* legacy seven-seg blits only in LSFGVK_HUD=minimal */
         const VkImage hudImage = hud->image().handle();
         const VkImageMemoryBarrier hudBarrier = makeBlitBarrier(hudImage,
             hud->lastAccess(), VK_IMAGE_LAYOUT_GENERAL,
@@ -1169,6 +1219,33 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     }
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk-app: hud update failed: " << e.what() << "\n";
+                }
+            }
+            /* S40+ imgui overlay tick: publish the freshest numbers first —
+               the widget content changes every state change while the render
+               stays 15 Hz (frame pacing inside imgui_hud's own dt). */
+            if (g_imguiHud) {
+                ls::hud::ImGuiHud::Stats st{};
+                st.gameFps = static_cast<float>(gameFps);
+                st.presentedFps = static_cast<float>(presentedFps);
+                st.ipcMs = lsfgvk::gui::g_guiState.latencyIpcMs.load();
+                st.genMs = lsfgvk::gui::g_guiState.latencyGenSolveMs.load();
+                st.scanMs = lsfgvk::gui::g_guiState.latencyScanMs.load();
+                st.genExtraMs = lsfgvk::gui::g_guiState.latencyGenExtraMs.load();
+                st.genExtraLive = st.genExtraMs != 0.0f;
+                // click->photon rows are probe-session live values from the
+                // dual-shm ledger (imgui_hud reads them directly); publish
+                // the frame times ring from REAL/GEN present MEASURED rows.
+                ls::hud::ImGuiHud::publish(st);
+                try {
+                    if (g_imguiToggleReq != 0) {
+                        g_imguiToggleReq = 0;
+                        ls::hud::ImGuiHud::toggle();
+                    }
+                    g_imguiHud->tick(static_cast<float>(dt));
+                } catch (const std::exception& e) {
+                    std::cerr << "lsfg-vk-app: imgui hud tick failed: "
+                              << e.what() << "\n";
                 }
             }
             statsLastTime = now;
@@ -1391,7 +1468,31 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             ensureOverlayWsi();
                             swapchain = g_overlay.swapchain;
                             extent = g_overlay.extent;
-                            makeHud();
+                            /* S40+ default: imgui overlay shows; the legacy
+                               seven-segment renders only when asked via
+                               LSFGVK_HUD=minimal (or when imgui failed). */
+                            static const int hudMode = [] {
+                                const char* e = getenv("LSFGVK_HUD");
+                                return (e && std::strcmp(e, "minimal") == 0) ? 1 : 0;
+                            }();
+                            if (hudMode == 1)
+                                makeHud();
+                            /* S40+ Phase A imgui overlay (per-process,
+                               survives stream teardown): create once. */
+                            if (!g_imguiInitDone.exchange(true)) {
+                                try {
+                                    static ls::hud::ImGuiHud hudInst{ vk,
+                                        extent, static_cast<VkFormat>(
+                                            g_overlay.imageFormat) };
+                                    g_imguiHud = &hudInst;
+                                    installImguiToggle();
+                                } catch (const std::exception& e) {
+                                    g_imguiInitDone.store(false);
+                                    std::cerr << "lsfg-vk-app: imgui overlay "
+                                              << "init failed: " << e.what()
+                                              << "\n";
+                                }
+                            }
                         }
                         cur.active = true;
                         cur.nextDest = 0;
