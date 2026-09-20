@@ -157,7 +157,9 @@ namespace ls::hud {
             FILE* f = fopen(cand, "rb");
             if (!f) continue;
             fclose(f);
-            const float sz = 16.0f * static_cast<float>(this->baseScale);
+            /* S40+ unobtrusive pass: 16 px * (H/1080) ≈ 13 px @1440p — small,
+           readable, does not sit on the crosshair. */
+        const float sz = 16.0f * static_cast<float>(this->baseScale) * 0.5f;
             ImGui::GetIO().Fonts->AddFontFromFileTTF(cand, sz, &fc);
             fontLoaded = true;
             break;
@@ -285,8 +287,8 @@ namespace ls::hud {
         ImGui::SetNextWindowPos(ImVec2(
             static_cast<float>(this->rtSize.width) - 12.f, 12.f),
             ImGuiCond_Always, ImVec2(1.f, 0.f));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.f, 10.f));
-        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6.f, 5.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(6.f, 5.f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.f, 2.f));
         ImGui::PushStyleVar(ImGuiStyleVar_ScrollbarSize, 0.f);
         ImGui::PushStyleColor(ImGuiCol_ScrollbarBg, ImVec4(0,0,0,0));
         ImGui::Begin("lsfg-vk", nullptr,
@@ -297,14 +299,14 @@ namespace ls::hud {
             ImGuiWindowFlags_NoNav);
         // FPS table: label dim-left, value white-right (tabular alignment)
         ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "game");
-        ImGui::SameLine(110.f);
+        ImGui::SameLine(56.f);
         ImGui::TextUnformatted("fps");
-        ImGui::SameLine(150.f);
+        ImGui::SameLine(78.f);
         ImGui::Text("%u", static_cast<unsigned>(std::lround(s.gameFps)));
         ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "doubled");
-        ImGui::SameLine(110.f);
+        ImGui::SameLine(56.f);
         ImGui::TextUnformatted("fps");
-        ImGui::SameLine(150.f);
+        ImGui::SameLine(78.f);
         if (s.presentedFps > s.gameFps + 1.f)
             ImGui::Text("%u  (2x)", static_cast<unsigned>(std::lround(s.presentedFps)));
         else
@@ -312,14 +314,13 @@ namespace ls::hud {
         // frametime sparkline, fixed y-range (0..25 ms) — the shape can't lie
         if (s.frameTimesCount > 2) {
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "frametime");
-            ImGui::SameLine(150.f);
-            ImGui::TextDisabled("ms");
+            ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f),
+                "frametime (ms)");
             ImGui::PlotLines("##ft", s.frameTimesMs,
                 static_cast<int>(s.frameTimesCount),
                 static_cast<int>(s.frameTimesIdx % 180),
                 nullptr, 0.f, 25.f,
-                ImVec2(196.f, 34.f));
+                ImVec2(84.f, 15.f));
         }
         // click->photon percentiles from the live ring (dash while empty)
         ImGui::Spacing();
@@ -331,10 +332,10 @@ namespace ls::hud {
             const float p50 = ls[s.latencySamplesCount / 2];
             const float p99 = ls[static_cast<uint32_t>(
                 std::min<uint32_t>(255, s.latencySamplesCount * 99 / 100))];
-            ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "latency");
-            ImGui::SameLine(150.f);
-            ImGui::TextDisabled("ms");
-            ImGui::Text("p50 %.2f   p99 %.2f",
+            ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f),
+                "latency");
+            ImGui::SameLine();
+            ImGui::Text("p50 %.1f p99 %.1f",
                 static_cast<double>(p50), static_cast<double>(p99));
         }
         // pipeline segments (I=ipc G=gen S=scan E=GEN adds), fixed 4 slots
