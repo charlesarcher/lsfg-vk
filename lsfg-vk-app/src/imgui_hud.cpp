@@ -447,12 +447,33 @@ void ImGuiHud::setupThemeAndFont() {
             pfn(vk.dev(), this->dumpMemory, 0, VK_WHOLE_SIZE, 0,
                 reinterpret_cast<void**>(&p));
         if (p) {
+            /* DIAG: host-fill first 16 B 0x50 to test the map */
+            std::memset(p, 0x50, 16);
+
             for (uint32_t y = 0; y < this->rtSize.height; ++y)
                 fwrite(p + y * this->rtSize.width * 4, 1,
                     this->rtSize.width * 4, f);
         }
         fclose(f);
         std::fprintf(stderr, "imgui_hud: dumped /tmp/imgui_pm.pam\n");
+        if (this->dumpMemory2) {
+            FILE* f2 = fopen("/tmp/imgui_src.pam", "wb");
+            if (f2) {
+                std::fprintf(f2, "P7\nWIDTH %u\nHEIGHT %u\nDEPTH 4\n"
+                    "MAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
+                    this->rtSize.width, this->rtSize.height);
+                uint8_t* p2 = nullptr;
+                if (auto pfn = devPfn<PFN_vkMapMemory>(vk, "vkMapMemory"); pfn)
+                    pfn(vk.dev(), this->dumpMemory2, 0, VK_WHOLE_SIZE, 0,
+                        reinterpret_cast<void**>(&p2));
+                if (p2)
+                    for (uint32_t y = 0; y < this->rtSize.height; ++y)
+                        fwrite(p2 + y * this->rtSize.width * 4, 1,
+                            this->rtSize.width * 4, f2);
+                fclose(f2);
+            }
+            std::fprintf(stderr, "imgui_hud: dumped /tmp/imgui_src.pam\n");
+        }
         this->dumpPending = false;
     }
     void ImGuiHud::tick(float dt) {
@@ -472,9 +493,20 @@ void ImGuiHud::setupThemeAndFont() {
         ImGui::NewFrame();
         this->drawWidgets(latest());
         ImGui::Render();
+        static const bool dumpPm2 = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
+        if (dumpPm2)
+            std::fprintf(stderr, "imgui_hud: drawdata vtx=%d idx=%d\n",
+                ImGui::GetDrawData()->TotalVtxCount,
+                ImGui::GetDrawData()->TotalIdxCount);
         // ---- record RT renderpass + imgui vertices ------------------------
         this->cmdbuf.begin(this->vk);
-        VkClearValue clear{ .color = { .float32 = { 0.f, 0.f, 0.f, 0.f } } };
+        /* DIAG: when dumping, the clear proves the copy path with RED */
+        static const bool dumpRed = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
+        VkClearValue clear{};
+        if (dumpRed) {
+            clear.color.float32[0] = 1.f;
+            clear.color.float32[3] = 1.f;
+        }
         VkRenderPassBeginInfo rbi{
             .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
             .renderPass = this->renderpass,
@@ -491,7 +523,7 @@ void ImGuiHud::setupThemeAndFont() {
         /* S40+ PM pass: rt[active] holds straight-alpha imgui output; render
            the PREMULTIPLIED copy into rt[other] with the pm pipeline. The
            present-side blit samples rt[other] (markRead swaps the roles). */
-        const bool pmOn = true;   /* S40 DIAG-B: PM on, dump off */
+        const bool pmOn = false;  /* S40: PM disabled; StraightAlpha path */
         if (pmOn) {
             /* sample the slot THIS tick's imgui pass just wrote (=next) */
             const uint8_t srcSlot = next;   /* next == imgui output of now */
@@ -537,7 +569,6 @@ void ImGuiHud::setupThemeAndFont() {
             if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
                 erp(this->cmdbuf.raw());
         }
-        this->cmdbuf.end(this->vk);
         /* S40+ DIAG dump: LSFGVK_IMGUI_DUMP=1 writes the PM image once. */
         static const bool dumpPm = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
         if (dumpPm && !this->dumpedPmImage) {
@@ -570,10 +601,14 @@ void ImGuiHud::setupThemeAndFont() {
                 }
             mai.memoryTypeIndex = mi;
             VkDeviceMemory mem{ VK_NULL_HANDLE };
+            VkResult aRes = VK_RESULT_MAX_ENUM;
             if (auto pfn = devPfn<PFN_vkAllocateMemory>(vk, "vkAllocateMemory"); pfn)
-                pfn(vk.dev(), &mai, nullptr, &mem);
+                aRes = pfn(vk.dev(), &mai, nullptr, &mem);
+            VkResult bRes = VK_RESULT_MAX_ENUM;
             if (auto pfn = devPfn<PFN_vkBindBufferMemory>(vk, "vkBindBufferMemory"); pfn)
-                pfn(vk.dev(), buf, mem, 0);
+                bRes = pfn(vk.dev(), buf, mem, 0);
+            std::fprintf(stderr, "imgui_hud: dump alloc=%d bind=%d type=%u\n",
+                (int)aRes, (int)bRes, mai.memoryTypeIndex);
             // within the SAME cb (before submit): pm image is
             // SHADER_READ after the PM pass: barrier to TRANSFER_SRC:
             VkImageMemoryBarrier bar = makeImgBarrier(this->pmImg->handle(),
@@ -590,22 +625,54 @@ void ImGuiHud::setupThemeAndFont() {
                 .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
                 .imageOffset = { 0, 0, 0 },
                 .imageExtent = { this->rtSize.width, this->rtSize.height, 1 } };
+            /* DIAG smoke 1: fill the buffer 0xEE to prove host mem */
+            if (auto pfn = devPfn<PFN_vkCmdFillBuffer>(vk, "vkCmdFillBuffer"); pfn)
+                pfn(this->cmdbuf.raw(), buf, 0, VK_WHOLE_SIZE, 0xEEEEEEEE);
             if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
                 pfn(this->cmdbuf.raw(), this->pmImg->handle(),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
+            /* second copy: the straight-alpha imgui slot */
+            VkImageMemoryBarrier bar2 = makeImgBarrier(
+                this->rt[next]->handle(),
+                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            if (auto pfn = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier"); pfn)
+                pfn(this->cmdbuf.raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar2);
+            VkBufferImageCopy reg2{ .bufferOffset = 0,
+                .bufferRowLength = this->rtSize.width,
+                .bufferImageHeight = this->rtSize.height,
+                .imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .imageOffset = { 0, 0, 0 },
+                .imageExtent = { this->rtSize.width, this->rtSize.height, 1 } };
+            VkBuffer buf2{ VK_NULL_HANDLE };
+            VkDeviceMemory mem2{ VK_NULL_HANDLE };
+            if (auto pfn = devPfn<PFN_vkCreateBuffer>(vk, "vkCreateBuffer"); pfn)
+                pfn(vk.dev(), &bci, nullptr, &buf2);
+            if (auto pfn = devPfn<PFN_vkAllocateMemory>(vk, "vkAllocateMemory"); pfn)
+                pfn(vk.dev(), &mai, nullptr, &mem2);
+            if (auto pfn = devPfn<PFN_vkBindBufferMemory>(vk, "vkBindBufferMemory"); pfn)
+                pfn(vk.dev(), buf2, mem2, 0);
+            if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
+                pfn(this->cmdbuf.raw(), this->rt[next]->handle(),
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf2, 1, &reg2);
+            this->dumpBuffer2 = buf2;
+            this->dumpMemory2 = mem2;
             this->dumpedPmImage = true;
             // read after the fence below:
             this->dumpBuffer = buf;
             this->dumpMemory = mem;
             this->dumpPending = true;
         }
+        this->cmdbuf.end(this->vk);
         this->cmdbuf.submit(this->vk, {}, VK_NULL_HANDLE, 0,
             {}, VK_NULL_HANDLE, 0, fence.handle());
         this->rtFenceSignaled[next] = true;
         this->rtGeneral[next] = true;
         this->rtLastAccess[next] = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         this->active = next;
-        this->pmLastAccess = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     }
 
     void ImGuiHud::drawWidgets(const Stats& s) {
@@ -710,13 +777,13 @@ void ImGuiHud::setupThemeAndFont() {
     }
 
     VkImage ImGuiHud::rtImage() const {
-        /* S40: present the PREMULTIPLIED card (pmImg) */
-        return this->pmImg->handle();
+        /* S40: straight-alpha path (PM disabled) */
+        return this->rt[this->active]->handle();
     }
     VkExtent2D ImGuiHud::rtExtent() const { return this->rtSize; }
     float ImGuiHud::blitAlpha() const { return g_alpha.load(); }
-    VkAccessFlags ImGuiHud::lastAccess() const { return this->pmLastAccess; }
-    void ImGuiHud::markRead() { this->pmLastAccess = VK_ACCESS_TRANSFER_READ_BIT; }
+    VkAccessFlags ImGuiHud::lastAccess() const { return this->rtLastAccess[this->active]; }
+    void ImGuiHud::markRead() { this->rtLastAccess[this->active] = VK_ACCESS_TRANSFER_READ_BIT; }
     ImGuiHud::Origin ImGuiHud::origin() const {
         return Origin {
             static_cast<int32_t>(this->outExtent.width) -

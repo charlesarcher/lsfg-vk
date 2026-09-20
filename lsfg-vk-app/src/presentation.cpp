@@ -731,6 +731,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         compositingAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
     else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
         compositingAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
+    std::fprintf(stderr, "lsfg-vk-app: overlay compositeAlpha=0x%x (supported=0x%x)\n",
+        (unsigned)compositingAlpha, (unsigned)caps.supportedCompositeAlpha);
 
     // Overlay present must not be FIFO-paced at compositor-throttled ~20 Hz.
     // MAILBOX (else IMMEDIATE) matches Windows LS: the secondary GPU presents as fast

@@ -123,6 +123,8 @@ namespace ls::hud {
         bool dumpedPmImage{false}, dumpPending{false};
         VkBuffer dumpBuffer{VK_NULL_HANDLE};
         VkDeviceMemory dumpMemory{VK_NULL_HANDLE};
+        VkBuffer dumpBuffer2{VK_NULL_HANDLE};
+        VkDeviceMemory dumpMemory2{VK_NULL_HANDLE};
         void hostDump();   /* after fence: map + write /tmp/pm.pam */
         void buildPmPass();
     };
