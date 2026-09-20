@@ -255,6 +255,7 @@ namespace ls::hud {
             .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
             .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE };
+        std::fprintf(stderr, "imgui_hud: bco1 sampler\n");
         PFN_vkCreateSampler cSamp = devPfn<PFN_vkCreateSampler>(vk, "vkCreateSampler");
         if (!cSamp || cSamp(vk.dev(), &sci, nullptr, &this->pmSampler) != VK_SUCCESS)
             throw ls::error("imgui_hud: PM sampler failed");
@@ -272,6 +273,7 @@ namespace ls::hud {
         VkDescriptorSetLayoutCreateInfo dsl{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             .bindingCount = 1, .pBindings = &b };
+        std::fprintf(stderr, "imgui_hud: bco2 desc-layout\n");
         PFN_vkCreateDescriptorSetLayout cDsl = devPfn<PFN_vkCreateDescriptorSetLayout>(vk, "vkCreateDescriptorSetLayout");
         VkDescriptorSetLayout layout{};
         if (!cDsl || cDsl(vk.dev(), &dsl, nullptr, &layout) != VK_SUCCESS)
@@ -283,6 +285,7 @@ namespace ls::hud {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             .setLayoutCount = 1, .pSetLayouts = &layout,
             .pushConstantRangeCount = 1, .pPushConstantRanges = &pc };
+        std::fprintf(stderr, "imgui_hud: bco3 pipe-layout\n");
         PFN_vkCreatePipelineLayout cPl = devPfn<PFN_vkCreatePipelineLayout>(vk, "vkCreatePipelineLayout");
         if (!cPl || cPl(vk.dev(), &plci, nullptr, &this->pmPipelineLayout) != VK_SUCCESS)
             throw ls::error("imgui_hud: PM pipeline layout failed");
@@ -290,6 +293,7 @@ namespace ls::hud {
            for descriptor alloc below.) */
         this->pmSetLayout = layout;
         VkShaderModule vs{}, fs{};
+        std::fprintf(stderr, "imgui_hud: bco5 shaders\n");
         PFN_vkCreateShaderModule cSm = devPfn<PFN_vkCreateShaderModule>(vk, "vkCreateShaderModule");
         VkShaderModuleCreateInfo sm{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
         sm.codeSize = sizeof(pmVert); sm.pCode = pmVert;
@@ -344,6 +348,7 @@ namespace ls::hud {
             .pColorBlendState = &cb, .pDynamicState = &dy,
             .layout = this->pmPipelineLayout,
             .renderPass = this->renderpass, .subpass = 0 };
+        std::fprintf(stderr, "imgui_hud: bco7 gpipelines\n");
         PFN_vkCreateGraphicsPipelines cGp = devPfn<PFN_vkCreateGraphicsPipelines>(vk, "vkCreateGraphicsPipelines");
         VkPipeline pipe{};
         VkResult res = cGp ? cGp(vk.dev(), VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe)
@@ -374,6 +379,7 @@ namespace ls::hud {
         VkDescriptorPoolCreateInfo pool{
             .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
             .maxSets = 2, .poolSizeCount = 1, .pPoolSizes = &poolSize };
+        std::fprintf(stderr, "imgui_hud: bco4 desc-pool\n");
         PFN_vkCreateDescriptorPool cDp = devPfn<PFN_vkCreateDescriptorPool>(vk, "vkCreateDescriptorPool");
         if (!cDp || cDp(vk.dev(), &pool, nullptr, &this->pmPool) != VK_SUCCESS)
             throw ls::error("imgui_hud: PM descriptor pool failed");
@@ -489,6 +495,127 @@ namespace ls::hud {
             if (cUp) cUp(vk.dev(), 1, &w, 0, nullptr);
             this->coSet2[i] = set;
         }
+        /* S41 DIAG: LSFGVK_CO_TEAL=1 points the sets at a teal diag
+           image instead of the RT — bisects plumbing vs rt content. */
+        static const bool tealDiag = getenv("LSFGVK_CO_TEAL") != nullptr;
+        if (tealDiag) {
+            VkImageCreateInfo ici{
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = VK_FORMAT_B8G8R8A8_UNORM,
+                .extent = { 8, 8, 1 },
+                .mipLevels = 1, .arrayLayers = 1,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                         VK_IMAGE_USAGE_TRANSFER_DST_BIT };
+            PFN_vkCreateImage cIm = devPfn<PFN_vkCreateImage>(vk, "vkCreateImage");
+            VkImage img{};
+            if (cIm && cIm(vk.dev(), &ici, nullptr, &img) == VK_SUCCESS) {
+                VkMemoryRequirements mrq{};
+                PFN_vkGetImageMemoryRequirements gmrq =
+                    devPfn<PFN_vkGetImageMemoryRequirements>(vk, "vkGetImageMemoryRequirements");
+                gmrq(vk.dev(), img, &mrq);
+                VkPhysicalDeviceMemoryProperties mp{};
+                PFN_vkGetPhysicalDeviceMemoryProperties gmp =
+                    devPfn<PFN_vkGetPhysicalDeviceMemoryProperties>(vk, "vkGetPhysicalDeviceMemoryProperties");
+                gmp(vk.physdev(), &mp);
+                uint32_t memIdx = 0;
+                for (uint32_t t = 0; t < mp.memoryTypeCount; ++t)
+                    if ((mrq.memoryTypeBits & (1u << t)) &&
+                        (mp.memoryTypes[t].propertyFlags &
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { memIdx = t; break; }
+                VkMemoryAllocateInfo mai2{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                    .allocationSize = mrq.size, .memoryTypeIndex = memIdx };
+                VkDeviceMemory mem{};
+                PFN_vkAllocateMemory cMem = devPfn<PFN_vkAllocateMemory>(vk, "vkAllocateMemory");
+                if (cMem && cMem(vk.dev(), &mai2, nullptr, &mem) == VK_SUCCESS) {
+                    PFN_vkBindImageMemory bIm =
+                        devPfn<PFN_vkBindImageMemory>(vk, "vkBindImageMemory");
+                    bIm(vk.dev(), img, mem, 0);
+                    VkImageViewCreateInfo vci{
+                        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                        .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                        .format = VK_FORMAT_B8G8R8A8_UNORM,
+                        .subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 } };
+                    VkImageView v{};
+                    PFN_vkCreateImageView cIv2 = devPfn<PFN_vkCreateImageView>(vk, "vkCreateImageView");
+                    if (cIv2 && cIv2(vk.dev(), &vci, nullptr, &v) == VK_SUCCESS) {
+                        /* upload CELESTE teal (64,224,208) — fill via a
+                           small cb: ClearColorImage */
+                        VkClearColorValue cc{ .float32 = { 0.25f, 0.88f, 0.81f, 1.f } };
+                        VkImageSubresourceRange rr{
+                            VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                        VkCommandPoolCreateInfo pciT{
+                            .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                            .queueFamilyIndex = 0u };
+                        VkCommandPool lpVkCmdPool{ VK_NULL_HANDLE };
+                        PFN_vkCreateCommandPool cplT =
+                            devPfn<PFN_vkCreateCommandPool>(vk, "vkCreateCommandPool");
+                        bool poolOk = cplT && cplT(vk.dev(), &pciT, nullptr,
+                            &lpVkCmdPool) == VK_SUCCESS;
+                        VkCommandBufferAllocateInfo cai{
+                            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                            .commandPool = lpVkCmdPool,
+                            .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                            .commandBufferCount = 1 };
+                        (void)cai;
+                        VkCommandBuffer xcb{ VK_NULL_HANDLE };
+                        PFN_vkAllocateCommandBuffers acb =
+                            devPfn<PFN_vkAllocateCommandBuffers>(vk, "vkAllocateCommandBuffers");
+                        if (poolOk && acb(vk.dev(), &cai, &xcb) == VK_SUCCESS) {
+                            VkCommandBufferBeginInfo bi{
+                                .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+                            PFN_vkBeginCommandBuffer bgn =
+                                devPfn<PFN_vkBeginCommandBuffer>(vk, "vkBeginCommandBuffer");
+                            PFN_vkEndCommandBuffer end =
+                                devPfn<PFN_vkEndCommandBuffer>(vk, "vkEndCommandBuffer");
+                            PFN_vkCmdClearColorImage clr =
+                                devPfn<PFN_vkCmdClearColorImage>(vk, "vkCmdClearColorImage");
+                            VkImageMemoryBarrier tb = makeImgBarrier(img,
+                                VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                            if (bgn && bgn(xcb, &bi) == VK_SUCCESS) {
+                                PFN_vkCmdPipelineBarrier barr =
+                                    devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier");
+                                barr(xcb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &tb);
+                                clr(xcb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &cc, 1, &rr);
+                                VkImageMemoryBarrier tb2 = makeImgBarrier(img,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                                barr(xcb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1, &tb2);
+                                end(xcb);
+                                PFN_vkQueueSubmit qsub =
+                                    devPfn<PFN_vkQueueSubmit>(vk, "vkQueueSubmit");
+                                VkSubmitInfo si{ .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                                si.commandBufferCount = 1; si.pCommandBuffers = &xcb;
+                                qsub(vk.queue(), 1, &si, VK_NULL_HANDLE);
+                                PFN_vkDeviceWaitIdle dwi =
+                                    devPfn<PFN_vkDeviceWaitIdle>(vk, "vkDeviceWaitIdle");
+                                dwi(vk.dev());
+                            }
+                        }
+                        for (int i2b = 0; i2b < 2; ++i2b) {
+                            VkDescriptorImageInfo diT{
+                                .sampler = this->coSampler, .imageView = v,
+                                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+                            VkWriteDescriptorSet wT{
+                                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                                .dstSet = this->coSet2[i2b], .dstBinding = 0,
+                                .descriptorCount = 1, .pImageInfo = &diT };
+                            PFN_vkUpdateDescriptorSets uT =
+                                devPfn<PFN_vkUpdateDescriptorSets>(vk, "vkUpdateDescriptorSets");
+                            uT(vk.dev(), 1, &wT, 0, nullptr);
+                        }
+                        std::fprintf(stderr,
+                            "imgui_hud: TEAL diag image bound to coSet2\n");
+                    }
+                }
+            }
+        }
         /* shaders (branch-free: sample + alpha does everything) */
         VkShaderModule vs{}, fs{};
         PFN_vkCreateShaderModule cSm =
@@ -584,6 +711,7 @@ namespace ls::hud {
             .attachmentCount = 1, .pAttachments = &color,
             .subpassCount = 1, .pSubpasses = &sub,
             .dependencyCount = 2, .pDependencies = deps };
+        std::fprintf(stderr, "imgui_hud: bco6 renderpass\n");
         PFN_vkCreateRenderPass cRp =
             devPfn<PFN_vkCreateRenderPass>(vk, "vkCreateRenderPass");
         if (!cRp || cRp(vk.dev(), &rci, nullptr, &this->coRenderpass) != VK_SUCCESS)
@@ -602,23 +730,14 @@ namespace ls::hud {
         VkPipeline pipe{};
         VkResult res = cGp ? cGp(vk.dev(), VK_NULL_HANDLE, 1, &gpi, nullptr, &pipe)
                            : VK_ERROR_INITIALIZATION_FAILED;
+        std::fprintf(stderr, "imgui_hud: bco7a first-cGp done\n");
         PFN_vkDestroyShaderModule dSm =
             devPfn<PFN_vkDestroyShaderModule>(vk, "vkDestroyShaderModule");
         if (dSm) { dSm(vk.dev(), vs, nullptr); dSm(vk.dev(), fs, nullptr); }
         if (res != VK_SUCCESS)
             throw ls::error("imgui_hud: card-over graphics pipeline failed");
         this->coPipeline = pipe;
-        /* DIAG2: same pipeline but for the RT renderpass (in-tick draw) */
-        {
-            VkGraphicsPipelineCreateInfo gpi2{gpi};
-            gpi2.renderPass = this->renderpass;
-            VkPipeline pipe2{};
-            VkResult res2 = cGp(vk.dev(), VK_NULL_HANDLE, 1, &gpi2, nullptr, &pipe2);
-            if (res2 == VK_SUCCESS) {
-                this->coDiPipeline = pipe2;
-                std::fprintf(stderr, "imgui_hud: DIAG pipeline built\n");
-            }
-        }
+        std::fprintf(stderr, "imgui_hud: bco8 done\n");
         this->coBuilt = true;
         std::fprintf(stderr, "imgui_hud: card-over built (2-pass in-buffer)\n");
     }
@@ -1000,9 +1119,12 @@ void ImGuiHud::setupThemeAndFont() {
             if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
                 pfn(this->cmdbuf.raw(), this->pmImg->handle(),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
-            /* second copy: the straight-alpha imgui slot */
+            /* second copy: the straight-alpha imgui slot.
+               S41: flips the SAME slot the copy reads (rt[active]
+               — next==active? NO: the copy below reads rt[active];
+               this barrier must target that slot! */
             VkImageMemoryBarrier bar2 = makeImgBarrier(
-                this->rt[next]->handle(),
+                this->rt[this->active]->handle(),
                 VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_ACCESS_TRANSFER_READ_BIT,
