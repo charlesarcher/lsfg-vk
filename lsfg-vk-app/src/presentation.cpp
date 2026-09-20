@@ -1034,16 +1034,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 VK_PIPELINE_STAGE_TRANSFER_BIT,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
                 0, nullptr, 0, nullptr, 2, bars);
+            /* S42d: blit ONLY the card subrect of the RT. The RT outside
+               the imgui window = transparent-black premult (0,0,0,0);
+               under the OPAQUE composite surface those pixels present
+               as opaque black = the 650x366 "black box" seen in RE2
+               play-test (pixel-verified edges x=1912, y=367). */
+            const int32_t cx0 = 463, cy0 = 13, cx1 = 627, cy1 = 112;
             const VkImageBlit bl{
                 .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0,0,1 },
                 .srcOffsets = {
-                    { 0, 0, 0 },
-                    { static_cast<int32_t>(b.width), static_cast<int32_t>(b.height), 1 } },
+                    { cx0, cy0, 0 },
+                    { cx1, cy1, 1 } },
                 .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0,0,1 },
                 .dstOffsets = {
-                    { o.x, o.y, 0 },
-                    { o.x + static_cast<int32_t>(b.width),
-                      o.y + static_cast<int32_t>(b.height), 1 } },
+                    { o.x + cx0, o.y + cy0, 0 },
+                    { o.x + cx1, o.y + cy1, 1 } },
             };
             vk.df().CmdBlitImage(cb.raw(), srcImg,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, dstImage,
