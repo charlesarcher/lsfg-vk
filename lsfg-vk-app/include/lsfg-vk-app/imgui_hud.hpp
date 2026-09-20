@@ -13,6 +13,7 @@
 #include <string_view>
 #include <memory>
 #include <array>
+#include <deque>
 
 namespace ls::hud {
 
@@ -60,6 +61,13 @@ namespace ls::hud {
         static void toggle();
         /// query whether the overlay is (still) drawing — false stops blits
         [[nodiscard]] static bool drawing();
+
+        /// S40+: blend the card OVER the game frame resident in
+        /// dstImage (premult-OVER with dst.a forced to 1 = no hole).
+        void renderCardOver(class vk::CommandBuffer& cb, VkImage dstImage,
+            VkExtent2D dstExtent);
+        /// the over pipeline is built (safe to call renderCardOver)
+        [[nodiscard]] bool cardOverReady() const { return this->pmBuilt; }
 
         /// render one frame (call at ~15 Hz from the OUTPUT thread):
         /// NewFrame -> widgets -> submit RT upload. cheap when hidden.
@@ -127,6 +135,10 @@ namespace ls::hud {
         VkDeviceMemory dumpMemory2{VK_NULL_HANDLE};
         void hostDump();   /* after fence: map + write /tmp/pm.pam */
         void buildPmPass();
+        struct OverFb { VkImage image; VkImageView view; VkFramebuffer fb; };
+        std::deque<OverFb> overFbs;
+        VkRenderPass overRenderpass{VK_NULL_HANDLE};
+        [[nodiscard]] VkRenderPass buildLoadRenderpass();
     };
 
 } // namespace ls::hud
