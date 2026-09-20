@@ -997,21 +997,24 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         // S40+ card-over: blend the premult card into the game frame.
         // coBlit chooses: co pass (new) vs proven blit (a3501c3) — env-co
         // behaves like: LSFGVK_CO_DISABLE=1 → blit.
+        /* S41: blit is now the default (proven card); the in-buffer
+           card-over stays opt-in via LSFGVK_CO_EXPERIMENT=1 while its
+           present-time sampled-slot reads transparent (S41 C1-C7). */
         static const bool coDisable = [] {
-            const char* e = std::getenv("LSFGVK_CO_DISABLE");
-            return e && e[0] == '1' && !e[1];
+            const char* e = std::getenv("LSFGVK_CO_EXPERIMENT");
+            return !(e && e[0] == '1' && !e[1]);
         }();
         static bool logged = false;
         if (g_imguiHud && !coDisable) {
             if (!logged) { logged = true;
-                std::cerr << "lsfg-vk-app: card-over branch active\n"; }
+                std::cerr << "lsfg-vk-app: card-over experiment active\n"; }
             g_imguiHud->renderCardOver(cb, dstImage, imgExtent);
             return;
         }
         if (g_imguiHud && coDisable) {
             static bool logged2 = false;
             if (!logged2) { logged2 = true;
-                std::cerr << "lsfg-vk-app: blit fallback active\n"; }
+                std::cerr << "lsfg-vk-app: blit HUD active (card verified)\n"; }
         }
         if (g_imguiHud && ls::hud::ImGuiHud::drawing()) {
             const VkImage srcImg = g_imguiHud->rtImage();
@@ -1131,6 +1134,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
                         throw ls::vulkan_error(res, "AcquireNextImageKHR failed");
                     return true;
+                }
+                static int acqSpinN = 0;
+                if ((acqSpinN++ % 240) == 0) {
+                    std::cerr << "lsfg-vk-app: [dbg] acquire spin #"
+                              << acqSpinN << " (no image yet)\n";
                 }
                 processWsiEvents(0);   // may deliver the wl_buffer release
             }
@@ -1522,7 +1530,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                     g_imguiHud = new ls::hud::ImGuiHud{ vk,
                                         extent, static_cast<VkFormat>(
                                             g_overlay.imageFormat) };
-                                    g_imguiHud->buildCardOver();
+                                    /* S41: buildCardOver crashes RADV on the
+                                       clean-rebuilt tree (null dispatch in
+                                       vkCreate chain). Default = don't build;
+                                       opt-in via LSFGVK_CO_EXPERIMENT=1. */
+                                    static const bool coExp = [] {
+                                        const char* e = getenv("LSFGVK_CO_EXPERIMENT");
+                                        return e && e[0] == '1' && !e[1];
+                                    }();
+                                    if (coExp) g_imguiHud->buildCardOver();
                                     installImguiToggle();
                                 } catch (const std::exception& e) {
                                     g_imguiInitDone.store(false);

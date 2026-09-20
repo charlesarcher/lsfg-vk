@@ -719,7 +719,28 @@ namespace ls::hud {
             ss(cb.raw(), 0, 1, &sc);
         /* descriptor = set for the ACTIVE slot (premult card image) */
         static const bool d5Other = ::getenv("LSFGVK_CO_OTHER") != nullptr;
-        VkDescriptorSet set = this->coSet2[d5Other ? (this->active ^ 1) : this->active];
+        static std::atomic<unsigned> frameFlip{0};
+        const bool alt = ::getenv("LSFGVK_CO_ALT") != nullptr
+            && (frameFlip.fetch_add(1) & 1);
+        const uint8_t slot = alt ? (this->active ^ 1)
+            : (d5Other ? (this->active ^ 1) : this->active);
+        VkDescriptorSet set = this->coSet2[slot];
+        /* S41+ seam test: re-write the desc INK per present (static
+           coSet2 may hold a stale/too-early view→ suspect #1). Env:
+           LSFGVK_CO_REUPD=1. */
+        static const bool reupd = ::getenv("LSFGVK_CO_REUPD") != nullptr;
+        if (reupd) {
+            VkDescriptorImageInfo diu{
+                .sampler = this->coSampler,
+                .imageView = this->rt[this->active]->imageview(),
+                .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+            VkWriteDescriptorSet wu{
+                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = set, .dstBinding = 0,
+                .descriptorCount = 1, .pImageInfo = &diu };
+            if (auto up2 = devPfn<PFN_vkUpdateDescriptorSets>(vk, "vkUpdateDescriptorSets"); up2)
+                up2(vk.dev(), 1, &wu, 0, nullptr);
+        }
         if (auto bds = devPfn<PFN_vkCmdBindDescriptorSets>(vk, "vkCmdBindDescriptorSets");
                 bds)
             bds(cb.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -1006,6 +1027,29 @@ void ImGuiHud::setupThemeAndFont() {
             if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
                 pfn(this->cmdbuf.raw(), this->rt[this->active]->handle(),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf2, 1, &reg2);
+            /* S41: FLIP BACK BOTH slots — every dump copy leaves its
+               source in TRANSFER_SRC; the co over-pass samples
+               rt[active] between ticks, so sources must end SHADER-
+               READ or the sample runs in the wrong layout (the
+               blue-ramp era). Covers rt[active] (this copy) AND
+               rt[next] (the earlier dump copy). */
+            VkImageMemoryBarrier backBars[2] = {
+                makeImgBarrier(
+                    this->rt[this->active]->handle(),
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+                makeImgBarrier(
+                    this->rt[next]->handle(),
+                    VK_ACCESS_TRANSFER_READ_BIT,
+                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) };
+            if (auto pfn = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier"); pfn)
+                pfn(this->cmdbuf.raw(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+                    0, nullptr, 0, nullptr, 2, backBars);
             this->dumpBuffer2 = buf2;
             this->dumpMemory2 = mem2;
             // read after the fence below:
