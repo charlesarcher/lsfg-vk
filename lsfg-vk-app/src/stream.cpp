@@ -43,10 +43,28 @@ StreamState::~StreamState() {
     // pointer and aborts the overlay on FurMark swapchain recreate.
     if (this->shmBytes == 0)
         return;
-    static auto* leak = new std::vector<ls::lazy<vk::Image>>;
-    for (auto& im : this->sourceImages)
-        if (im.has_value())
-            leak->push_back(std::move(im));
+    /* S42e OOM fix: the old dtor moved EVERY dead stream's staging
+       into a process-lifetime static vector — a FurMark-recreate
+       workaround that becomes an unbounded leak when a game
+       reconnects repeatedly (RE2 2026-09-20: six kernel OOM kills,
+       swap exhaustion; watchdog + journal evidence). Policy:
+       retain the FIRST stream's images (the RADV FreeMemory aliasing
+       hazard needs at most one retention), free every stream's
+       memfd maps + host buffers beyond that, and let later streams'
+       images destruct normally. */
+    static unsigned retainedStreams = 0;
+    if (retainedStreams == 0) {
+        static auto* leak = new std::vector<ls::lazy<vk::Image>>;
+        for (auto& im : this->sourceImages)
+            if (im.has_value())
+                leak->push_back(std::move(im));
+        retainedStreams = 1;
+        return;
+    }
+    for (auto& m : this->shmMaps)
+        if (m) { ::munmap(m, this->shmBytes + 4096); m = nullptr; }
+    for (auto& h : this->hostPtrs)
+        if (h) { ::free(h); h = nullptr; }
 }
 
 namespace {
