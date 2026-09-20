@@ -745,7 +745,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             modeName = "IMMEDIATE";
         }
     }
-    const uint32_t minImages = caps.minImageCount < 2 ? 3 : caps.minImageCount;
+    /* S40 next-steps lever: LSFGVK_OVERLAY_IMAGES forces the overlay buffer
+       count (2 = shallowest legal: minImageCount floor). Shallow pool trims
+       the REAL present's queued-ahead wait (the ~1-2 ms the traces chased);
+       0/missing = driver default (deep pool). */
+    uint32_t minImages = caps.minImageCount < 2 ? 3 : caps.minImageCount;
+    if (const char* oi = getenv("LSFGVK_OVERLAY_IMAGES"); oi && *oi) {
+        const uint32_t forced{ static_cast<uint32_t>(atoi(oi)) };
+        if (forced >= 2 && forced <= 8)
+            minImages = forced > caps.minImageCount ? forced : caps.minImageCount;
+    }
 
     VkSwapchainCreateInfoKHR ci{};
     ci.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR;
