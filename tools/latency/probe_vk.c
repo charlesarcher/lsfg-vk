@@ -151,8 +151,12 @@ static void* input_thread_fn(void* arg) {
                             printf("click #%u armed @%.3fs\n", totalClicks,
                                 ts.tv_sec % 1000 + ts.tv_nsec / 1e9);
                         }
-                        struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
-                        const uint64_t t0 = ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+                        /* S40 strict A/B: use the KERNEL's evdev stamp
+                           (EVIOCSCLOCKID=CLOCK_MONOTONIC), identical to the
+                           baseline instrument's anchor — not the userspace
+                           read time. */
+                        const uint64_t t0 = (uint64_t)ev[j].time.tv_sec * 1000000000ULL
+                            + (uint64_t)ev[j].time.tv_usec * 1000ULL;
                         unsigned head2 = atomic_load(&g_clickHead);
                         unsigned tail2 = atomic_load(&g_clickTail);
                         unsigned next = (head2 + 1) & 63;
@@ -688,11 +692,19 @@ int main(int argc, char** argv) {
         wl_display_roundtrip(dpy);
         frameSeq++;
         if (frameSeq == 1) printf("render loop ALIVE (first frame presented, slot %u)\n", slot);
-        if (frameSeq % 240 == 0)
-            printf("tick %u clickT=%u ring(tail=%u head=%u) magUntil=%llu\n",
-                frameSeq, nClickT, atomic_load(&g_clickTail),
+        if (frameSeq % 240 == 0) {
+            struct timespec rn; clock_gettime(CLOCK_MONOTONIC, &rn);
+            const uint64_t nowNs = rn.tv_sec * 1000000000ULL + rn.tv_nsec;
+            static uint64_t lastTickNs = 0; static unsigned lastSeq = 0;
+            unsigned latches = 0;
+            for (unsigned k = 0; k < 4; ++k) if (atomic_load(&g_latch[k])) ++latches;
+            const double fps = lastTickNs ? (double)(frameSeq - lastSeq) * 1e9 / (double)(nowNs - lastTickNs) : 0.0;
+            printf("tick %u fps=%.0f latches=%u clickT=%u ring(tail=%u head=%u) magUntil=%llu\n",
+                frameSeq, fps, latches, nClickT, atomic_load(&g_clickTail),
                 atomic_load(&g_clickHead),
                 (unsigned long long)(magentaUntil ? 1u : 0u));
+            lastTickNs = nowNs; lastSeq = frameSeq;
+        }
 
         if (magenta && thisClickT) {
             printf("pair-attempt click%s=%llu\n", "", (unsigned long long)thisClickT);
