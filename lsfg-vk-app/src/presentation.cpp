@@ -1186,8 +1186,23 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             if (now - statsLastTime < statsInterval)
                 return;
             const double dt = std::chrono::duration<double>(now - statsLastTime).count();
-            const uint32_t gameFps = static_cast<uint32_t>(frameCount.exchange(0) / dt);
-            const uint32_t presentedFps = static_cast<uint32_t>(presentedFrames.exchange(0) / dt);
+            /* S42l: fps from the PROCESS-WIDE present atomics, not the
+               per-stream frameCount/presentedFrames. The game recreates
+               its layer context repeatedly (RE2 connected 3× in one
+               session; old streams never notice and never end), so a
+               stale stream's maybeStats kept publishing 0/0 windows
+               (the "oscillating 0/0 ↔ 120/240" report). The atomics are
+               shared by every stream, so a stale publisher computes the
+               same correct value as the live one. */
+            static uint64_t lastReal = lsfgvk::gui::g_guiState.totalRealPresents.load();
+            static uint64_t lastGen = lsfgvk::gui::g_guiState.totalGenPresents.load();
+            const uint64_t nowReal = lsfgvk::gui::g_guiState.totalRealPresents.load();
+            const uint64_t nowGen = lsfgvk::gui::g_guiState.totalGenPresents.load();
+            const uint32_t gameFps = static_cast<uint32_t>(
+                static_cast<double>(nowReal - lastReal) / dt + 0.5);
+            const uint32_t presentedFps = static_cast<uint32_t>(
+                static_cast<double>(nowGen - lastGen) / dt + 0.5);
+            lastReal = nowReal; lastGen = nowGen;
             // S42j: feed the ImGui card directly (the echo publish in
             // maybeHud re-publishes latest() and never carried these).
             ls::hud::ImGuiHud::publishFps(
