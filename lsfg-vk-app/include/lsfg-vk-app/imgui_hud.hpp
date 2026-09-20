@@ -106,6 +106,25 @@ namespace ls::hud {
         float fadeLock{0.f};                     // 0..1 synthesized alpha
         bool visible{true};
         std::string fontPath;
+
+        /* S40+ PM card: sample the straight-alpha RT and emit premultiplied
+           rgb for a PRE_MULTIPLIED overlay swapchain (true see-through). */
+        VkPipelineLayout pmPipelineLayout{VK_NULL_HANDLE};
+        VkPipeline pmPipeline{VK_NULL_HANDLE};
+        VkDescriptorPool pmPool{VK_NULL_HANDLE};
+        VkDescriptorSet pmSet[2]{VK_NULL_HANDLE, VK_NULL_HANDLE};
+        VkDescriptorSetLayout pmSetLayout{VK_NULL_HANDLE};
+        VkSampler pmSampler{VK_NULL_HANDLE};
+        bool pmBuilt{false};
+        std::unique_ptr<vk::Image> pmImg;
+        VkFramebuffer pmFramebuffer{VK_NULL_HANDLE};
+        VkAccessFlags pmLastAccess{VK_ACCESS_NONE};
+        /* diag dump */
+        bool dumpedPmImage{false}, dumpPending{false};
+        VkBuffer dumpBuffer{VK_NULL_HANDLE};
+        VkDeviceMemory dumpMemory{VK_NULL_HANDLE};
+        void hostDump();   /* after fence: map + write /tmp/pm.pam */
+        void buildPmPass();
     };
 
 } // namespace ls::hud

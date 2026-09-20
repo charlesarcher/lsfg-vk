@@ -720,13 +720,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                          : colorspaces.front();
 
     // --- pick a compositing alpha: OPAQUE, else PRE/POST_MULTIPLIED.
+    /* S40+: the imgui overlay card is semi-transparent (WindowBg alpha
+       ~0.40); the RT keeps per-pixel alpha and the blit copies it into the
+       swapchain — the compositor needs a premultiplied-alpha surface to
+       blend the card over the game. PRE_MULTIPLIED now PREFERRED whenever
+       supported (KWin layer-shell supports it); OPAQUE stays the legal
+       fallback (card renders as its cpu-y 40%-brightness color there). */
     VkCompositeAlphaFlagBitsKHR compositingAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    if (!(caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)) {
-        if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
-            compositingAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
-        else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
-            compositingAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
-    }
+    if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR)
+        compositingAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    else if (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)
+        compositingAlpha = VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
 
     // Overlay present must not be FIFO-paced at compositor-throttled ~20 Hz.
     // MAILBOX (else IMMEDIATE) matches Windows LS: the secondary GPU presents as fast
@@ -1242,7 +1246,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         g_imguiToggleReq = 0;
                         ls::hud::ImGuiHud::toggle();
                     }
-                    g_imguiHud->tick(static_cast<float>(dt));
+                    if (g_imguiHud)
+                        g_imguiHud->tick(static_cast<float>(dt));
                 } catch (const std::exception& e) {
                     std::cerr << "lsfg-vk-app: imgui hud tick failed: "
                               << e.what() << "\n";
@@ -1496,10 +1501,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                survives stream teardown): create once. */
                             if (!g_imguiInitDone.exchange(true)) {
                                 try {
-                                    static ls::hud::ImGuiHud hudInst{ vk,
+                                    g_imguiHud = new ls::hud::ImGuiHud{ vk,
                                         extent, static_cast<VkFormat>(
                                             g_overlay.imageFormat) };
-                                    g_imguiHud = &hudInst;
                                     installImguiToggle();
                                 } catch (const std::exception& e) {
                                     g_imguiInitDone.store(false);
@@ -2418,6 +2422,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::lock_guard<std::mutex> lk(submitMtx);
         vk.df().DeviceWaitIdle(vk.dev());
     }
+    /* S40+ FIX: the imgui card owns VkObjects tied to the STREAM
+       (rt/swapchain formats, the vk::Vulkan ref). The old function-static
+       survived a stream restart pointing at freed assets = RADV SEGV on
+       tick 2 of a fresh stream. Reset both gates so the next stream
+       builds a freshfad ImGuiHud. */
+    delete g_imguiHud;
+    g_imguiHud = nullptr;
+    g_imguiInitDone.store(false);
     if (inputError)
         std::rethrow_exception(inputError);
     if (outputError)
