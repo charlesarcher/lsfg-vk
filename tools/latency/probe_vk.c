@@ -35,6 +35,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -131,6 +132,7 @@ static _Atomic unsigned g_clickTail = 0;  /* reader index */
 static uint64_t g_clickRing[64];
 static pthread_mutex_t g_clickMtx = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int g_inRun = 1;
+static _Atomic int g_esc = 0;      /* S40+: user ESC = user kill switch */
 
 static void* input_thread_fn(void* arg) {
     (void)arg;
@@ -138,6 +140,35 @@ static void* input_thread_fn(void* arg) {
     for (int i = 0; i < g_inNfd; ++i) { pfd[i].fd = g_inFds[i]; pfd[i].events = POLLIN; }
     struct input_event ev[64];
     while (atomic_load(&g_inRun)) {
+        /* S40+: re-glob every ~2 s — later-spawned devices (uclick's
+           dedicated key uinput node, hotplug) must become readable or
+           the ESC kill switch never sees its events. No more than 64. */
+        static unsigned reglobCount = 0;
+        if ((++reglobCount % 8u) == 0 && g_inNfd < 60) {
+            glob_t gr;
+            if (glob("/dev/input/event*", 0, nullptr, &gr) == 0) {
+                for (size_t q = 0; q < gr.gl_pathc && g_inNfd < 62; ++q) {
+                    struct stat st;
+                    if (stat(gr.gl_pathv[q], &st) != 0) continue;
+                    bool have = false;
+                    for (int e = 0; e < g_inNfd; ++e) {
+                        struct stat se;
+                        if (fstat(g_inFds[e], &se) == 0 &&
+                            se.st_dev == st.st_dev &&
+                            se.st_ino == st.st_ino) { have = true; break; }
+                    }
+                    if (have) continue;
+                    int fd = open(gr.gl_pathv[q],
+                        O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+                    if (fd >= 0) {
+                        g_inFds[g_inNfd++] = fd;
+                        printf("input: +device %s\n", gr.gl_pathv[q]);
+                    }
+                }
+                globfree(&gr);
+            }
+        }
+        for (int i = 0; i < g_inNfd; ++i) { pfd[i].fd = g_inFds[i]; pfd[i].events = POLLIN; }
         const int pr = poll(pfd, (nfds_t)g_inNfd, 250);
         if (pr <= 0) continue;
         for (int i = 0; i < g_inNfd; ++i) {
@@ -146,6 +177,18 @@ static void* input_thread_fn(void* arg) {
             while ((n = read(g_inFds[i], ev, sizeof(ev))) > 0) {
                 for (size_t j = 0; j < (size_t)n / sizeof(ev[0]); ++j) {
                     const int code = ev[j].code;
+                    static unsigned keyDbg = 0;
+                    if (ev[j].type == EV_KEY && ++keyDbg <= 10)
+                        printf("EV type=%u code=%d val=%d\n",
+                            ev[j].type, code, ev[j].value);
+                    if (ev[j].type == EV_KEY && ev[j].value == 1) {
+                        if (code == 1 /* KEY_ESC: user kill switch */) {
+                            atomic_store(&g_esc, 1);
+                            atomic_store(&g_inRun, 0);
+                            printf("ESC pressed: ending probe NOW\n");
+                            continue;
+                        }
+                    }
                     if (ev[j].type == EV_KEY && ev[j].value == 1
                             && (code == BTN_LEFT || code == 16 /* KEY_Q (uclick --key) */)) {
                         static unsigned totalClicks = 0;
@@ -637,6 +680,10 @@ int main(int argc, char** argv) {
     uint64_t frameSeq = 0;
     double tStartMs = now_ms();
     for (;;) {
+        if (atomic_load(&g_esc)) {   /* S40+: user ESC = immediate end */
+            printf("probe: ESC kill, wrapping up\n");
+            break;
+        }
         { static int attachedOnce = 0;
           if (!attachedOnce && g_ledgerMap && g_layerMap) attachedOnce = 1;
           if (!attachedOnce) ledger_reader_init(); }

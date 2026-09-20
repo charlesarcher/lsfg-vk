@@ -13,7 +13,6 @@
 #include <string_view>
 #include <memory>
 #include <array>
-#include <deque>
 
 namespace ls::hud {
 
@@ -62,13 +61,6 @@ namespace ls::hud {
         /// query whether the overlay is (still) drawing — false stops blits
         [[nodiscard]] static bool drawing();
 
-        /// S40+: blend the card OVER the game frame resident in
-        /// dstImage (premult-OVER with dst.a forced to 1 = no hole).
-        void renderCardOver(class vk::CommandBuffer& cb, VkImage dstImage,
-            VkExtent2D dstExtent);
-        /// the over pipeline is built (safe to call renderCardOver)
-        [[nodiscard]] bool cardOverReady() const { return this->pmBuilt; }
-
         /// render one frame (call at ~15 Hz from the OUTPUT thread):
         /// NewFrame -> widgets -> submit RT upload. cheap when hidden.
         void tick(float dt);
@@ -87,6 +79,12 @@ namespace ls::hud {
         struct Origin { int32_t x, y; };
         [[nodiscard]] Origin origin() const;
 
+        /// the card's ACTIVE sub-rect inside the RT (px): only this region
+        /// holds non-transparent pixels each tick; blit ONLY this region
+        /// into the overlay (premult-alpha-0 margins would punch holes).
+        struct CardRect { int32_t x, y, w, h; };
+        [[nodiscard]] CardRect cardRect() const;
+
     private:
         void drawWidgets(const struct Stats& s);   // the actual imgui frame
         void setupThemeAndFont();
@@ -98,6 +96,7 @@ namespace ls::hud {
         VkFormat format;
         uint32_t baseScale{4};                    // px per imgui point-ish
         VkExtent2D rtSize;                        // offscreen RT size
+        CardRect mCardRect{ 0, 0, 0, 0 };         // S40+ live card sub-rect
         std::unique_ptr<vk::Image> rt[2];         // ping-pong RT pair
         uint8_t active{0};
         VkRenderPass renderpass{VK_NULL_HANDLE};
@@ -135,10 +134,6 @@ namespace ls::hud {
         VkDeviceMemory dumpMemory2{VK_NULL_HANDLE};
         void hostDump();   /* after fence: map + write /tmp/pm.pam */
         void buildPmPass();
-        struct OverFb { VkImage image; VkImageView view; VkFramebuffer fb; };
-        std::deque<OverFb> overFbs;
-        VkRenderPass overRenderpass{VK_NULL_HANDLE};
-        [[nodiscard]] VkRenderPass buildLoadRenderpass();
     };
 
 } // namespace ls::hud
