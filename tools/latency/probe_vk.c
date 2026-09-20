@@ -596,7 +596,6 @@ int main(int argc, char** argv) {
             /* paint the UNIQUE click color. User requirement (S40): each
                click paints its own distinct color so the measurement is
                provably looking at THAT click's frame, never a stale one. */
-            thisClickT = clickT[--nClickT];
             const float clickHue = (float)(nClickSeq % 12) / 12.0f;  /* 12 hues */
             clearR = 0.5f + 0.5f * (sinf(clickHue * 6.2831853f) * 0.5f + 0.5f);
             clearG = 0.5f + 0.5f * (sinf(clickHue * 6.2831853f + 2.0943951f) * 0.5f + 0.5f);
