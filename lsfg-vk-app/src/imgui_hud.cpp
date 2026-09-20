@@ -9,6 +9,7 @@
 
 #include "lsfg-vk-app/imgui_hud.hpp"
 #include <algorithm>
+#include <cfloat>
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
@@ -25,6 +26,7 @@
 
 
 namespace ls::hud {
+    static std::atomic<float> wsMinW{ 0.f };   /* sticky text-driven width */
 
     // ---- cross-thread toggle + stats --------------------------------------
     namespace {
@@ -281,9 +283,32 @@ namespace ls::hud {
 
     void ImGuiHud::drawWidgets(const Stats& s) {
         ImGuiIO& io = ImGui::GetIO();
-        /* S40+ review pass: NeverClip + corner-anchor. The card auto-sizes to
-           its content; anchored by the (1,0) pivot so it hugs the top-right
-           with a 12 px inset on ANY resolution. No scrollbar, ever. */
+        /* S40+ compact contract: the CARD is sized by the TEXT rows and only
+           the text rows. We measure the widest text line and pin the window
+           width to it BEFORE Begin(); the sparkline (drawn last) then fills
+           GetContentRegionAvail().x exactly — full inner width, and it
+           CANNOT widen the card because the width is already pinned.
+           AlwaysAutoResize handles the height only... with a pinned width
+           auto-resize still sizes height to content, which is what we want. */
+        char pipePare[128];
+        std::snprintf(pipePare, sizeof(pipePare), "I %.1f  G %.1f  S %.1f  E %+.1f",
+            88.8, 88.8, 88.8, -88.8);   /* widest possible pipe row */
+        char latPare[128];
+        std::snprintf(latPare, sizeof(latPare), "p50 %.1f p99 %.1f", 99.9, 99.9);
+        float maxW = 0.f;
+        maxW = std::max(maxW, ImGui::CalcTextSize("doubled").x
+            + ImGui::CalcTextSize(" ").x + ImGui::CalcTextSize("fps").x
+            + ImGui::CalcTextSize(" ").x + ImGui::CalcTextSize("88 (2x)").x);
+        maxW = std::max(maxW, ImGui::CalcTextSize("markers").x);
+        const ImVec2 latSz = ImGui::CalcTextSize(latPare);
+        const float latRowW = ImGui::CalcTextSize("latency").x
+            + ImGui::CalcTextSize(" ").x + latSz.x;
+        maxW = std::max(maxW, latRowW);
+        maxW = std::max(maxW, ImGui::CalcTextSize(pipePare).x);
+        maxW = std::max(maxW, wsMinW.load());
+        const float pad2 = 12.f;             /* 2x WindowPadding.x */
+        ImGui::SetNextWindowSizeConstraints(ImVec2(maxW + pad2, 0.f),
+            ImVec2(FLT_MAX, FLT_MAX));
         ImGui::SetNextWindowPos(ImVec2(
             static_cast<float>(this->rtSize.width) - 12.f, 12.f),
             ImGuiCond_Always, ImVec2(1.f, 0.f));
@@ -339,17 +364,18 @@ namespace ls::hud {
                 static_cast<double>(s.ipcMs), static_cast<double>(s.genMs),
                 static_cast<double>(s.scanMs));
         ImGui::TextDisabled("%s", pipe);
-        // frametime sparkline LAST, clamped to the widest TEXT row so the
-        // card width is set by the words, never by the graph:
+        // remember the widest ACTUAL row for the next frame's min-width:
+        float realMax = 0.f;
+        realMax = std::max(realMax, ImGui::GetItemRectSize().x);
+        wsMinW.store(std::max(wsMinW.load(), maxW), std::memory_order_relaxed);
+        // frametime sparkline fills the pinned inner width exactly:
         if (s.frameTimesCount > 2) {
-            const float w = ImGui::CalcTextSize(
-                "doubled fps 478 (2x)").x;  // row-realistic max
             ImGui::Spacing();
             ImGui::PlotLines("##ft", s.frameTimesMs,
                 static_cast<int>(s.frameTimesCount),
                 static_cast<int>(s.frameTimesIdx % 180),
                 nullptr, 0.f, 25.f,
-                ImVec2(std::min(w, ImGui::GetContentRegionAvail().x), 15.f));
+                ImVec2(ImGui::GetContentRegionAvail().x, 15.f));
         }
         ImGui::End();
         ImGui::PopStyleColor();
