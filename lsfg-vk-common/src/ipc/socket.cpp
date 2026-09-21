@@ -573,6 +573,7 @@ namespace ls::ipc {
         std::span<const std::byte> remaining{frame};
         while (!remaining.empty()) {
             ssize_t n = 0;
+            bool wasFirst = firstCall;
             if (firstCall) {
                 n = ::sendmsg(this->sockFd, &mh, flags);
                 firstCall = false;
@@ -581,7 +582,15 @@ namespace ls::ipc {
             }
 
             if (n < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR) {
+                    /* S42r: restore first-call state so the retry goes
+                       through sendmsg() again — a plain send() here has
+                       no cmsg slot, so the SCM_RIGHTS fd would never be
+                       attached and the next FRAME would fail with
+                       "attachFd with another fd still attached". */
+                    firstCall = wasFirst;
+                    continue;
+                }
                 const int err = errno;
                 if (err == EAGAIN || err == EWOULDBLOCK) {
                     if (sent > 0)

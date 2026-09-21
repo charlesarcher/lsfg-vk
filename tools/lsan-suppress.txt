@@ -1,0 +1,11 @@
+leak:radv_
+leak:mesa_
+leak:vk_alloc
+leak:vk_free
+leak:_mesa_
+leak:vkCreateInstance
+leak:wl_proxy_
+leak:_XData32
+leak:libvulkan_radeon
+leak:libvulkan_intel
+leak:libwayland-client
