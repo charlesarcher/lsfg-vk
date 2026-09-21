@@ -61,10 +61,19 @@ StreamState::~StreamState() {
         retainedStreams = 1;
         return;
     }
+    /* S42m (alt-F4 SIGABRT fix): free ONLY the memfd maps here.
+       The host buffers (hostPtrs) are singly owned by the
+       host-imported DeviceMemory of hostImages: RADV's
+       vkFreeMemory on HOST_ALLOCATION_BIT frees the caller's
+       malloc block (see image.cpp importMemoryHostPointer).
+       The member dtors run AFTER this body, so freeing hostPtrs
+       here — and letting hostImages' vkFreeMemory free the same
+       block again — is a guaranteed glibc double free:
+       'double free or corruption (!prev)' + SIGABRT repro'd on
+       every dxvk/ReFramework/RE2 swapchain teardown (alt-F4).
+       hostImages destruct normally and release everything. */
     for (auto& m : this->shmMaps)
         if (m) { ::munmap(m, this->shmBytes + 4096); m = nullptr; }
-    for (auto& h : this->hostPtrs)
-        if (h) { ::free(h); h = nullptr; }
 }
 
 namespace {
