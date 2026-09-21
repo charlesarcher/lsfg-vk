@@ -567,7 +567,7 @@ int main(int argc, char** argv) {
     VkFenceCreateInfo fci = { VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
     for (uint32_t i = 0; i < 8; ++i)
         vkCreateFence(dev, &fci, nullptr, &cbsFences[i]);
-    /* fences start UNSIGNALED (no signaled-初始 flag exists); the guard waits
+    /* fences start UNSIGNALED (no signaled-init flag exists); the guard waits
        would time out forever — pulse them: one empty submit each (idle queue). */
     {
         VkSubmitInfo ssi = { VK_STRUCTURE_TYPE_SUBMIT_INFO };
