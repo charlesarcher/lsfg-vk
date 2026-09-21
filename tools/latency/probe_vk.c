@@ -242,22 +242,35 @@ static uint64_t* g_ledgerMap = nullptr;   /* hdr: [magic][slot hdr+2 rows*4] */
 static uint64_t* g_layerMap  = nullptr;   /* hdr: [magic][head][rows..] */
 static int g_ledgerFd = -1, g_layerFd = -1;
 static void ledger_reader_init(void) {
+    /* S42p (fd-leak fix): idempotent attach. The ring SINKS are
+       created once by the layer at first publish; before that this
+       fn was re-called EVERY present (the caller's attachedOnce
+       guard only latches when BOTH sinks already exist) and each
+       successful shm_open+mmap leaked the previous cycle's fd and
+       mapping — 2 fds per present at 240 fps hammered the 1024
+       soft limit in ~4 s, EMFILE surfaced as vkGetSemaphoreFdKHR
+       "error -13", and the whole external path wedged. Attach
+       each sink exactly once; never re-open while attached. */
     struct stat st;
-    int fd = shm_open("/lsfg-dbl-ledger", O_RDONLY, 0);
-    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= LEDGER_FILE) {
-        void* m = mmap(nullptr, LEDGER_FILE, PROT_READ, MAP_SHARED, fd, 0);
-        if (m != MAP_FAILED && *(uint64_t*)m == LEDGER_MAGIC) {
-            if (!g_ledgerMap) printf("dbl-ledger: app sink attached\n");
-            g_ledgerMap = (uint64_t*)m; g_ledgerFd = fd;
-        } else close(fd);
+    if (g_ledgerFd < 0) {
+        int fd = shm_open("/lsfg-dbl-ledger", O_RDONLY, 0);
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= LEDGER_FILE) {
+            void* m = mmap(nullptr, LEDGER_FILE, PROT_READ, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED && *(uint64_t*)m == LEDGER_MAGIC) {
+                printf("dbl-ledger: app sink attached\n");
+                g_ledgerMap = (uint64_t*)m; g_ledgerFd = fd;
+            } else close(fd);
+        } else if (fd >= 0) close(fd);
     }
-    fd = shm_open("/lsfg-dbl-layer", O_RDONLY, 0);
-    if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= LAYER_FILE) {
-        void* m = mmap(nullptr, LAYER_FILE, PROT_READ, MAP_SHARED, fd, 0);
-        if (m != MAP_FAILED && *(uint64_t*)m == LAYER_MAGIC) {
-            if (!g_layerMap) printf("dbl-ledger: layer sink attached\n");
-            g_layerMap = (uint64_t*)m; g_layerFd = fd;
-        } else close(fd);
+    if (g_layerFd < 0) {
+        int fd = shm_open("/lsfg-dbl-layer", O_RDONLY, 0);
+        if (fd >= 0 && fstat(fd, &st) == 0 && st.st_size >= LAYER_FILE) {
+            void* m = mmap(nullptr, LAYER_FILE, PROT_READ, MAP_SHARED, fd, 0);
+            if (m != MAP_FAILED && *(uint64_t*)m == LAYER_MAGIC) {
+                printf("dbl-ledger: layer sink attached\n");
+                g_layerMap = (uint64_t*)m; g_layerFd = fd;
+            } else close(fd);
+        } else if (fd >= 0) close(fd);
     }
 }
 /* newest layer row (capTs slot published AFTER COMMIT ARM: the row matching our
