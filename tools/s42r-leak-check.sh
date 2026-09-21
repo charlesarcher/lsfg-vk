@@ -4,6 +4,10 @@
 # Requires: build-asan/ (cmake -B build-asan with -fsanitize=address,leak)
 #           probe compiled as /tmp/probe_vk_asan (see journal S42r)
 set -euo pipefail
+# valgrind/memcheck on CachyOS aborts at startup when
+# DEBUGINFOD_URLS is unset (its memcmp-redirect init path needs the
+# debuginfod client initialized first). Export any URL:
+export DEBUGINFOD_URLS="${DEBUGINFOD_URLS:-https://debuginfod.cachyos.org}"
 SECS=${1:-30}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 rm -f ~/.local/state/lsfg-vk/app.sock /dev/shm/lsfg-dbl-* /tmp/s42r-lsan-*
