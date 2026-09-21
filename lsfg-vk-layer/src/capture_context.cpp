@@ -896,6 +896,45 @@ CaptureContext::~CaptureContext() {
             // teardown must not throw
         }
     }
+    /* S42n (alt-F4 ntsync-wedge fix): release the game-side waiters.
+       Per frame the capture blit consumes the game's PRESENT-wait
+       semaphores and signals presentSem (OPAQUE_FD); the game's own
+       vkQueuePresent (forwarded with no wait) and dxvk's frame fences
+       may still be parked on an ntsync wait for a payload that can
+       only come from OUR submit. When the stream dies (socket
+       ECONNRESET on quit/alt-F4), no further Frame/submit ever runs,
+       so dxvk's last acquire/present fence can remain unsignaled
+       forever — the game parks ~40 threads in ntsync WAIT_ANY with an
+       infinite timeout and Proton never exits (gdb-proven).
+       Fix: on teardown, signal every pending game-facing semaphore
+       (per-slot presentSem + captureSem) with an empty queue submit
+       and drain the queues, so every outstanding wine ntsync wait
+       resolves and the process can die cleanly. */
+    if (this->vkPtr && !this->fake) {
+        try {
+            auto& vk = *this->vkPtr;
+            std::vector<VkSemaphore> toSignal;
+            toSignal.reserve(this->presentSemaphores.size() +
+                this->captureSemaphores.size());
+            for (auto& s : this->presentSemaphores)
+                toSignal.push_back(s.handle());
+            for (auto& s : this->captureSemaphores)
+                toSignal.push_back(s.handle());
+            if (!toSignal.empty()) {
+                const VkSubmitInfo si{
+                    .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                    .signalSemaphoreCount =
+                        static_cast<uint32_t>(toSignal.size()),
+                    .pSignalSemaphores = toSignal.data()
+                };
+                (void)vk.df().QueueSubmit(vk.queue(), 1, &si, VK_NULL_HANDLE);
+                (void)vk.df().DeviceWaitIdle(vk.dev());
+            }
+        } catch (...) {
+            // teardown must not throw
+        }
+    }
+
     for (int& fd : this->localExportFds) {
         if (fd >= 0) { ::close(fd); fd = -1; }
     }
