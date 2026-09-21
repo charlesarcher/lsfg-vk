@@ -63,8 +63,11 @@ trap cleanup EXIT INT TERM
 export VK_LAYER_PATH="$REPO_ROOT/build/lsfg-vk-layer"
 export VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation
 export MESA_VK_DEVICE_SELECT="${MESA_VK_DEVICE_SELECT:-1002:7550}"
-export LSFGVK_LAYER_DBG=1
-export PROTON_LOG=1
+# S42o: layer debug defaulted OFF (LSFGVK_LAYER_DBG=1 hits the layer's
+# per-present fprintf paths — latency-spike source during play).
+# Opt in explicitly for diagnostics runs.
+export LSFGVK_LAYER_DBG="${LSFGVK_LAYER_DBG:-0}"
+export PROTON_LOG="${PROTON_LOG:-0}"
 # Valve Steam layer compatibility flags
 export DISABLE_VK_LAYER_VALVE_steam_fossilize=1
 export DISABLE_VK_LAYER_VALVE_steam_overlay=1

@@ -4,6 +4,7 @@
 #include "lsfg-vk-app/presentation.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
+#include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
@@ -81,7 +82,7 @@ namespace {
     /// on LSFGVK_APP_DBG so the default stream stays clean.
     const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
     bool dbgEnabled() {
-        return std::getenv("LSFGVK_APP_DBG") != nullptr;
+        return envFlagOn("LSFGVK_APP_DBG");
     }
     void dbg(const char* fmt, ...) {
         if (!dbgEnabled())
@@ -290,9 +291,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         const uint64_t bytes = (static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull;
         const bool posixShm =
             conf.presentation == ls::Presentation::External
-            && (std::getenv("LSFGVK_POSIX_SHM") != nullptr
-                ? (std::getenv("LSFGVK_POSIX_SHM")[0] != '0')
-                : (conf.transport == ls::Transport::PosixShm));
+            && (envFlagOn("LSFGVK_POSIX_SHM")
+                || conf.transport == ls::Transport::PosixShm);
         if (posixShm) {
         const uint64_t mapBytes = bytes + 4096ull;
         const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", MFD_CLOEXEC));

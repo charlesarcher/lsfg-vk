@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
+#include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
@@ -317,7 +318,7 @@ struct lsfgvk::layer::CopyHop {
 namespace {
     // TEMP DEBUG (Session 13.29d): per-phase absolute wall-clock timestamps
     // to identify exactly which step in present() blocks the game thread.
-    [[maybe_unused]] const bool layerDbg{ std::getenv("LSFGVK_LAYER_DBG") != nullptr };
+    [[maybe_unused]] const bool layerDbg{ envFlagOn("LSFGVK_LAYER_DBG") };
     using SteadyClock = std::chrono::steady_clock;
     [[maybe_unused]] auto g_layerDbgT0 = SteadyClock::now();
     [[maybe_unused]] long long layerDbgMs(SteadyClock::time_point from) {
@@ -507,9 +508,8 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             if (fd < 0)
                 throw ls::error("lsfg-vk: external stream error: STAGING arrived without its fd");
 
-            const bool posixShm = (std::getenv("LSFGVK_POSIX_SHM") != nullptr)
-                ? (std::getenv("LSFGVK_POSIX_SHM")[0] != '0')
-                : (this->profile.transport == ls::Transport::PosixShm);
+            const bool posixShm = envFlagOn("LSFGVK_POSIX_SHM")
+                || this->profile.transport == ls::Transport::PosixShm;
             if (!posixShm) {
                 ::close(fd);
                 continue;
@@ -715,7 +715,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             this->copyHop = std::make_unique<CopyHop>();
         }
         const bool dualHost = (this->profile.transport == ls::Transport::DecoupledDma)
-            || (std::getenv("LSFGVK_DUAL_HOST") != nullptr && std::getenv("LSFGVK_DUAL_HOST")[0] == '1');
+            || envFlagOn("LSFGVK_DUAL_HOST");
         if (dualHost && this->fake && !this->shmMaps.at(0)) {
             try {
                 auto selectB = [](const vk::VulkanInstanceFuncs& fi,

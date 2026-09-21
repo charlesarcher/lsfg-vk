@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "instance.hpp"
+#include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
@@ -527,7 +528,7 @@ namespace {
         if (swIt == instance_info->swapchains.end())
             return VK_ERROR_INITIALIZATION_FAILED;
 
-        static const bool dbgAcq = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        static const bool dbgAcq = envFlagOn("LSFGVK_LAYER_DBG");
         const auto t0 = std::chrono::steady_clock::now();
         VkResult res = VK_SUCCESS;
         if (isIsolated(swapchain)) {
@@ -618,7 +619,7 @@ namespace {
                     waitSemaphores.push_back(info->pWaitSemaphores[j]);
 
                 {
-                    static const bool dbgPres{ std::getenv("LSFGVK_LAYER_DBG") != nullptr };
+                    static const bool dbgPres{ envFlagOn("LSFGVK_LAYER_DBG") };
                     const auto t0 = std::chrono::steady_clock::now();
                     if (dbgPres) {
                         const auto now = std::chrono::steady_clock::now();
@@ -750,7 +751,7 @@ namespace {
             const VkSubmitInfo2* pSubmits, VkFence fence) {
         std::vector<PendingPresentWork> pending;
         pending.swap(t_pendingPresentWork);
-        static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
         bool is1440 = false;
         for (const auto& p : pending)
             if (p.height >= 1440)
@@ -829,7 +830,7 @@ namespace {
         const auto& it = instance_info->devices.find(device);
         if (it == instance_info->devices.end())
             return VK_ERROR_INITIALIZATION_FAILED;
-        static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
         if (dbg)
             std::fprintf(stderr,
                 "lsfg-vk-layer: [dbg] WaitForFences ENTER n=%u timeout=%llu fence0=%p\n",
@@ -947,7 +948,7 @@ namespace {
     }
 
     VkResult myvkWaitForPresentKHR(VkDevice, VkSwapchainKHR, uint64_t, uint64_t) {
-        static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+        static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
         if (dbg)
             std::fprintf(stderr, "lsfg-vk-layer: [dbg] WaitForPresentKHR -> SUCCESS\n");
         return VK_SUCCESS; // isolated presents complete when QueuePresent returns
@@ -970,7 +971,7 @@ namespace {
         // isolated images / CaptureContext here is the 1080→1440 freeze.
         // Tombstone: later Destroy is a no-op; leak until process exit.
         if (isIsolated(swapchain) || isIsolatedTombstone(swapchain)) {
-            static const bool dbg = std::getenv("LSFGVK_LAYER_DBG") != nullptr;
+            static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
             if (dbg)
                 std::fprintf(stderr,
                     "lsfg-vk-layer: [dbg] isolated Destroy keep %p\n",

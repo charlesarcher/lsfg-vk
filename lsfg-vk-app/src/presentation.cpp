@@ -48,6 +48,7 @@ std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/sampler.hpp"
+#include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
 #include "lsfg-vk-common/vulkan/shader.hpp"
 
@@ -99,7 +100,10 @@ namespace {
 /// on LSFGVK_APP_DBG so the default stream stays clean.
 const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
 bool dbgEnabled() {
-    return std::getenv("LSFGVK_APP_DBG") != nullptr;
+    /* S42o: "0"/empty must mean OFF — a bare getenv()!=nullptr treats
+       LSFGVK_APP_DBG=0 as enabled and keeps fprintf formatting alive
+       on the hot path. */
+    return envFlagOn("LSFGVK_APP_DBG");
 }
 using Clock = std::chrono::steady_clock;
 using Usec = std::chrono::microseconds;
@@ -295,7 +299,7 @@ void dbg(const char* fmt, ...) {
     /// whether verbose per-cycle logging is requested (the -v hook: main sets
     /// LSFGVK_APP_VERBOSE when -v is passed, since runPresent carries no flag).
     bool verboseEnabled() {
-        return std::getenv("LSFGVK_APP_VERBOSE") != nullptr;
+        return envFlagOn("LSFGVK_APP_VERBOSE");
     }
 
     struct DmaHopTs {

@@ -15,6 +15,7 @@
 
 #include "lsfg-vk-app/wsi/surface_backend.hpp"
 
+#include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 
 #include <chrono>
@@ -57,7 +58,7 @@ namespace {
 /// on LSFGVK_APP_DBG so the default stream stays clean.
 const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
 bool dbgEnabled() {
-    return std::getenv("LSFGVK_APP_DBG") != nullptr;
+    return envFlagOn("LSFGVK_APP_DBG");
 }
 void dbg(const char* fmt, ...) {
     if (!dbgEnabled())
