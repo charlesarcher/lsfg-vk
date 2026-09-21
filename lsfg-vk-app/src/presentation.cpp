@@ -1204,8 +1204,20 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             const uint64_t nowGen = lsfgvk::gui::g_guiState.totalGenPresents.load();
             const uint32_t gameFps = static_cast<uint32_t>(
                 static_cast<double>(nowReal - lastReal) / dt + 0.5);
+            /* S42q: the card's second row is the SCREEN rate = every
+               present shown (REAL captures + GEN solves). The old
+               value was totalGenPresents alone — at multiplier 2 the
+               GEN rate equals the REAL rate BY STRUCTURE (the flow
+               emits exactly multiplier-1 destination images per
+               capture), so the rows pinned at parity (244/244,
+               51/55) and the card's own "(2x)" tag (which compares
+               presented > game) could never engage at steady state
+               — the exact "244/244 means it didn't double" confusion.
+               Keep the gen-only rate in totalGenPresents for the
+               trace row; publish real+gen as the presented rate. */
             const uint32_t presentedFps = static_cast<uint32_t>(
-                static_cast<double>(nowGen - lastGen) / dt + 0.5);
+                static_cast<double>((nowReal - lastReal)
+                    + (nowGen - lastGen)) / dt + 0.5);
             lastReal = nowReal; lastGen = nowGen;
             // S42j: feed the ImGui card directly (the echo publish in
             // maybeHud re-publishes latest() and never carried these).
