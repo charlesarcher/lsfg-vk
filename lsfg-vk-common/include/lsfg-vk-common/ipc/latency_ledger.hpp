@@ -144,7 +144,31 @@ struct LedgerSink {
         row[0] = captureTsNs;                            // capture time of frame
         row[1] = presentedNs;                            // compositor latch
         row[2] = ++seq;                                  // monotonic row count
-        row[3] = 0;                                      // reserved
+        row[3] = 0;                                      // kind: REAL capture present
+    }
+
+    /* S43: one row per GENERATED (interpolated) present, same clock and same
+       layout, so the pacing of the GEN half is measurable at ns resolution.
+
+       Why captureTsNs is written as 0 and not the parent capture's stamp: the
+       S40 click probe (tools/latency/probe_vk.c ledger_pair) resolves a row by
+       captureTs and SKIPS row[0]==0 as a stale slot. A GEN row therefore never
+       matches a lookup, so the click→photon rig keeps working unmodified
+       against the byte-exact layout it was written for. row[3] carries the kind
+       tag (0 = REAL, 1 = GEN) and row[2] stays the single monotonic seq, so one
+       reader can order both kinds on one clock. Side effect: the probe's
+       backwards window is 512 rows, which now spans 512 presents (~2.1 s) rather
+       than 512 REAL presents (~4.3 s) — still ~250x the click→row distance.
+    */
+    void publishGen(uint64_t presentedNs) {
+        if (!ok) return;
+        auto* hdr = static_cast<uint64_t*>(shm.map);
+        uint64_t slot = hdr[1]++;
+        uint64_t* row = hdr + 2 + (slot % (LEDGER_CAP - 1)) * 4;
+        row[0] = 0;                                      // no captureTs: probe skips it
+        row[1] = presentedNs;                            // compositor latch
+        row[2] = ++seq;
+        row[3] = 1;                                      // kind: GEN solve present
     }
 };
 
