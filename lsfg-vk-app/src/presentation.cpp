@@ -1183,6 +1183,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         uint64_t presentIdx{ 0 };      // rolling index into the signal pool
 
         Clock::time_point statsLastTime = Clock::now();
+        /* S43: lastReal/lastGen MUST be per-thread, exactly like
+           statsLastTime. The app spawns one std::thread per accepted
+           connection (main.cpp accept loop) and RE2 opens three in one
+           session, so this closure runs concurrently three times over. As
+           `static` they were ONE baseline shared by all three threads while
+           the 250 ms gate stayed per-thread: whichever thread won the window
+           took the full delta (~120) and the other two divided a partial
+           delta by a full 250 ms and read near zero. The card then showed
+           whichever thread wrote last — the 27/51/94/0 oscillation measured
+           2026-09-25. Per-thread baselines fix it at the source: each thread
+           measures the whole process-wide interval across its own full
+           window, so all three compute the same correct value, and the data
+           race on the shared statics disappears with them. */
+        uint64_t lastReal = lsfgvk::gui::g_guiState.totalRealPresents.load();
+        uint64_t lastGen = lsfgvk::gui::g_guiState.totalGenPresents.load();
         /* S42c: 4 Hz stats (was 1 s; the 1 Hz cadence ALSO paced the
            card tick = the RE2 play-test choppy-card complaint). */
         const auto statsInterval = std::chrono::milliseconds(250);
@@ -1198,8 +1213,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                (the "oscillating 0/0 ↔ 120/240" report). The atomics are
                shared by every stream, so a stale publisher computes the
                same correct value as the live one. */
-            static uint64_t lastReal = lsfgvk::gui::g_guiState.totalRealPresents.load();
-            static uint64_t lastGen = lsfgvk::gui::g_guiState.totalGenPresents.load();
             const uint64_t nowReal = lsfgvk::gui::g_guiState.totalRealPresents.load();
             const uint64_t nowGen = lsfgvk::gui::g_guiState.totalGenPresents.load();
             const uint32_t gameFps = static_cast<uint32_t>(
