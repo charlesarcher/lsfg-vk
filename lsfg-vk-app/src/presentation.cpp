@@ -32,6 +32,19 @@
  * These live at file scope (signal handler + function-scope extern rules). */
 static ls::hud::ImGuiHud* g_imguiHud{ nullptr };
 static std::atomic<bool> g_imguiInitDone{ false };
+/* S43b: the imgui card is ONE process-wide object but runPresent runs on one
+   std::thread PER CONNECTION (the app's accept loop), and RE2 opens three in a
+   single session. The S40 fix destroyed the card in every stream's teardown, so
+   the first stream to end freed the card out from under its two siblings that
+   were still inside renderCardOver / ImGui_ImplVulkan_NewFrame — the SIGSEGV in
+   ImGui_ImplVulkan_Shutdown we kept hitting. Reference-count instead: register
+   on entry, and only the LAST user out destroys it, when nobody can be inside. */
+static std::atomic<int> g_imguiUsers{ 0 };
+/* Extent/format the card was actually built with. RE2 changes resolution
+   mid-session, so a later stream can find a card sized for the old one — the
+   original S40 fault. Recorded so the mismatch is visible instead of silent. */
+static std::atomic<uint32_t> g_imguiBuiltW{ 0 };
+static std::atomic<uint32_t> g_imguiBuiltH{ 0 };
 static volatile std::sig_atomic_t g_imguiToggleReq{ 0 };
 static void installImguiToggle() {
 std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
@@ -659,6 +672,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const std::atomic<bool>& stop) {
     const uint32_t w = state.width, h = state.height;
     bool dropOverlay = false;
+    /* S43b: claim a reference on the shared card for the life of this stream.
+       Balanced release at the bottom of this function. */
+    g_imguiUsers.fetch_add(1, std::memory_order_acq_rel);
     // Session 40: window handle for wp_presentation arming; set once when the
     // overlay WSI is built inside ensureOverlayWsi, read from the present
     // loops. X11 backends return false from armPresentFeedback — no arming.
@@ -1215,6 +1231,19 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             const char* e = getenv("LSFGVK_PACE");
             return !(e && (e[0] == '0' || e[0] == '\0'));   // unset = ON
         }();
+        /* Fire this far BEFORE the slot boundary, never on it. Boundary is the
+           ambiguity point: a present submitted exactly at the tick cannot know
+           whether it made that refresh or the next one, and a few microseconds
+           decide. That ambiguity IS the skip+pileup pair — one present lands
+           late, the next rushes to reclaim the lost slot, and they collide in
+           the same refresh. Aim early and the frame is already queued when the
+           compositor scans out. Tunable for the panel's actual commit latency;
+           0.7 ms default, measured comfortable on kennykiller DP-7 @240 Hz. */
+        static const uint64_t paceLeadNs = [] {
+            const char* e = getenv("LSFGVK_PACE_LEAD_US");
+            const long long us = e ? atoll(e) : 700;
+            return (us > 0 ? (uint64_t)us : 0ULL) * 1000ULL;
+        }();
         constexpr size_t kPeriodWin = 64;
         std::array<uint64_t, kPeriodWin> gapWin{};
         size_t gapPos{ 0 }, gapFill{ 0 };
@@ -1240,11 +1269,45 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (mn != UINT64_MAX) pacePeriodNs = mn;
             }
             if (pacePeriodNs != 0) {
+                /* Absolute re-anchor from the newest latch — NOT max(old, new).
+                   Keeping the old (later) deadline is what made a late present
+                   cascade: the deadline stayed in the past, so the next present
+                   also fired immediately and two submits landed in one refresh.
+                   Re-anchoring means a missed slot is simply not taken; the grid
+                   moves on and the following present waits properly again. */
                 const uint64_t want = latchNs + pacePeriodNs;
-                // only ever push the deadline forward: a late latch must not
-                // make us submit immediately and re-race the compositor
-                if (nextSlotNs == 0 || want > nextSlotNs) nextSlotNs = want;
+                nextSlotNs = (want > paceLeadNs) ? (want - paceLeadNs) : 0;
             }
+        };
+        /* Claim a slot the instant a present is SUBMITTED. Latch feedback is
+           asynchronous: after we submit a GEN present the compositor has not told
+           us it latched yet, so nextSlotNs still points at the slot we just
+           took. The REAL present for the same capture then finds it "already
+           due", skips the wait, and submits into that same slot — two presents,
+           one refresh, one of them discarded. At a game rate above half the
+           panel rate that happens on nearly every frame and reads on screen as
+           exactly the judder/glitch it is. Advancing the grid on submit (and
+           letting the async latch correct residual drift) gives every present
+           its own slot. */
+        auto paceClaimSlot = [&]() {
+            if (!paceOn || pacePeriodNs == 0)
+                return;
+            const uint64_t submit = nowNs();
+            if (nextSlotNs == 0 || submit > nextSlotNs)
+                nextSlotNs = submit;          // already late: re-anchor here
+            nextSlotNs += pacePeriodNs;       // this present owns the next slot
+        };
+        /* True when the grid is so far behind that a generated frame could not
+           land in a free slot even if we solved it right now. A capture in this
+           state must present its REAL frame instead of spending a solve on a
+           frame the panel will never show. */
+        auto paceGenSlotFree = [&]() {
+            if (!paceOn || pacePeriodNs == 0 || nextSlotNs == 0)
+                return true;                 // grid not learned yet: don't skip
+            const uint64_t now = nowNs();
+            if (now < nextSlotNs)
+                return true;                 // slot still in the future: room
+            return (now - nextSlotNs) < pacePeriodNs;
         };
         // hold until the next slot boundary; no-op until the grid is learned
         auto paceWait = [&]() {
@@ -1252,8 +1315,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 return;
             const uint64_t now = nowNs();
             if (now >= nextSlotNs)
-                return;
-            const uint64_t remain = nextSlotNs - now;
+                return;                        // already late: take the slot, do
+            const uint64_t remain = nextSlotNs - now;   // NOT chase the lost time
             if (remain > 2 * pacePeriodNs)     // hopelessly behind: never add
                 return;                        // more than one extra slot of wait
             if (remain > 1'500'000ULL) {      // >1.5 ms out: sleep, don't burn a core
@@ -1694,6 +1757,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                     g_imguiHud = new ls::hud::ImGuiHud{ vk,
                                         extent, static_cast<VkFormat>(
                                             g_overlay.imageFormat) };
+                                    g_imguiBuiltW.store(extent.width,
+                                        std::memory_order_relaxed);
+                                    g_imguiBuiltH.store(extent.height,
+                                        std::memory_order_relaxed);
                                     /* S41: buildCardOver crashes RADV on the
                                        clean-rebuilt tree (null dispatch in
                                        vkCreate chain). Default = don't build;
@@ -1753,7 +1820,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
 
                 // exactly one present this vblank: GEN, REAL, or HOLD-LAST.
-                if (cur.active && cur.nextDest < destCount) {
+                if (cur.active && cur.nextDest < destCount && paceGenSlotFree()) {
                     // --- GEN present for destination images[cur.nextDest] ------
                     const size_t i = cur.nextDest;
                     const auto tGen0 = Clock::now();
@@ -1883,6 +1950,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     ++presentIdx;
                     ++presentedFrames;
                     ++cur.nextDest;
+                    paceClaimSlot();   // this present owns the next slot
                     lsfgvk::gui::g_guiState.totalGenPresents.fetch_add(1);
                     lsfgvk::gui::g_guiState.totalPresents.fetch_add(1);
                     dbg("output: GEN present dest %zu/%zu (slot %u)",
@@ -1892,6 +1960,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (!presentReal(cur.stagingIdx, cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs))
                         break;
                     lastShownStagingIdx = static_cast<int>(cur.stagingIdx);
+                    paceClaimSlot();   // this present owns the next slot
                     for (int d : cur.doneFds)   // close any never-imported gen fds
                         if (d >= 0)
                             ::close(d);
@@ -2637,14 +2706,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::lock_guard<std::mutex> lk(submitMtx);
         vk.df().DeviceWaitIdle(vk.dev());
     }
-    /* S40+ FIX: the imgui card owns VkObjects tied to the STREAM
-       (rt/swapchain formats, the vk::Vulkan ref). The old function-static
-       survived a stream restart pointing at freed assets = RADV SEGV on
-       tick 2 of a fresh stream. Reset both gates so the next stream
-       builds a freshfad ImGuiHud. */
-    delete g_imguiHud;
-    g_imguiHud = nullptr;
-    g_imguiInitDone.store(false);
+    /* S43b: the imgui card is shared by every CONCURRENT stream (one
+       std::thread per connection; RE2 opens three in one session), so it must
+       NOT be destroyed per stream — that freed it under its live siblings and
+       produced the SIGSEGV in ImGui_ImplVulkan_Shutdown, which in turn left the
+       game quit with nothing on the other end of its IPC socket. Only the LAST
+       stream out destroys it, when no sibling can still be inside the card. */
+    if (g_imguiUsers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::lock_guard<std::mutex> lk(submitMtx);
+        vk.df().DeviceWaitIdle(vk.dev());
+        delete g_imguiHud;
+        g_imguiHud = nullptr;
+        g_imguiInitDone.store(false);
+        g_imguiBuiltW.store(0, std::memory_order_relaxed);
+        g_imguiBuiltH.store(0, std::memory_order_relaxed);
+    }
     if (inputError)
         std::rethrow_exception(inputError);
     if (outputError)
