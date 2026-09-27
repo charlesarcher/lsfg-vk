@@ -940,6 +940,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         uint64_t recvTsNs{ 0 };
         uint64_t schedDoneNs{ 0 };
     };
+    // Frames abandoned without being read. MUST stay 0: no frame may ever be
+    // dropped. A non-zero value means a slot's blit did not signal in time and
+    // we declined to read a possibly-torn slot - a visible hole in the stream,
+    // counted rather than hidden. Static so the local Inbox (and the input
+    // loop that owns it) can both reach them.
+    static uint64_t g_framesDropped;
+    static uint64_t g_framesOut;
+
     struct Inbox {
         std::mutex m;
         std::condition_variable cv;
@@ -962,20 +970,32 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 return std::nullopt;
             return takeNewestLocked();
         }
+        // FIFO, oldest-first. NO FRAME MAY BE DROPPED.
+        //
+        // This used to take q.back() (the NEWEST) and then q.clear() the rest,
+        // closing every queued frame's fds on the way out. That silently
+        // discarded complete, already-captured frames - and because each
+        // capture produces a GEN and a REAL, it discarded those in pairs, so
+        // the doubler was left interpolating against frames that no longer
+        // existed. Under load (any hiccup that let the queue build) this
+        // silently threw away work the render card had already paid for.
+        //
+        // Taking the oldest and leaving the rest queued keeps the 1:1
+        // GEN/REAL correspondence the backend's pairing depends on.
         std::optional<PendingFrame> takeNewestLocked() {
             if (q.empty())
                 return std::nullopt;
-            PendingFrame newest = std::move(q.back());
-            q.pop_back();
-            for (auto& f : q) {
-                for (int d : f.doneFds)
-                    if (d >= 0)
-                        ::close(d);
-                if (f.snapFd >= 0)
-                    ::close(f.snapFd);
+            PendingFrame oldest = std::move(q.front());
+            q.pop_front();
+            if (g_framesDropped) {
+                std::cerr << "lsfg-vk-app: frame-integrity out " << g_framesOut
+                          << " backlog " << q.size()
+                          << " dropped " << g_framesDropped
+                          << " (must be 0)\n";
+                g_framesOut = 0;
+                g_framesDropped = 0;
             }
-            q.clear();
-            return PendingFrame{ std::move(newest) };
+            return PendingFrame{ std::move(oldest) };
         }
         void push(PendingFrame f) {
             {
@@ -1002,6 +1022,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         if (g_overlay.wsi)
             g_overlay.wsi->processEvents(timeoutMs);
     };
+
 
     const VkExtent2D imgExtent{ w, h };
 
@@ -2100,10 +2121,36 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (state.shmBytes && sidx < state.shmMaps.size()
                         && state.shmMaps.at(sidx) && state.hostPtrs.at(sidx)) {
                     if (captureFd >= 0) {
+                        // BLOCK until the render card says this slot's blit has
+                        // actually landed, then read it.
+                        //
+                        // This used to be `::poll(&pfd, 1, 1)` with the result
+                        // DISCARDED - a 1 ms wait that gave up silently and read
+                        // the slot anyway. captureFd is the render card's
+                        // slot-ready sync semaphore: it is signalled only when
+                        // the capture blit into this slot has completed. Reading
+                        // before that yields a TORN capture (part of frame N,
+                        // part of frame N+1), and the doubler then interpolates
+                        // against garbage. Nothing downstream can detect it.
+                        //
+                        // A large timeout is a FAILURE indication, not licence
+                        // to read: on timeout we never touch the slot, hand it
+                        // straight back, and surface the error.
                         pollfd pfd{};
                         pfd.fd = captureFd;
                         pfd.events = POLLIN;
-                        ::poll(&pfd, 1, 1);
+                        const int prReady = ::poll(&pfd, 1, 2000);
+                        if (prReady <= 0) {
+                            // Slot abandoned unread - never a torn read.
+                            ::close(captureFd);
+                            captureFd = -1;
+                            if (!dmaHop)
+                                conn.send(ls::ipc::Release{ sidx });
+                            ++g_framesDropped;   // never torn-read; counted
+                            if (prReady == 0)
+                                continue;
+                            throw ls::error("poll() on capture slot-ready failed");
+                        }
                         ::close(captureFd);
                         captureFd = -1;
                     }

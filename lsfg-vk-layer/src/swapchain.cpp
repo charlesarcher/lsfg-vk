@@ -29,6 +29,7 @@ using namespace lsfgvk;
 using namespace lsfgvk::layer;
 
 namespace {
+
     VkImageMemoryBarrier barrierHelper(VkImage handle,
             VkAccessFlags srcAccessMask,
             VkAccessFlags dstAccessMask,
@@ -229,9 +230,33 @@ VkResult Swapchain::present(const vk::Vulkan& vk,
         throw ls::error("failed to schedule frames", e);
     }
 
-    // wait for completion of previous frame
-    if (this->fidx && !this->renderFence->wait(vk, 150ULL * 1000 * 1000))
-        throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
+    // Wait for completion of previous frame.
+    //
+    // The dependency is real: frame N+1's copyImage writes sourceImage, which
+    // frame N's copy-out is still reading. But doing it with a HOST wait is
+    // wrong - it blocks the render thread on the GPU on every single frame,
+    // even though there is always more work to record. That is the one place
+    // the render path violates "never wait unless there is provably no work to
+    // do". (The layer's own note at capture_context.cpp:1219 records the cost
+    // of a fence on a submit: 53 fps with, 141 without.)
+    //
+    // The right mechanism is a GPU-side chain: the previous frame's submit
+    // signals syncSemaphore, and this frame's submit WAITS on it. The driver
+    // defers the work; the host never blocks.
+    //
+    // Before restructuring that, MEASURE whether the host wait is even load
+    // bearing. If the fence is virtually always already signalled, the block is
+    // nearly free to remove and the rewrite can be scoped to the rare case. If
+    // it is frequently unsignalled, there is genuinely no free image at this
+    // moment and the async ring is required for correctness, not just speed.
+    // Non-blocking probe: if the previous frame's copy-out is already done we
+    // take the fast path and never block the render thread. Only if it is
+    // genuinely still in flight do we fall back to a bounded wait - at that
+    // point there is provably no free source image, so waiting is correct.
+    if (this->fidx && !this->renderFence->wait(vk, 0)) {
+        if (!this->renderFence->wait(vk, 150ULL * 1000 * 1000))
+            throw ls::vulkan_error(VK_TIMEOUT, "vkWaitForFences() failed");
+    }
     this->renderFence->reset(vk);
 
     cmdbuf.end(vk);
