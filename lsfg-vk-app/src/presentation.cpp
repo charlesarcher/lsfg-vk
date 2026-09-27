@@ -1342,10 +1342,20 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         auto maybeHud = [&](Clock::time_point now) {
             static Clock::time_point hudLast = now;
             const double hdt = std::chrono::duration<double>(now - hudLast).count();
-            if (hdt < 0.05) return;          /* ≥20 Hz repaint ceiling */
+            /* S43: no repaint ceiling. This was 20 Hz, so the card's frame
+               index lagged the frame on screen by up to 50 ms (~7 captures
+               at 132/s) and could not identify a frame in a capture. The
+               HUD now repaints once per present, which is what the frame
+               identity row needs to mean anything. */
             hudLast = now;
             if (!g_imguiHud || !g_imguiInitDone.load()) return;
             ls::hud::ImGuiHud::Stats st = ls::hud::ImGuiHud::latest();
+            /* S43: frame identity for the card. captureIdx is the count of
+               frames the layer has handed us, presentIdx the count of presents
+               submitted. Both are plain atomic loads on the stats path, so
+               this costs nothing per frame. */
+            st.captureIdx = frameCount.load(std::memory_order_relaxed);
+            st.presentIdx = presentedFrames.load(std::memory_order_relaxed);
             try {
                 ls::hud::ImGuiHud::publish(st);
                 if (g_imguiHud)

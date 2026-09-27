@@ -44,6 +44,10 @@ namespace {
 } // namespace
 namespace ls::hud {
     static std::atomic<float> wsMinW{ 0.f };   /* sticky text-driven width */
+    /* S43: the card's real rect in RT px. Written by drawWidgets each frame
+       under g_statsMtx, read by renderCardOver to pick what to composite. */
+    float ImGuiHud::s_cardX0 = 0.f, ImGuiHud::s_cardY0 = 0.f;
+    float ImGuiHud::s_cardX1 = 0.f, ImGuiHud::s_cardY1 = 0.f;
 
     // ---- cross-thread toggle + stats --------------------------------------
     namespace {
@@ -77,6 +81,11 @@ namespace ls::hud {
         g_stats.frameTimesIdx = (g_stats.frameTimesIdx + 1) % 100000;
         g_stats.frameTimesCount = std::min<uint32_t>(180, g_stats.frameTimesCount + 1);
     }
+    ImGuiHud::CardRect ImGuiHud::cardRect() {
+        std::lock_guard<std::mutex> lk(g_statsMtx);
+        return CardRect{ s_cardX0, s_cardY0, s_cardX1, s_cardY1 };
+    }
+
     void ImGuiHud::publish(const Stats& s) {
         /* S40+ merge: the gears of the ring counters (frametime/latency
            rings) belong to the OUTPUT thread; the 1 Hz stats publish MUST
@@ -90,6 +99,11 @@ namespace ls::hud {
         g_stats.scanMs = s.scanMs;
         g_stats.genExtraMs = s.genExtraMs;
         g_stats.genExtraLive = s.genExtraLive;
+        /* S43: frame identity. Without these two lines the row renders a
+           permanent 0 -- publish() copies named fields, not the whole
+           struct, so anything new has to be added here explicitly. */
+        g_stats.captureIdx = s.captureIdx;
+        g_stats.presentIdx = s.presentIdx;
     }
     ImGuiHud::Stats ImGuiHud::latest() {
         std::lock_guard<std::mutex> lk(g_statsMtx);
@@ -901,9 +915,17 @@ namespace ls::hud {
         /* pack = shader PC layout: (offX, offY, scX, scY) in ONE vec4 */
         const float rtW = static_cast<float>(this->rtSize.width);
         const float rtH = static_cast<float>(this->rtSize.height);
-        /* imgui window rect inside the RT (px): x 463..627, y 13..112 */
-        const float winX0 = 463.f / rtW, winY0 = 13.f / rtH;
-        const float winX1 = 627.f / rtW, winY1 = 112.f / rtH;
+        /* S43: composite the card's REAL rect. The hardcoded 463..627 /
+           13..112 band was sized for an older, shorter card, so rows added
+           at the bottom (the frame-identity rows) were cropped off before
+           they ever reached the screen. Fall back to the old band only
+           before the first frame has published a rect. */
+        const auto cr = ImGuiHud::cardRect();
+        const bool haveRect = (cr.x1 > cr.x0 + 1.f) && (cr.y1 > cr.y0 + 1.f);
+        const float winX0 = (haveRect ? cr.x0 : 463.f) / rtW;
+        const float winY0 = (haveRect ? cr.y0 : 13.f) / rtH;
+        const float winX1 = (haveRect ? cr.x1 : 627.f) / rtW;
+        const float winY1 = (haveRect ? cr.y1 : 112.f) / rtH;
         float gFpsF = 0.f, dFpsF = 0.f;
         {
             std::lock_guard<std::mutex> lk(g_statsMtx);
@@ -1014,13 +1036,14 @@ void ImGuiHud::setupThemeAndFont() {
            ping-pong fence discipline the tick relies on. A plain
            4 Hz floor keeps queue-time at the S42c levels (4 submits/s)
            while guaranteeing the paint path actually executes. */
-        {
-            static float sincePaint = 0.0f;
-            sincePaint += dt;
-            if (sincePaint < 0.24f)
-                return;
-            sincePaint = 0.0f;
-        }
+        /* S43: repaint EVERY present. This was a 4 Hz floor and maybeHud
+           above is a 20 Hz ceiling, so the card could never show a value
+           fresher than 50 ms -- at ~132 captures/s that is ~7 frames of
+           drift, which is useless for tying a frame in a capture to a log
+           line. Both gates are gone: the card is now rebuilt once per
+           present, so the frame index on screen belongs to the frame being
+           shown. */
+        (void)dt;
         // pick inactive slot + fence discipline (S40: submit WITH fence, wait
         // BLOCKING on the fence of the slot we are about to overwrite)
         const uint8_t next = static_cast<uint8_t>(this->active ^ 1);
@@ -1267,6 +1290,15 @@ void ImGuiHud::setupThemeAndFont() {
             + ImGui::CalcTextSize(" ").x + latSz.x;
         maxW = std::max(maxW, latRowW);
         maxW = std::max(maxW, ImGui::CalcTextSize(pipePare).x);
+        /* S43: the frame-identity rows are laid out with SameLine(56.f), so
+           their real width is the 56 px offset plus the value, NOT the
+           label+value sum the other rows use. Sizing them wrong is what
+           clipped the card before, so measure the actual shape. Worst case
+           is a 10-digit index. */
+        {
+            const ImVec2 valW = ImGui::CalcTextSize("0000000000");
+            maxW = std::max(maxW, 56.f + valW.x);
+        }
         maxW = std::max(maxW, wsMinW.load());
         const float pad2 = 12.f;             /* 2x WindowPadding.x */
         ImGui::SetNextWindowSizeConstraints(ImVec2(maxW + pad2, 0.f),
@@ -1326,6 +1358,22 @@ void ImGuiHud::setupThemeAndFont() {
                 static_cast<double>(s.ipcMs), static_cast<double>(s.genMs),
                 static_cast<double>(s.scanMs));
         ImGui::TextDisabled("%s", pipe);
+        /* S43: frame identity row. Same label/value shape as the rows above
+           (dim label at x=0, value at x=56) so the card's rhythm is
+           unchanged, and one single Text call so it can never wrap the way
+           separate SameLine cells did.
+
+           frame = capture index of the frame the game produced, which is
+           what a per-frame log line would carry; doubled = running count of
+           presents submitted for it. A movie frame showing "frame 4211" ties
+           straight to a log line about capture 4211. */
+        ImGui::Spacing();
+        ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "frame");
+        ImGui::SameLine(56.f);
+        ImGui::Text("%llu", static_cast<unsigned long long>(s.captureIdx));
+        ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "doubled");
+        ImGui::SameLine(56.f);
+        ImGui::Text("%llu", static_cast<unsigned long long>(s.presentIdx));
         // remember the widest ACTUAL row for the next frame's min-width:
         float realMax = 0.f;
         realMax = std::max(realMax, ImGui::GetItemRectSize().x);
@@ -1338,6 +1386,14 @@ void ImGuiHud::setupThemeAndFont() {
                 static_cast<int>(s.frameTimesIdx % 180),
                 nullptr, 0.f, 25.f,
                 ImVec2(ImGui::GetContentRegionAvail().x, 15.f));
+        }
+        /* S43: publish the card's real rect (RT px) for renderCardOver. */
+        {
+            const ImVec2 wp = ImGui::GetWindowPos();
+            const ImVec2 wz = ImGui::GetWindowSize();
+            std::lock_guard<std::mutex> lk(g_statsMtx);
+            s_cardX0 = wp.x; s_cardY0 = wp.y;
+            s_cardX1 = wp.x + wz.x; s_cardY1 = wp.y + wz.y;
         }
         ImGui::End();
         ImGui::PopStyleColor();
