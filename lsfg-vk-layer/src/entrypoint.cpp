@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "instance.hpp"
+#include "lsfg-vk-common/frame_dbg.hpp"
 #include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
@@ -495,7 +496,12 @@ namespace {
                 .images = std::move(swapchainImages),
                 .format = newInfo.imageFormat,
                 .colorSpace = newInfo.imageColorSpace,
-                .extent = newInfo.imageExtent,
+                /* S43: advertise the PINNED extent, not the game's. This is
+                   the size the app sizes its swapchain from and the size it
+                   renders into, so it has to be the size we actually capture
+                   -- otherwise the app composites a 1382-tall image into a
+                   1440 panel and every "1440p" run is quietly short. */
+                .extent = pinnedCaptureExtent(newInfo.imageExtent),
                 .presentMode = newInfo.presentMode
             }).first->second;
 
@@ -528,7 +534,7 @@ namespace {
         if (swIt == instance_info->swapchains.end())
             return VK_ERROR_INITIALIZATION_FAILED;
 
-        static const bool dbgAcq = envFlagOn("LSFGVK_LAYER_DBG");
+        static const bool dbgAcq = LSGV_FRAME_DBG_ENABLED;
         const auto t0 = std::chrono::steady_clock::now();
         VkResult res = VK_SUCCESS;
         if (isIsolated(swapchain)) {
@@ -619,7 +625,7 @@ namespace {
                     waitSemaphores.push_back(info->pWaitSemaphores[j]);
 
                 {
-                    static const bool dbgPres{ envFlagOn("LSFGVK_LAYER_DBG") };
+                    static const bool dbgPres{ LSGV_FRAME_DBG_ENABLED };
                     const auto t0 = std::chrono::steady_clock::now();
                     if (dbgPres) {
                         const auto now = std::chrono::steady_clock::now();
@@ -751,7 +757,7 @@ namespace {
             const VkSubmitInfo2* pSubmits, VkFence fence) {
         std::vector<PendingPresentWork> pending;
         pending.swap(t_pendingPresentWork);
-        static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
+        static const bool dbg = LSGV_FRAME_DBG_ENABLED;
         bool is1440 = false;
         for (const auto& p : pending)
             if (p.height >= 1440)
@@ -830,7 +836,7 @@ namespace {
         const auto& it = instance_info->devices.find(device);
         if (it == instance_info->devices.end())
             return VK_ERROR_INITIALIZATION_FAILED;
-        static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
+        static const bool dbg = LSGV_FRAME_DBG_ENABLED;
         if (dbg)
             std::fprintf(stderr,
                 "lsfg-vk-layer: [dbg] WaitForFences ENTER n=%u timeout=%llu fence0=%p\n",
@@ -948,7 +954,7 @@ namespace {
     }
 
     VkResult myvkWaitForPresentKHR(VkDevice, VkSwapchainKHR, uint64_t, uint64_t) {
-        static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
+        static const bool dbg = LSGV_FRAME_DBG_ENABLED;
         if (dbg)
             std::fprintf(stderr, "lsfg-vk-layer: [dbg] WaitForPresentKHR -> SUCCESS\n");
         return VK_SUCCESS; // isolated presents complete when QueuePresent returns
@@ -971,7 +977,7 @@ namespace {
         // isolated images / CaptureContext here is the 1080→1440 freeze.
         // Tombstone: later Destroy is a no-op; leak until process exit.
         if (isIsolated(swapchain) || isIsolatedTombstone(swapchain)) {
-            static const bool dbg = envFlagOn("LSFGVK_LAYER_DBG");
+            static const bool dbg = LSGV_FRAME_DBG_ENABLED;
             if (dbg)
                 std::fprintf(stderr,
                     "lsfg-vk-layer: [dbg] isolated Destroy keep %p\n",

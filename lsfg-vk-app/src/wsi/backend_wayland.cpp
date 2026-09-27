@@ -14,6 +14,12 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lsfg-vk-app/wsi/surface_backend.hpp"
+#include "lsfg-vk-common/frame_dbg.hpp"
+
+/* Compile-time debug predicate. The frame callback and seat plumbing below are
+   gated on it, so it must stay a constant in a normal build: the call sites
+   fold away instead of reading an env var on every frame. */
+static constexpr bool dbgEnabled() { return LSGV_FRAME_DBG_ENABLED; }
 
 #include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/helpers/errors.hpp"
@@ -57,31 +63,16 @@ namespace {
 /// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
 /// on LSFGVK_APP_DBG so the default stream stays clean.
 const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
-bool dbgEnabled() {
-    return envFlagOn("LSFGVK_APP_DBG");
-}
-void dbg(const char* fmt, ...) {
-    if (!dbgEnabled())
-        return;
-    char buf[256];
-    va_list ap;
-    va_start(ap, fmt);
-    std::vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - g_dbgT0).count();
-    std::fprintf(stderr, "lsfg-vk-app: [dbg] wl: %s (t+%lld ms)\n", buf, ms);
-}
 
 /// TEMP DEBUG: wl_surface enter/leave an OUTPUT's scanout region (leave means
 /// the compositor stopped displaying this surface anywhere)
 void surfaceEnter(void* data, wl_surface* /*s*/, wl_output* output) {
-    dbg("wl_surface ENTERED output %p", (void*)output);
+    LSFG_FRAME_DBG("wl_surface ENTERED output %p", (void*)output);
     (void)data;
 }
 
 void surfaceLeave(void* data, wl_surface* /*s*/, wl_output* output) {
-    dbg("wl_surface LEFT output %p (compositor stopped scanning it out)", (void*)output);
+    LSFG_FRAME_DBG("wl_surface LEFT output %p (compositor stopped scanning it out)", (void*)output);
     (void)data;
 }
 
@@ -99,7 +90,7 @@ bool g_dbgFrameCbPending = false;
 void surfaceFrameEvent(void* /*data*/, wl_callback* cb, uint32_t /*time*/) {
     g_dbgFrameCbPending = false;
     ++g_dbgFrameCount;
-    dbg("wl_surface frame callback #%u (compositor displayed a buffer)", g_dbgFrameCount);
+    LSFG_FRAME_DBG("wl_surface frame callback #%u (compositor displayed a buffer)", g_dbgFrameCount);
     wl_callback_destroy(cb);
 }
 
@@ -523,7 +514,7 @@ public:
                 const int rt = wl_display_roundtrip(mDisplay);
                 haveShell = mGlobals.layerShell || mGlobals.xdgWmBase;
                 if (rt < 0) {
-                    dbg("wl: roundtrip err attempt=%d i=%d display_err=%d",
+                    LSFG_FRAME_DBG("wl: roundtrip err attempt=%d i=%d display_err=%d",
                         attempt, i, wl_display_get_error(mDisplay));
                     break;
                 }
@@ -534,11 +525,11 @@ public:
             if (mGlobals.compositor && haveShell) {
                 wl_registry_destroy(registry);
                 if (attempt > 0)
-                    dbg("wl: connected on attempt %d", attempt);
+                    LSFG_FRAME_DBG("wl: connected on attempt %d", attempt);
                 break;
             }
 
-            dbg("wl: connect attempt %d compositor=%d layer=%d xdg=%d, retry",
+            LSFG_FRAME_DBG("wl: connect attempt %d compositor=%d layer=%d xdg=%d, retry",
                 attempt,
                 mGlobals.compositor != nullptr,
                 mGlobals.layerShell != nullptr,
@@ -644,10 +635,19 @@ public:
             zwlr_layer_surface_v1_set_anchor(mLayerSurface,
                 ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                 ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-            // exclusive zone -1: do NOT claim space (anchored to all four
-            // sides the surface is output-sized anyway); claiming a zone
-            // would push/resize the game's window, which must stay put.
-            zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, -1);
+            /* S43: exclusive zone 0 = borderless fullscreen.
+
+               -1 means "claim no space", so KWin keeps the panel visible and
+               configures us to the WORK area: 2560x1382 on a 2560x1440
+               output, 58 px of panel missing. Every "1440p" run today was
+               really 1382 and nothing said so.
+
+               0 means "this surface covers the entire output", which is the
+               layer-shell spelling of borderless fullscreen: the compositor
+               hides the panel and hands us all 1440 rows. The game's own
+               window is untouched -- exclusive zone only moves the panel,
+               it does not resize or reposition other toplevels. */
+            zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, 0);
             // Isolated overlay covers the output. 1 px gap was for forwarded
             // WSI occlusion; LSFGVK_OVERLAY_GAP=N restores a margin.
             int gap = 0;
@@ -655,7 +655,7 @@ public:
                 gap = std::atoi(e);
             if (gap > 0) {
                 zwlr_layer_surface_v1_set_margin(mLayerSurface, gap, gap, gap, gap);
-                dbg("overlay gap %d px (LSFGVK_OVERLAY_GAP)", gap);
+                LSFG_FRAME_DBG("overlay gap %d px (LSFGVK_OVERLAY_GAP)", gap);
             }
             // Protocol default keyboard_interactivity is `exclusive`, which
             // would steal the keyboard from the game - set it to none so the
@@ -664,7 +664,7 @@ public:
                 mLayerSurface,
                 ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
             wl_surface_commit(mSurface);
-            dbg("window type: layer-shell OVERLAY on %s (wl_output %p)",
+            LSFG_FRAME_DBG("window type: layer-shell OVERLAY on %s (wl_output %p)",
                 target->geom.name.c_str(), (void*)target->wlOutput);
         } else {
             // Fallback: xdg_toplevel (compositor without layer-shell)
@@ -704,11 +704,11 @@ public:
                         }
                     }
                 }
-                dbg("fullscreen requested (noFullscreen=%d)", noFullscreen);
+                LSFG_FRAME_DBG("fullscreen requested (noFullscreen=%d)", noFullscreen);
             } else {
-                dbg("fullscreen SKIPPED (LSFGVK_APP_NO_FS set)");
+                LSFG_FRAME_DBG("fullscreen SKIPPED (LSFGVK_APP_NO_FS set)");
             }
-            dbg("window type: xdg_toplevel (Alt+Tab-able; layer-shell off)");
+            LSFG_FRAME_DBG("window type: xdg_toplevel (Alt+Tab-able; layer-shell off)");
 
             // Commit initial surface state
             wl_surface_commit(mSurface);
@@ -1110,7 +1110,7 @@ void xdgToplevelConfigure(void* data, xdg_toplevel* /*toplevel*/,
             stateStr += std::to_string(statePtr[i]);
         }
     }
-    dbg("toplevel configure %dx%d states=[%s]", width, height, stateStr.c_str());
+    LSFG_FRAME_DBG("toplevel configure %dx%d states=[%s]", width, height, stateStr.c_str());
     if (width <= 0 || height <= 0)
         return;
     // xdg-shell emits a configure after every buffer commit, not only on real
@@ -1150,7 +1150,7 @@ void layerSurfaceConfigure(void* data, zwlr_layer_surface_v1* layerSurface,
         return;
     if (width == backend->mWindowExtent.width && height == backend->mWindowExtent.height)
         return;
-    dbg("layer configure %ux%u (was %ux%u) -> FLAG", width, height,
+    LSFG_FRAME_DBG("layer configure %ux%u (was %ux%u) -> FLAG", width, height,
         backend->mWindowExtent.width, backend->mWindowExtent.height);
     backend->mWindowExtent = VkExtent2D{ width, height };
     backend->mPendingWidth = width;
@@ -1163,7 +1163,7 @@ void layerSurfaceClosed(void* data, zwlr_layer_surface_v1* /*layerSurface*/) {
     // processEvents signals the host to tear down via mClosePending,
     // matching the xdg_toplevel close path.
     auto* backend = static_cast<WaylandSurfaceBackend*>(data);
-    dbg("layer surface closed");
+    LSFG_FRAME_DBG("layer surface closed");
     backend->mClosePending = true;
 }
 

@@ -749,18 +749,11 @@ namespace ls::hud {
 
     void ImGuiHud::renderCardOver(vk::CommandBuffer& cb, VkImage dstImage,
             VkExtent2D dstExtent) {
-        static std::atomic<unsigned> rcoN{0};
-        const unsigned n = rcoN.fetch_add(1);
-        const bool dbg = (n % 256) == 0;
-        if (dbg)
-            std::fprintf(stderr, "imgui_hud: rco enter #%u\n", n);
         if (!this->coBuilt || !this->coPipeline)
             return;   /* silently skip until built */
         if (!ls::hud::ImGuiHud::drawing())
             return;
         this->syncTick();
-        if (dbg)
-            std::fprintf(stderr, "imgui_hud: rco post-syncTick\n");
         /* framebuffer cache per dst image (swapchain image handoff) */
         auto it = std::find_if(this->coFbs.begin(), this->coFbs.end(),
             [&](const CoFb& o){ return o.image == dstImage; });
@@ -915,18 +908,6 @@ namespace ls::hud {
         {
             std::lock_guard<std::mutex> lk(g_statsMtx);
             gFpsF = g_stats.gameFps; dFpsF = g_stats.presentedFps;
-        }
-        /* S42k: state-change tracer — one stderr line when the card's read
-           values change (0<->nonzero or step). Scoped dbg is shadowed by
-           a local `const bool dbg` in this fn, so print directly. */
-        {
-            static float lg = -1.f, ld = -1.f;
-            if (gFpsF != lg || dFpsF != ld) {
-                std::fprintf(stderr, "imgui_hud: hud read gf=%u df=%u\n",
-                    static_cast<uint32_t>(gFpsF + 0.5f),
-                    static_cast<uint32_t>(dFpsF + 0.5f));
-                lg = gFpsF; ld = dFpsF;
-            }
         }
         const uint32_t gFps = static_cast<uint32_t>(gFpsF + 0.5f);
         const uint32_t dFps = static_cast<uint32_t>(dFpsF + 0.5f);

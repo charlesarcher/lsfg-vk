@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "lsfg-vk-app/stream.hpp"
+#include "lsfg-vk-common/frame_dbg.hpp"
 #include "lsfg-vk-app/presentation.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
@@ -78,24 +79,6 @@ StreamState::~StreamState() {
 }
 
 namespace {
-    /// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
-    /// on LSFGVK_APP_DBG so the default stream stays clean.
-    const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
-    bool dbgEnabled() {
-        return envFlagOn("LSFGVK_APP_DBG");
-    }
-    void dbg(const char* fmt, ...) {
-        if (!dbgEnabled())
-            return;
-        char buf[256];
-        va_list ap;
-        va_start(ap, fmt);
-        std::vsnprintf(buf, sizeof(buf), fmt, ap);
-        va_end(ap);
-        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - g_dbgT0).count();
-        std::fprintf(stderr, "lsfg-vk-app: [dbg] %s (t+%lld ms)\n", buf, ms);
-    }
 
     /// bound the blocking recv() so a SIGINT (EINTR) or a silent peer can never
     /// hang the accept loop: SO_RCVTIMEO makes recvmsg return within this span
@@ -174,9 +157,9 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     setRecvTimeout(conn.fd(), RECV_TIMEOUT);
 
     // 1. HELLO: game identity + swapchain size/format --------------------
-    dbg("runStream: waiting for HELLO");
+    LSFG_FRAME_DBG("runStream: waiting for HELLO");
     auto helloMsg = recvStop(conn, stop);
-    dbg("runStream: HELLO received");
+    LSFG_FRAME_DBG("runStream: HELLO received");
     if (!helloMsg)
         return;
     const auto* hello = std::get_if<Hello>(&*helloMsg);
@@ -258,9 +241,9 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
                 vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     mall, probeSz);
-                dbg("host-import malloc OK");
+                LSFG_FRAME_DBG("host-import malloc OK");
             } catch (const std::exception& e) {
-                dbg("host-import malloc FAIL %s", e.what());
+                LSFG_FRAME_DBG("host-import malloc FAIL %s", e.what());
             }
             ::free(mall);
         }
@@ -277,9 +260,9 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
                         vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             p, probeSz);
-                        dbg("host-import shm_open OK");
+                        LSFG_FRAME_DBG("host-import shm_open OK");
                     } catch (const std::exception& e) {
-                        dbg("host-import shm_open FAIL %s", e.what());
+                        LSFG_FRAME_DBG("host-import shm_open FAIL %s", e.what());
                     }
                     ::munmap(p, probeSz);
                 }
@@ -329,7 +312,7 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             throw ls::error("dup() failed for POSIX staging memfd");
         conn.attachFd(sendFd);
         conn.send(Staging{});
-        dbg("posix-shm staging slot %zu size=%llu", i, (unsigned long long)bytes);
+        LSFG_FRAME_DBG("posix-shm staging slot %zu size=%llu", i, (unsigned long long)bytes);
         continue;
         }
         state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },
@@ -413,14 +396,14 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     //    on any throw before a successful import, close the handed dups (the
     //    backend has consumed none yet).
     try {
-        dbg("runStream: openContext start");
+        LSFG_FRAME_DBG("runStream: openContext start");
         auto& ctx = backend.openContext(
             std::span<const vk::ExchangeDescriptor>(sourceDescs),
             std::span<const vk::ExchangeDescriptor>(destDescs),
             state.gameUuid, neg.modifier, -1 /*syncFd ignored cross-device*/,
             w, h, false /*hdr: R8G8B8A8 staging, never format>57*/,
             1.0F / conf.flow_scale, conf.performance_mode);
-        dbg("runStream: openContext done");
+        LSFG_FRAME_DBG("runStream: openContext done");
         if (!backend.isCrossDevice(ctx))
             throw ls::error("backend context is not cross-device");
         state.context = ls::owned_ptr<ls::R<lsfgvk::backend::Context>>(

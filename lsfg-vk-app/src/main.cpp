@@ -14,6 +14,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "lsfg-vk-app/stream.hpp"
+#include "lsfg-vk-common/frame_dbg.hpp"
 #include "gui.hpp"
 #include "lsfg-vk-app/presentation.hpp"
 
@@ -68,13 +69,6 @@ namespace {
     /// TEMP DEBUG: monotonic elapsed-ms probe for reconnection timing. gated
     /// on LSFGVK_APP_DBG so the default stream stays clean.
     std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
-    void dbg(const char* what) {
-        if (std::getenv("LSFGVK_APP_DBG") == nullptr)
-            return;
-        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - g_dbgT0).count();
-        std::fprintf(stderr, "lsfg-vk-app: [dbg] main: %s (t+%lld ms)\n", what, ms);
-    }
 
     /// process-level frame-gen backend instance (never freed: makeLeaking).
     /// created once before the accept loop, alive for the whole run. its
@@ -470,10 +464,10 @@ int main(int argc, char** argv) {
             }
             if (!(pfd[1].revents & POLLIN)) continue;
 
-            dbg("listener ready, accepting");
+            LSFG_FRAME_DBG("listener ready, accepting");
             try {
                 auto conn = listener.accept();
-                dbg("accept returned");
+                LSFG_FRAME_DBG("accept returned");
 
                 const int key = conn.fd();
                 {
@@ -495,17 +489,17 @@ int main(int argc, char** argv) {
                                 return streams.at(key);
                             }(), g_stop, *vkPtr, *backendPtr, *confPtr, session);
                         } catch (const std::exception& e) {
-                            dbg("runStream returned (catch)");
+                            LSFG_FRAME_DBG("runStream returned (catch)");
                             std::cerr << "lsfg-vk-app: stream ended: " << e.what() << "\n";
-                            dbg("about to erase stream state (dtor)");
+                            LSFG_FRAME_DBG("about to erase stream state (dtor)");
                         }
-                        dbg("erasing stream state");
+                        LSFG_FRAME_DBG("erasing stream state");
                         {
                             std::lock_guard<std::mutex> lk(streamsMtx);
                             streams.erase(key);
                             streamsCv.notify_all();
                         }
-                        dbg("stream state erased (dtor done)");
+                        LSFG_FRAME_DBG("stream state erased (dtor done)");
                     });
                 thread.detach();
             } catch (const ls::ipc::socket_error& e) {
@@ -513,7 +507,7 @@ int main(int argc, char** argv) {
                     break;
                 std::cerr << "lsfg-vk-app: accept failed: " << e.what() << "\n";
             }
-            dbg("about to poll listener");
+            LSFG_FRAME_DBG("about to poll listener");
         }
 
         std::cerr << "lsfg-vk-app: shutting down\n";

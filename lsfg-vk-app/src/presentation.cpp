@@ -20,6 +20,13 @@
 // glibc keeps struct sigaction / sigemptyset behind __USE_POSIX; not needed here
 // but harmless. We only need poll/errno/close/getenv which are exposed.
 #include "lsfg-vk-app/presentation.hpp"
+#include "lsfg-vk-common/frame_dbg.hpp"
+
+using Clock = std::chrono::steady_clock;
+using Usec = std::chrono::microseconds;
+static inline long long elapsedUs(Clock::time_point a, Clock::time_point b) {
+    return std::chrono::duration_cast<Usec>(b - a).count();
+}
 #include "gui.hpp"
 
 #include "lsfg-vk-app/hud.hpp"
@@ -109,33 +116,7 @@ namespace {
     /// the doubled path. Env-gated: only mapped when LSFGVK_DBL_LEDGER=1.
     lsfgvk::ledger::LedgerSink g_ledgerApp;
 
-    /// TEMP DEBUG: elapsed-ms probe (app start) for stall localization. gated
-/// on LSFGVK_APP_DBG so the default stream stays clean.
-const std::chrono::steady_clock::time_point g_dbgT0 = std::chrono::steady_clock::now();
-bool dbgEnabled() {
-    /* S42o: "0"/empty must mean OFF — a bare getenv()!=nullptr treats
-       LSFGVK_APP_DBG=0 as enabled and keeps fprintf formatting alive
-       on the hot path. */
-    return envFlagOn("LSFGVK_APP_DBG");
-}
-using Clock = std::chrono::steady_clock;
-using Usec = std::chrono::microseconds;
-static inline long long elapsedUs(Clock::time_point a, Clock::time_point b) {
-    return std::chrono::duration_cast<Usec>(b - a).count();
-}
-void dbg(const char* fmt, ...) {
-    if (!dbgEnabled())
-        return;
-    char buf[256];
-        va_list ap;
-        va_start(ap, fmt);
-        std::vsnprintf(buf, sizeof(buf), fmt, ap);
-        va_end(ap);
-        const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - g_dbgT0).count();
-        std::fprintf(stderr, "lsfg-vk-app: [dbg] %s (t+%lld ms)\n", buf, ms);
-    }
-    /// clamp v into [lo, hi] (mirrors the main.cpp swapchain-clamp helper).
+        /// clamp v into [lo, hi] (mirrors the main.cpp swapchain-clamp helper).
     uint32_t clamp32(uint32_t v, uint32_t lo, uint32_t hi) {
         return v < lo ? lo : (v > hi ? hi : v);
     }
@@ -174,17 +155,17 @@ void dbg(const char* fmt, ...) {
             return -1;
         uint32_t handle = 0;
         if (drmPrimeFDToHandle(drmFd, foreignFd, &handle) != 0) {
-            dbg("prime FDToHandle errno=%d fd=%d", errno, foreignFd);
+            LSFG_FRAME_DBG("prime FDToHandle errno=%d fd=%d", errno, foreignFd);
             return -1;
         }
         int localFd = -1;
         if (drmPrimeHandleToFD(drmFd, handle, O_CLOEXEC | O_RDWR, &localFd) != 0) {
-            dbg("prime HandleToFD errno=%d handle=%u", errno, handle);
+            LSFG_FRAME_DBG("prime HandleToFD errno=%d handle=%u", errno, handle);
             (void)drmCloseBufferHandle(drmFd, handle);
             return -1;
         }
         (void)drmCloseBufferHandle(drmFd, handle);
-        dbg("prime reexport foreign=%d -> local=%d handle=%u", foreignFd, localFd, handle);
+        LSFG_FRAME_DBG("prime reexport foreign=%d -> local=%d handle=%u", foreignFd, localFd, handle);
         return localFd;
     }
 
@@ -215,13 +196,13 @@ void dbg(const char* fmt, ...) {
             return;
         const int drm = existingRenderFd();
         if (drm < 0) {
-            dbg("pin gtt: no render node fd in this process");
+            LSFG_FRAME_DBG("pin gtt: no render node fd in this process");
             return;
         }
         drm_prime_handle ph{};
         ph.fd = dmaFd;
         if (::drmIoctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
-            dbg("pin gtt: FD_TO_HANDLE errno=%d drm=%d", errno, drm);
+            LSFG_FRAME_DBG("pin gtt: FD_TO_HANDLE errno=%d drm=%d", errno, drm);
             return;
         }
         drm_amdgpu_gem_op op{};
@@ -235,7 +216,7 @@ void dbg(const char* fmt, ...) {
         q.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
         q.value = reinterpret_cast<uint64_t>(&info);
         const int ir = ::drmIoctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &q);
-        dbg("pin gtt drm=%d handle=%u set=%d errno=%d get=%d domains=0x%llx flags=0x%llx explicit=%d",
+        LSFG_FRAME_DBG("pin gtt drm=%d handle=%u set=%d errno=%d get=%d domains=0x%llx flags=0x%llx explicit=%d",
             drm, ph.handle, pr, pr != 0 ? errno : 0, ir,
             static_cast<unsigned long long>(info.domains),
             static_cast<unsigned long long>(info.domain_flags),
@@ -250,13 +231,13 @@ void dbg(const char* fmt, ...) {
         once = true;
         const int drm = existingRenderFd();
         if (drm < 0) {
-            dbg("gem flags: no render node fd in this process");
+            LSFG_FRAME_DBG("gem flags: no render node fd in this process");
             return;
         }
         drm_prime_handle ph{};
         ph.fd = dmaFd;
         if (::drmIoctl(drm, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) != 0) {
-            dbg("gem flags: FD_TO_HANDLE errno=%d", errno);
+            LSFG_FRAME_DBG("gem flags: FD_TO_HANDLE errno=%d", errno);
             return;
         }
         drm_amdgpu_gem_create_in info{};
@@ -265,7 +246,7 @@ void dbg(const char* fmt, ...) {
         op.op = AMDGPU_GEM_OP_GET_GEM_CREATE_INFO;
         op.value = reinterpret_cast<uint64_t>(&info);
         const int ir = ::drmIoctl(drm, DRM_IOCTL_AMDGPU_GEM_OP, &op);
-        dbg("gem flags rc=%d domains=0x%llx flags=0x%llx explicit=%d uncached=%d coherent=%d uswc=%d",
+        LSFG_FRAME_DBG("gem flags rc=%d domains=0x%llx flags=0x%llx explicit=%d uncached=%d coherent=%d uswc=%d",
             ir,
             static_cast<unsigned long long>(info.domains),
             static_cast<unsigned long long>(info.domain_flags),
@@ -346,7 +327,7 @@ void dbg(const char* fmt, ...) {
         auto& cb = *state.dmaCbs.at(0);
         auto& fence = *state.dmaFences.at(0);
         if (!fence.wait(dvk, 50ULL * 1000 * 1000)) {
-            dbg("dma-in probe %s: fence wait failed before submit", tag);
+            LSFG_FRAME_DBG("dma-in probe %s: fence wait failed before submit", tag);
             return;
         }
         fence.reset(dvk);
@@ -375,7 +356,7 @@ void dbg(const char* fmt, ...) {
             try {
                 haveQ = cb.getQueryPoolResults(dvk, g_dmaHopTs.pool, 0, 2, qv, true);
             } catch (const std::exception& e) {
-                dbg("dma-in probe %s timestamp read failed: %s", tag, e.what());
+                LSFG_FRAME_DBG("dma-in probe %s timestamp read failed: %s", tag, e.what());
             }
         }
         const double wallMs = elapsedUs(t0, t1) / 1000.0;
@@ -391,7 +372,7 @@ void dbg(const char* fmt, ...) {
                 parkMs = wallMs - copyMs;
             }
         }
-        dbg("dma-in probe %s wall %.3f ms exec %.3f ms park %.3f ms cal0=%d",
+        LSFG_FRAME_DBG("dma-in probe %s wall %.3f ms exec %.3f ms park %.3f ms cal0=%d",
             tag, wallMs, copyMs, parkMs, haveCal0);
     }
 
@@ -455,7 +436,7 @@ void dbg(const char* fmt, ...) {
             submitDmaTimed(state, "local-full-copy-2", copyF);
             submitDmaTimed(state, "empty-after-local", empty);
         } catch (const std::exception& e) {
-            dbg("dma-in probe local copy failed: %s", e.what());
+            LSFG_FRAME_DBG("dma-in probe local copy failed: %s", e.what());
         }
     }
 
@@ -512,16 +493,16 @@ void dbg(const char* fmt, ...) {
                     g_dmaHopTs.pool = VK_NULL_HANDLE;
                 g_dmaHopTs.getCal = reinterpret_cast<PFN_vkGetCalibratedTimestampsEXT>(
                     dvk.fi().GetDeviceProcAddr(dvk.dev(), "vkGetCalibratedTimestampsEXT"));
-                dbg("dma-in timestamps period %.3f ns/tick pool=%d cal=%d",
+                LSFG_FRAME_DBG("dma-in timestamps period %.3f ns/tick pool=%d cal=%d",
                     g_dmaHopTs.periodNs,
                     g_dmaHopTs.pool != VK_NULL_HANDLE,
                     g_dmaHopTs.getCal != nullptr);
             }
-            dbg("dma-in device ready (no gfx)");
+            LSFG_FRAME_DBG("dma-in device ready (no gfx)");
             return true;
         } catch (const std::exception& e) {
             ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
-            dbg("dma-in device failed: %s", e.what());
+            LSFG_FRAME_DBG("dma-in device failed: %s", e.what());
             state.dmaVk.reset();
             return false;
         }
@@ -557,7 +538,7 @@ void dbg(const char* fmt, ...) {
                 state.dmaSrc.at(sidx).emplace(dvk, ext, state.captureFormat,
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT, imp, std::nullopt, shareLay);
             } catch (const std::exception& e) {
-                dbg("dma-in import share failed: %s", e.what());
+                LSFG_FRAME_DBG("dma-in import share failed: %s", e.what());
                 return -1;
             }
         }
@@ -570,7 +551,7 @@ void dbg(const char* fmt, ...) {
                 auto exp = state.dmaDst.at(sidx)->exportDmaBuf(dvk);
                 state.dmaDstFds.at(sidx) = exp.fd;
             } catch (const std::exception& e) {
-                dbg("dma-in vram dest failed: %s", e.what());
+                LSFG_FRAME_DBG("dma-in vram dest failed: %s", e.what());
                 return -1;
             }
         }
@@ -622,7 +603,7 @@ void dbg(const char* fmt, ...) {
             try {
                 haveQ = cb.getQueryPoolResults(dvk, g_dmaHopTs.pool, 0, 2, qv, true);
             } catch (const std::exception& e) {
-                dbg("dma-in timestamp read failed: %s", e.what());
+                LSFG_FRAME_DBG("dma-in timestamp read failed: %s", e.what());
             }
         }
         static int nHop = 0;
@@ -640,7 +621,7 @@ void dbg(const char* fmt, ...) {
                     parkMs = wallMs - copyMs;
                 }
             }
-            dbg("dma-in hop slot %u wall %.3f ms copy %.3f ms park %.3f ms "
+            LSFG_FRAME_DBG("dma-in hop slot %u wall %.3f ms copy %.3f ms park %.3f ms "
                 "q0=%llu q1=%llu cal0=%d cal1=%d",
                 sidx, wallMs, copyMs, parkMs,
                 static_cast<unsigned long long>(qv[0]),
@@ -783,7 +764,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         auto has = [&](VkPresentModeKHR m) {
             return std::find(modes.begin(), modes.end(), m) != modes.end();
         };
-        dbg("surface present modes (%u):%s%s%s%s",
+        LSFG_FRAME_DBG("surface present modes (%u):%s%s%s%s",
             n,
             has(VK_PRESENT_MODE_FIFO_KHR) ? " FIFO" : "",
             has(VK_PRESENT_MODE_FIFO_RELAXED_KHR) ? " FIFO_RELAXED" : "",
@@ -835,7 +816,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     if (createRes != VK_SUCCESS)
         throw ls::vulkan_error(createRes, "CreateSwapchainKHR failed");
 
-    dbg("swapchain extent %ux%u fmt=%u mode=%s minImages=%u (stream %ux%u)",
+    LSFG_FRAME_DBG("swapchain extent %ux%u fmt=%u mode=%s minImages=%u (stream %ux%u)",
         extent.width, extent.height, ci.imageFormat, modeName, minImages, w, h);
 
     uint32_t imageCount{};
@@ -857,13 +838,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     const bool noWsi = std::getenv("LSFGVK_NO_OVERLAY_WSI")
         && std::getenv("LSFGVK_NO_OVERLAY_WSI")[0] == '1';
     if (g_overlay.wsi) {
-        dbg("reusing overlay WSI %ux%u (stream %ux%u)",
+        LSFG_FRAME_DBG("reusing overlay WSI %ux%u (stream %ux%u)",
             g_overlay.extent.width, g_overlay.extent.height, w, h);
     } else if (boot1080 || noWsi) {
-        dbg("defer overlay WSI (boot1080=%d noWsi=%d stream %ux%u)",
+        LSFG_FRAME_DBG("defer overlay WSI (boot1080=%d noWsi=%d stream %ux%u)",
             boot1080 ? 1 : 0, noWsi ? 1 : 0, w, h);
     } else {
-        dbg("defer overlay WSI until first FRAME (stream %ux%u)", w, h);
+        LSFG_FRAME_DBG("defer overlay WSI until first FRAME (stream %ux%u)", w, h);
     }
     VkSwapchainKHR swapchain = g_overlay.swapchain;
     auto& swapImages = g_overlay.swapImages;
@@ -896,10 +877,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         bool* drop;
         ~SwapchainGuard() {
             if (drop == nullptr || !*drop) {
-                dbg("guard: keeping overlay WSI");
+                LSFG_FRAME_DBG("guard: keeping overlay WSI");
                 return;
             }
-            dbg("guard: dropping overlay WSI");
+            LSFG_FRAME_DBG("guard: dropping overlay WSI");
             if (g_overlay.swapchain != VK_NULL_HANDLE && vk != nullptr)
                 vk->df().DestroySwapchainKHR(vk->dev(), g_overlay.swapchain, VK_NULL_HANDLE);
             g_overlay.swapchain = VK_NULL_HANDLE;
@@ -907,7 +888,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             if (g_overlay.wsi)
                 g_overlay.wsi->destroy();
             g_overlay.wsi.reset();
-            dbg("guard: overlay WSI dropped");
+            LSFG_FRAME_DBG("guard: overlay WSI dropped");
         }
     };
     SwapchainGuard guard{ &vk, &dropOverlay };
@@ -1175,11 +1156,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         throw ls::vulkan_error(res, "AcquireNextImageKHR failed");
                     return true;
                 }
-                static int acqSpinN = 0;
-                if ((acqSpinN++ % 240) == 0) {
-                    std::cerr << "lsfg-vk-app: [dbg] acquire spin #"
-                              << acqSpinN << " (no image yet)\n";
-                }
+                /* S43: an unconditional print on the acquire-retry path.
+                   It only fires when the swapchain runs dry, but it is still
+                   the frame path and still formatted every 240 spins. The
+                   loop now just pumps events and tries again; the stall is
+                   visible on the card without writing to stderr. */
                 processWsiEvents(0);   // may deliver the wl_buffer release
             }
         };
@@ -1257,7 +1238,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             {
                 static uint32_t lastG = 0, lastD = 0; static int logThrottle = 0;
                 if ((gameFps != lastG || presentedFps != lastD) && logThrottle++ < 240)
-                    dbg("stats win: gf=%u df=%u dt=%.3f", gameFps, presentedFps, dt);
+                    LSFG_FRAME_DBG("stats win: gf=%u df=%u dt=%.3f", gameFps, presentedFps, dt);
                 if (gameFps != lastG || presentedFps != lastD) { lastG = gameFps; lastD = presentedFps; }
             }
             lsfgvk::gui::g_guiState.currentFpsReal.store(static_cast<float>(gameFps));
@@ -1399,7 +1380,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 importSyncFd(vk, doneWaitSem.at(destCount).handle(), snapFd);
                 const auto tImport1 = Clock::now();
                 realWaits.push_back(doneWaitSem.at(destCount).handle());
-                dbg("output: REAL importSyncFd %lld us", elapsedUs(tImport0, tImport1));
+                LSFG_FRAME_DBG("output: REAL importSyncFd %lld us", elapsedUs(tImport0, tImport1));
             }
             cbs.at(cbIdx).blitImage(vk,
                 {
@@ -1432,7 +1413,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     { signalSem.at(presentIdx % signalPool).handle() }, VK_NULL_HANDLE, 0,
                     cbFences.at(cbIdx).handle());
                 const auto tSubmit1 = Clock::now();
-                dbg("output: REAL acquire %lld us blit %lld us lock %lld us submit %lld us (total %lld us)",
+                LSFG_FRAME_DBG("output: REAL acquire %lld us blit %lld us lock %lld us submit %lld us (total %lld us)",
                     elapsedUs(tReal0, tAcquire), elapsedUs(tAcquire, tBlitEnd),
                     elapsedUs(tLock0, tLock1), elapsedUs(tLock1, tSubmit1),
                     elapsedUs(tReal0, tSubmit1));
@@ -1505,7 +1486,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     }
                     prevPresentNs = nowNs;
                 }
-                dbg("MEASURED LATENCY: REAL present slot %d latency %.2f ms", stagingIdx, latMs);
+                LSFG_FRAME_DBG("MEASURED LATENCY: REAL present slot %d latency %.2f ms", stagingIdx, latMs);
             }
             ++presentIdx;
             ++presentedFrames;
@@ -1654,7 +1635,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         cur.schedDoneNs = pf->schedDoneNs;
                     } else if (wantDropWsi.exchange(false, std::memory_order_relaxed)
                             && g_overlay.wsi) {
-                        dbg("output: idle drop overlay WSI (keep IPC)");
+                        LSFG_FRAME_DBG("output: idle drop overlay WSI (keep IPC)");
                         {
                             std::lock_guard<std::mutex> lk(submitMtx);
                             vk.df().DeviceWaitIdle(vk.dev());
@@ -1787,7 +1768,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 Clock::now().time_since_epoch()).count());
                         const double latMs = (nowNs > cur.captureTsNs) ? (nowNs - cur.captureTsNs) / 1e6 : 0.0;
                         lsfgvk::gui::g_guiState.currentLatencyGenMs.store(static_cast<float>(latMs));
-                        dbg("MEASURED LATENCY: GEN present slot %u latency %.2f ms", cur.stagingIdx, latMs);
+                        LSFG_FRAME_DBG("MEASURED LATENCY: GEN present slot %u latency %.2f ms", cur.stagingIdx, latMs);
                         // Session 40 ledger: IPC hop (capture→recv) + app solve
                         // (recv→schedDone excerpts the app's work window)
                         if (cur.recvTsNs > cur.captureTsNs) {
@@ -1799,7 +1780,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                     (cur.schedDoneNs - cur.recvTsNs) / 1e6));
                             static uint32_t ledgerLogged = 0;
                             if (ledgerLogged++ < 5)
-                                dbg("ledger: ipc %.3f ms solve %.3f ms (slot %u)",
+                                LSFG_FRAME_DBG("ledger: ipc %.3f ms solve %.3f ms (slot %u)",
                                     ipcMs,
                                     (cur.schedDoneNs > cur.recvTsNs)
                                         ? (cur.schedDoneNs - cur.recvTsNs) / 1e6 : 0.0,
@@ -1811,7 +1792,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     ++cur.nextDest;
                     lsfgvk::gui::g_guiState.totalGenPresents.fetch_add(1);
                     lsfgvk::gui::g_guiState.totalPresents.fetch_add(1);
-                    dbg("output: GEN present dest %zu/%zu (slot %u)",
+                    LSFG_FRAME_DBG("output: GEN present dest %zu/%zu (slot %u)",
                         i, destCount, cur.stagingIdx);
                 } else if (cur.active) {
                     // --- REAL present: this frame's private snapshot -----------
@@ -1824,7 +1805,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     cur.active = false;
                     lsfgvk::gui::g_guiState.totalRealPresents.fetch_add(1);
                     lsfgvk::gui::g_guiState.totalPresents.fetch_add(1);
-                    dbg("output: REAL present (slot %u)", cur.stagingIdx);
+                    LSFG_FRAME_DBG("output: REAL present (slot %u)", cur.stagingIdx);
                 } else if (lastShownStagingIdx >= 0) {
                     // --- HOLD-LAST: nothing newer to show ---------------------
                     // The last REAL present is still on screen; re-blitting
@@ -1848,7 +1829,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // Concurrent runPresent shares g_overlay; two output threads
                 // on one swapchain is FRAME 0 then hang.
                 if (!boot1080 && g_overlay.wsi && g_overlay.wsi->processEvents(0)) {
-                    dbg("output: processEvents requested stop (close)");
+                    LSFG_FRAME_DBG("output: processEvents requested stop (close)");
                     break;
                 }
             }
@@ -1955,14 +1936,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     char link[64]{};
                     (void)::readlink(("/proc/self/fd/" + std::to_string(captureFd)).c_str(),
                         link, sizeof(link) - 1);
-                    dbg("input: FRAME fd=%d link=%s", captureFd, link);
+                    LSFG_FRAME_DBG("input: FRAME fd=%d link=%s", captureFd, link);
                 }
                 static const bool dropGen = std::getenv("LSFGVK_DROP_GEN")
                     && std::getenv("LSFGVK_DROP_GEN")[0] == '1';
                 if (dropGen) {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
-                    dbg("input: DROP_GEN Release (slot %u) (fidx %llu)",
+                    LSFG_FRAME_DBG("input: DROP_GEN Release (slot %u) (fidx %llu)",
                         frame->stagingIdx, (unsigned long long)fidx);
                     ++fidx;
                     continue;
@@ -1975,7 +1956,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     && std::getenv("LSFGVK_DUAL_HOST")[0] == '0');
                 if (!dmaHop) {
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
-                    dbg("input: Release first (slot %u) (fidx %llu)",
+                    LSFG_FRAME_DBG("input: Release first (slot %u) (fidx %llu)",
                         frame->stagingIdx, (unsigned long long)fidx);
                 }
 
@@ -1993,7 +1974,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     static uint32_t fdKindLogged{ 0 };
                     if (fdKindLogged < 8) {
                         ++fdKindLogged;
-                        dbg("input: FRAME fd slot %u link='%s' needShare=%d",
+                        LSFG_FRAME_DBG("input: FRAME fd slot %u link='%s' needShare=%d",
                             sidxEarly, nlink > 0 ? link : "?", needShare);
                     }
                     const bool isShare = nlink > 0 && std::strstr(link, "dmabuf") != nullptr;
@@ -2004,7 +1985,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         state.dmaFds.at(sidxEarly) = keepFd;
                         if (sidxEarly < state.aImports.size())
                             state.aImports.at(sidxEarly).reset();
-                        dbg("input: keep render dma-buf slot %u link='%s'",
+                        LSFG_FRAME_DBG("input: keep render dma-buf slot %u link='%s'",
                             sidxEarly, nlink > 0 ? link : "?");
                         ::close(captureFd);
                         captureFd = -1;
@@ -2012,7 +1993,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
                 if (dmaHop && captureFd < 0) {
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
-                    dbg("input: dma-buf keep, hop on capture-done (slot %u)",
+                    LSFG_FRAME_DBG("input: dma-buf keep, hop on capture-done (slot %u)",
                         frame->stagingIdx);
                     ++fidx;
                     continue;
@@ -2039,14 +2020,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (dmaHop
                             && static_cast<int>(frame->stagingIdx) != pendingDmaRelease)
                         conn.send(ls::ipc::Release{ frame->stagingIdx });
-                    dbg("input: snapshot skip (cb busy) (fidx %llu)",
+                    LSFG_FRAME_DBG("input: snapshot skip (cb busy) (fidx %llu)",
                         (unsigned long long)fidx);
                 } else {
                 snapCbFence.reset(vk);
                 if (dmaHop && pendingDmaRelease >= 0) {
                     const uint32_t done = static_cast<uint32_t>(pendingDmaRelease);
                     conn.send(ls::ipc::Release{ done });
-                    dbg("input: Release slot %u", done);
+                    LSFG_FRAME_DBG("input: Release slot %u", done);
                     pendingDmaRelease = -1;
                 }
                 bool waitWriteDone = false;
@@ -2059,7 +2040,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     static uint32_t pollLogged{ 0 };
                     if (pollLogged < 8) {
                         ++pollLogged;
-                        dbg("input: poll write-complete %d revents=%d wall %.3f ms",
+                        LSFG_FRAME_DBG("input: poll write-complete %d revents=%d wall %.3f ms",
                             pr, pfd.revents, elapsedUs(tPoll0, Clock::now()) / 1000.0);
                     }
                     ::close(captureFd);
@@ -2077,7 +2058,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             // Dest data is safely in offload VRAM. Release render
                             // slot immediately so the game can capture next frame.
                             conn.send(ls::ipc::Release{ sidx });
-                            dbg("input: Release immediate after dma-in slot %u", sidx);
+                            LSFG_FRAME_DBG("input: Release immediate after dma-in slot %u", sidx);
                         }
                     }
                     if (srcFd >= 0 && !state.aImports.at(sidx).has_value()) {
@@ -2099,9 +2080,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 state.captureFormat, VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
                                 tryFd, std::nullopt, aLayout,
                                 VK_SHARING_MODE_EXCLUSIVE, families);
-                            dbg("input: import render dma-buf slot %u (copy)", sidx);
+                            LSFG_FRAME_DBG("input: import render dma-buf slot %u (copy)", sidx);
                         } catch (const std::exception& e) {
-                            dbg("input: render dma-buf import failed slot %u: %s",
+                            LSFG_FRAME_DBG("input: render dma-buf import failed slot %u: %s",
                                 sidx, e.what());
                         }
                     }
@@ -2130,7 +2111,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     }
                     std::memcpy(state.hostPtrs.at(sidx), state.shmMaps.at(sidx),
                         state.shmBytes);
-                    dbg("input: posix-shm memcpy slot %u", sidx);
+                    LSFG_FRAME_DBG("input: posix-shm memcpy slot %u", sidx);
 
                     // Session-40 click-response detector (LSFGVK_CODETECT=1):
                     // downsampled grid RMS-diff of the newest captured game frame
@@ -2199,7 +2180,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             }
                             std::fwrite(rgb.data(), 1, rgb.size(), out);
                             std::fclose(out);
-                            dbg("dumped %s", path);
+                            LSFG_FRAME_DBG("dumped %s", path);
                         }
                     }
                 } else if (captureFd >= 0) {
@@ -2210,7 +2191,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     static uint32_t pollLogged{ 0 };
                     if (pollLogged < 8) {
                         ++pollLogged;
-                        dbg("input: poll frame-ready %d revents=%d", pr, pfd.revents);
+                        LSFG_FRAME_DBG("input: poll frame-ready %d revents=%d", pr, pfd.revents);
                     }
                     if (sidx < state.dmaFds.size() && state.dmaFds.at(sidx) >= 0) {
                         dma_buf_import_sync_file imp{};
@@ -2219,13 +2200,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         if (::ioctl(state.dmaFds.at(sidx), DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &imp) != 0) {
                             static int nImp = 0;
                             if (nImp < 4) {
-                                dbg("input: IMPORT_SYNC_FILE WRITE errno=%d", errno);
+                                LSFG_FRAME_DBG("input: IMPORT_SYNC_FILE WRITE errno=%d", errno);
                                 ++nImp;
                             }
                         } else {
                             static bool impOk = false;
                             if (!impOk) {
-                                dbg("input: IMPORT_SYNC_FILE WRITE ok slot %u", sidx);
+                                LSFG_FRAME_DBG("input: IMPORT_SYNC_FILE WRITE ok slot %u", sidx);
                                 impOk = true;
                             }
                         }
@@ -2260,7 +2241,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     static bool loggedBlit = false;
                     if (!loggedBlit) {
                         loggedBlit = true;
-                        dbg("input: dma-buf hop copy+compute %u -> RGBA",
+                        LSFG_FRAME_DBG("input: dma-buf hop copy+compute %u -> RGBA",
                             static_cast<unsigned>(state.captureFormat));
                     }
                     if (!swizzleMid.at(sidx)) {
@@ -2386,7 +2367,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
                 }
                 snapFd = snapshotSem.exportFd(vk);
-                dbg("input: snapshot submitted xferQ=%d sameAsGfx=%d (fidx %llu)",
+                LSFG_FRAME_DBG("input: snapshot submitted xferQ=%d sameAsGfx=%d (fidx %llu)",
                     vk.transferQueueHandle() != VK_NULL_HANDLE,
                     vk.transferQueueHandle() == vk.queue() ? 1 : 0,
                     (unsigned long long)fidx);
@@ -2503,7 +2484,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         if (res != VK_SUCCESS)
                             throw ls::vulkan_error(res, "empty gen QueueSubmit failed");
                         lastSubmit = now;
-                        dbg("input: EMPTY_%s QueueSubmit period=%d (fidx %llu)",
+                        LSFG_FRAME_DBG("input: EMPTY_%s QueueSubmit period=%d (fidx %llu)",
                             emptyXfer ? "XFER" : "GEN", periodMs,
                             (unsigned long long)fidx);
                     }
@@ -2523,7 +2504,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (doneFds.size() != destCount)
                     throw ls::error("backend returned " + std::to_string(doneFds.size())
                         + " done fds, expected " + std::to_string(destCount));
-                dbg("input: scheduleFrames took %lld us (fidx %llu)",
+                LSFG_FRAME_DBG("input: scheduleFrames took %lld us (fidx %llu)",
                     elapsedUs(tSched0, Clock::now()), (unsigned long long)fidx);
 
                 PendingFrame pf{ std::move(doneFds), snapFd,
@@ -2587,7 +2568,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 void releaseOverlayWsi(const vk::Vulkan& vk) {
     if (!g_overlay.wsi)
         return;
-    dbg("release overlay WSI (no live stream)");
+    LSFG_FRAME_DBG("release overlay WSI (no live stream)");
     if (g_overlay.swapchain != VK_NULL_HANDLE)
         vk.df().DestroySwapchainKHR(vk.dev(), g_overlay.swapchain, VK_NULL_HANDLE);
     g_overlay.swapchain = VK_NULL_HANDLE;
