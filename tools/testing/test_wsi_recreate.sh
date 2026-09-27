@@ -48,7 +48,7 @@ env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH -u LSFGVK_LAYER_DBG \
   LSFGVK_APP_DBG=1 \
   LSFGVK_CONFIG="${LSFGVK_CONFIG:-$HOME/.config/lsfg-vk/conf.toml}" \
   LSFGVK_APP_SOCK="$SOCK" \
-  "$APP" --profile app-oneway --session wayland >>"$APPLOG" 2>&1 &
+  LSFGVK_LAYER_SHELL=1 "$APP" --profile app-oneway --session wayland >>"$APPLOG" 2>&1 &
 APP_PID=$!
 
 cleanup() {

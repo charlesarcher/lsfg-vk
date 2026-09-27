@@ -134,6 +134,7 @@ start_app() {
     LSFGVK_DUAL_HOST="$dual_host_flag" \
     LSFGVK_CONFIG="$CONFIG_FILE" \
     LSFGVK_APP_SOCK="$SOCK" \
+    LSFGVK_LAYER_SHELL=1 \
     "$APP" --profile "${LSFGVK_APP_PROFILE:-app-oneway}" --session wayland >"$OUT/$logname" 2>&1 &
   APP_PID=$!
   for _ in $(seq 1 60); do
