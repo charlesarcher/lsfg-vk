@@ -1342,22 +1342,24 @@ void ImGuiHud::setupThemeAndFont() {
                 static_cast<double>(s.ipcMs), static_cast<double>(s.genMs),
                 static_cast<double>(s.scanMs));
         ImGui::TextDisabled("%s", pipe);
-        /* S43: frame identity row. Same label/value shape as the rows above
-           (dim label at x=0, value at x=56) so the card's rhythm is
-           unchanged, and one single Text call so it can never wrap the way
-           separate SameLine cells did.
+        /* S43: frame identity, ONE row: "frame  <capture> / <presents>".
 
-           frame = capture index of the frame the game produced, which is
-           what a per-frame log line would carry; doubled = running count of
-           presents submitted for it. A movie frame showing "frame 4211" ties
-           straight to a log line about capture 4211. */
+           captureIdx is the index of the frame the game produced -- what a
+           per-frame log line would carry. presentIdx is the running count of
+           presents submitted for it. A movie frame showing "4211 / 8422"
+           ties straight to a log line about capture 4211.
+
+           This was two rows and only the first was ever visible. Keeping the
+           card's height unchanged is the point: the composite band is fixed
+           and two attempts to grow it (a real-rect fix, then a wider band)
+           both corrupted the display. One row, same height as before, and
+           nothing below the composite band is needed. */
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "frame");
         ImGui::SameLine(56.f);
-        ImGui::Text("%llu", static_cast<unsigned long long>(s.captureIdx));
-        ImGui::TextColored(ImVec4(0.60f, 0.63f, 0.70f, 1.00f), "doubled");
-        ImGui::SameLine(56.f);
-        ImGui::Text("%llu", static_cast<unsigned long long>(s.presentIdx));
+        ImGui::Text("%llu / %llu",
+            static_cast<unsigned long long>(s.captureIdx),
+            static_cast<unsigned long long>(s.presentIdx));
         // remember the widest ACTUAL row for the next frame's min-width:
         float realMax = 0.f;
         realMax = std::max(realMax, ImGui::GetItemRectSize().x);
