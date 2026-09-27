@@ -122,6 +122,8 @@ namespace {
     void storePxl(VkFormat format, uint8_t* p, uint8_t r, uint8_t g, uint8_t b) {
         if (format == VK_FORMAT_B8G8R8A8_UNORM) {
             p[0] = b; p[1] = g; p[2] = r; p[3] = 255;
+        } else if (format == VK_FORMAT_R8G8B8A8_UNORM) {
+            p[0] = r; p[1] = g; p[2] = b; p[3] = 255;
         } else { // A8B8G8R8_UNORM_PACK32
             p[0] = 255; p[1] = b; p[2] = g; p[3] = r;
         }
@@ -130,7 +132,8 @@ namespace {
 
 Hud::Hud(const vk::Vulkan& vk, uint32_t outputHeight, VkFormat format)
     : vk(vk), format(format), cmdbuf(vk) {
-    if (format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_A8B8G8R8_UNORM_PACK32)
+    if (format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_A8B8G8R8_UNORM_PACK32
+        && format != VK_FORMAT_R8G8B8A8_UNORM)
         throw ls::error("hud: unsupported swapchain format "
             + std::to_string(static_cast<int>(format)));
     // display scale: legible at 1080p, grows with the output resolution

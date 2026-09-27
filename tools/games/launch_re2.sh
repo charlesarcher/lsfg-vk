@@ -27,9 +27,15 @@ APP_PID=""
 if ! pgrep -x lsfg-vk-app >/dev/null; then
     mkdir -p "$(dirname "$LSFGVK_APP_SOCK")"
     rm -f "$LSFGVK_APP_SOCK"
+    # Layer-shell OVERLAY is the authored default and is REQUIRED here: with two
+    # fullscreen toplevels (this overlay + the game) an xdg_toplevel is
+    # re-activated ~20 Hz by KWin, re-stacking them and flickering. The layer
+    # surface sits above everything and never enters the focus/stacking cycle.
+    # Keyboard interactivity is NONE (backend_wayland.cpp), so the game keeps
+    # the keyboard and an empty input region keeps pointer clicks click-through.
     env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH -u LSFGVK_LAYER_DBG \
         LSFGVK_APP_DBG=1 \
-        LSFGVK_LAYER_SHELL=1 \
+        LSFGVK_LAYER_SHELL="${LSFGVK_LAYER_SHELL:-1}" \
         LSFGVK_CONFIG="$LSFGVK_CONFIG" \
         LSFGVK_APP_SOCK="$LSFGVK_APP_SOCK" \
         setsid -f "$APP_BIN" --profile app-oneway --session wayland \

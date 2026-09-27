@@ -823,9 +823,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
     std::unique_ptr<ls::hud::Hud> hud;
     auto makeHud = [&] {
-        if (!hud && g_overlay.extent.height > 0)
-            hud = std::make_unique<ls::hud::Hud>(vk, g_overlay.extent.height,
-                static_cast<VkFormat>(g_overlay.imageFormat));
+        if (!hud && g_overlay.extent.height > 0) {
+            // The fps/latency box is instrumentation, never a gate on doubling:
+            // an unrenderable pixel format must degrade to "no box", not kill the
+            // present stream (a throw here used to black the panel for the run).
+            try {
+                hud = std::make_unique<ls::hud::Hud>(vk, g_overlay.extent.height,
+                    static_cast<VkFormat>(g_overlay.imageFormat));
+            } catch (const std::exception& e) {
+                dbg("hud: disabled (%s) - continuing without box", e.what());
+            }
+        }
     };
 
     struct SwapchainGuard {

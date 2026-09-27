@@ -222,6 +222,17 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     };
     const VkSharingMode sourceSharing = vk.hasTransferQueue()
         ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
+    // Host-import capability probe. This is a THROWAWAY 256x256 self-test that
+    // runs once per stream; it is NOT the production staging path and its
+    // failure is benign. Production POSIX staging (below) allocates the GPU
+    // image from posix_memalign'd memory -- the malloc variant probed here --
+    // while the shm_open mapping is only the CPU-visible memcpy mirror.
+    //
+    // A "FAIL" line from this block therefore says nothing about whether
+    // staging works. RADV rejects the shm-backed import with
+    // VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003) on this box; the
+    // malloc-backed import succeeds and is the one production depends on.
+    // Read these as capability facts, not errors.
     {
         const size_t probeSz = 4ull * 1024 * 1024;
         void* mall = nullptr;
@@ -230,9 +241,9 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
                 vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
                     VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                     mall, probeSz);
-                dbg("host-import malloc OK");
+                dbg("host-import probe: malloc-backed OK (= production staging path)");
             } catch (const std::exception& e) {
-                dbg("host-import malloc FAIL %s", e.what());
+                dbg("host-import probe: malloc-backed UNSUPPORTED %s", e.what());
             }
             ::free(mall);
         }
@@ -249,9 +260,11 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
                         vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
                             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                             p, probeSz);
-                        dbg("host-import shm_open OK");
+                        dbg("host-import probe: shm-backed OK (unused by production)");
                     } catch (const std::exception& e) {
-                        dbg("host-import shm_open FAIL %s", e.what());
+                        dbg("host-import probe: shm-backed unsupported (%s)"
+                            " -- benign, production uses the malloc-backed path",
+                            e.what());
                     }
                     ::munmap(p, probeSz);
                 }
