@@ -44,10 +44,6 @@ namespace {
 } // namespace
 namespace ls::hud {
     static std::atomic<float> wsMinW{ 0.f };   /* sticky text-driven width */
-    /* S43: the card's real rect in RT px. Written by drawWidgets each frame
-       under g_statsMtx, read by renderCardOver to pick what to composite. */
-    float ImGuiHud::s_cardX0 = 0.f, ImGuiHud::s_cardY0 = 0.f;
-    float ImGuiHud::s_cardX1 = 0.f, ImGuiHud::s_cardY1 = 0.f;
 
     // ---- cross-thread toggle + stats --------------------------------------
     namespace {
@@ -80,10 +76,6 @@ namespace ls::hud {
         g_stats.frameTimesMs[idx] = ms;
         g_stats.frameTimesIdx = (g_stats.frameTimesIdx + 1) % 100000;
         g_stats.frameTimesCount = std::min<uint32_t>(180, g_stats.frameTimesCount + 1);
-    }
-    ImGuiHud::CardRect ImGuiHud::cardRect() {
-        std::lock_guard<std::mutex> lk(g_statsMtx);
-        return CardRect{ s_cardX0, s_cardY0, s_cardX1, s_cardY1 };
     }
 
     void ImGuiHud::publish(const Stats& s) {
@@ -915,17 +907,9 @@ namespace ls::hud {
         /* pack = shader PC layout: (offX, offY, scX, scY) in ONE vec4 */
         const float rtW = static_cast<float>(this->rtSize.width);
         const float rtH = static_cast<float>(this->rtSize.height);
-        /* S43: composite the card's REAL rect. The hardcoded 463..627 /
-           13..112 band was sized for an older, shorter card, so rows added
-           at the bottom (the frame-identity rows) were cropped off before
-           they ever reached the screen. Fall back to the old band only
-           before the first frame has published a rect. */
-        const auto cr = ImGuiHud::cardRect();
-        const bool haveRect = (cr.x1 > cr.x0 + 1.f) && (cr.y1 > cr.y0 + 1.f);
-        const float winX0 = (haveRect ? cr.x0 : 463.f) / rtW;
-        const float winY0 = (haveRect ? cr.y0 : 13.f) / rtH;
-        const float winX1 = (haveRect ? cr.x1 : 627.f) / rtW;
-        const float winY1 = (haveRect ? cr.y1 : 112.f) / rtH;
+        /* imgui window rect inside the RT (px): x 463..627, y 13..112 */
+        const float winX0 = 463.f / rtW, winY0 = 13.f / rtH;
+        const float winX1 = 627.f / rtW, winY1 = 112.f / rtH;
         float gFpsF = 0.f, dFpsF = 0.f;
         {
             std::lock_guard<std::mutex> lk(g_statsMtx);
@@ -1386,14 +1370,6 @@ void ImGuiHud::setupThemeAndFont() {
                 static_cast<int>(s.frameTimesIdx % 180),
                 nullptr, 0.f, 25.f,
                 ImVec2(ImGui::GetContentRegionAvail().x, 15.f));
-        }
-        /* S43: publish the card's real rect (RT px) for renderCardOver. */
-        {
-            const ImVec2 wp = ImGui::GetWindowPos();
-            const ImVec2 wz = ImGui::GetWindowSize();
-            std::lock_guard<std::mutex> lk(g_statsMtx);
-            s_cardX0 = wp.x; s_cardY0 = wp.y;
-            s_cardX1 = wp.x + wz.x; s_cardY1 = wp.y + wz.y;
         }
         ImGui::End();
         ImGui::PopStyleColor();

@@ -99,20 +99,8 @@ namespace ls::hud {
     private:
         void drawWidgets(const struct Stats& s);   // the actual imgui frame
 
-        /* S43: the card's real rect in RT pixels, published by drawWidgets.
-           renderCardOver used to composite a HARDCODED band (x 463..627,
-           y 13..112) sized for an older, shorter card, so any row added at
-           the bottom was silently cropped away. The composite now reads
-           this and adapts. */
-        struct CardRect { float x0, y0, x1, y1; };
-        static CardRect cardRect();
         void setupThemeAndFont();
 
-        /* S43: the card's real rect in RT px, published by drawWidgets each
-           frame under g_statsMtx and read by renderCardOver. The composite
-           used to sample a hardcoded band sized for an older, shorter card,
-           which silently cropped any row added at the bottom. */
-        static float s_cardX0, s_cardY0, s_cardX1, s_cardY1;
         void ensureFade(float dt);
         void blitUploadFenceGuard();
 
