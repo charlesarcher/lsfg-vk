@@ -43,6 +43,11 @@ IsolatedSwapchain& isolatedAt(VkSwapchainKHR handle);
 void destroyIsolated(const vk::Vulkan& vk, VkSwapchainKHR handle);
 
 /// create layer-owned images + recycle fences. never calls the driver swapchain.
+/// S43: the extent capture surfaces are pinned to (LSFGVK_CAPTURE_WxH), or
+/// the game's own extent when unset. Shared so the swapchain info the app is
+/// told about matches the images we actually allocate.
+VkExtent2D pinnedCaptureExtent(const VkExtent2D& gameExtent);
+
 IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateInfoKHR& info);
 void storeIsolated(VkSwapchainKHR handle, IsolatedSwapchain iso);
 

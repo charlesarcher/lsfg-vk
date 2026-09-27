@@ -153,10 +153,45 @@ void destroyIsolated(const vk::Vulkan& vk, VkSwapchainKHR handle) {
     g_tombstones->insert(handle);
 }
 
+/// S43: the extent the capture surfaces are pinned to.
+///
+/// The doubler composites into the panel, so the capture has to BE the
+/// panel's mode. Inheriting the game's imageExtent lets a game that is
+/// windowed (or sized to the work area) quietly hand us a smaller surface:
+/// FurMark on a 2560x1440 output asked for 2560x1382, and every "1440p"
+/// measurement was really 1382.
+///
+/// LSFGVK_CAPTURE_WxH pins it. Absent that we fall back to the game's own
+/// extent rather than guessing at a mode the layer cannot see -- the layer
+/// has no wl_output, so the honest default is what the game asked for and
+/// an explicit override is the only way to be sure.
+VkExtent2D pinnedCaptureExtent(const VkExtent2D& gameExtent) {
+    static const VkExtent2D pinned = [] {
+        VkExtent2D e{ 0, 0 };
+        const char* s = std::getenv("LSFGVK_CAPTURE_WxH");
+        if (s) {
+            unsigned w = 0, h = 0;
+            if (std::sscanf(s, "%ux%u", &w, &h) == 2 && w > 0 && h > 0) {
+                e.width = w;
+                e.height = h;
+            }
+        }
+        return e;
+    }();
+    if (pinned.width != 0) {
+        std::cerr << "lsfg-vk: capture extent pinned to " << pinned.width
+                  << "x" << pinned.height << " (game asked "
+                  << gameExtent.width << "x" << gameExtent.height << ")\n";
+        return pinned;
+    }
+    return gameExtent;
+}
+
 IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateInfoKHR& info) {
     IsolatedSwapchain iso;
     iso.format = info.imageFormat;
-    iso.extent = info.imageExtent;
+    const VkExtent2D extent = pinnedCaptureExtent(info.imageExtent);
+    iso.extent = extent;
     uint32_t count = 5u;
     const bool exportIsolated = std::getenv("LSFGVK_EXPORT_ISOLATED")
         && std::getenv("LSFGVK_EXPORT_ISOLATED")[0] == '1';
@@ -180,9 +215,9 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
         lay.mode = vk::ImageMode::Linear;
         lay.hostVisible = true;
     }
-    const uint32_t pitch = (info.imageExtent.width * 4u + 255u) / 256u * 256u;
+    const uint32_t pitch = (extent.width * 4u + 255u) / 256u * 256u;
     const uint64_t gemBytes =
-        (static_cast<uint64_t>(pitch) * info.imageExtent.height + 4095ull) & ~4095ull;
+        (static_cast<uint64_t>(pitch) * extent.height + 4095ull) & ~4095ull;
     int nExplicit = 0;
     for (uint32_t i = 0; i < count; ++i) {
         int gemFd = -1;
@@ -198,7 +233,7 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
                 gemFd = -1;
                 if (imp < 0)
                     throw ls::error("dup isolated explicit fd failed");
-                iso.images.emplace_back(vk, info.imageExtent, info.imageFormat, usage,
+                iso.images.emplace_back(vk, extent, info.imageFormat, usage,
                     imp, std::nullopt, expl, sharing, shareFams);
                 ++nExplicit;
             } catch (const std::exception& e) {
@@ -206,11 +241,11 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
                     ::close(gemFd);
                 std::cerr << "lsfg-vk: isolated explicit-sync import failed: "
                     << e.what() << "\n";
-                iso.images.emplace_back(vk, info.imageExtent, info.imageFormat, usage,
+                iso.images.emplace_back(vk, extent, info.imageFormat, usage,
                     std::nullopt, std::nullopt, lay, sharing, shareFams);
             }
         } else {
-            iso.images.emplace_back(vk, info.imageExtent, info.imageFormat, usage,
+            iso.images.emplace_back(vk, extent, info.imageFormat, usage,
                 std::nullopt, std::nullopt, lay, sharing, shareFams);
         }
         iso.handles.push_back(iso.images.back().handle());
@@ -236,12 +271,12 @@ IsolatedSwapchain createIsolated(const vk::Vulkan& vk, const VkSwapchainCreateIn
     const bool dedicated = q != VK_NULL_HANDLE && q != vk.queue();
     if (!dedicated)
         std::cerr << "lsfg-vk: isolated swapchain " << count << " images "
-                  << info.imageExtent.width << "x" << info.imageExtent.height
+                  << extent.width << "x" << extent.height
                   << " FALLBACK render queue (noted=" << g_signalNoted
                   << " fam=" << g_signalFamily << " idx=" << g_signalIndex << ")\n";
     else
         std::cerr << "lsfg-vk: isolated swapchain " << count << " images "
-                  << info.imageExtent.width << "x" << info.imageExtent.height
+                  << extent.width << "x" << extent.height
                   << " DEDICATED fam=" << g_signalFamily << " idx=" << g_signalIndex << "\n";
     return iso;
 }
