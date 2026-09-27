@@ -1198,135 +1198,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         int lastShownStagingIdx{ -1 }; // newest real frame actually shown (HOLD-LAST)
         uint64_t presentIdx{ 0 };      // rolling index into the signal pool
 
-        /* S43: display-slot pacer.
-
-           Measured on kennykiller / RE2 2560x1440 @240 Hz with the ns-resolution
-           dbl-ledger (2026-09-25): present-to-present gaps came in dead-tight at
-           the 4.167 ms refresh period, BUT 1110 of 4094 gaps were TWO periods
-           (a refresh showing nothing new) and 1212 were inside ONE period (two
-           submits into a single slot, one discarded by the mailbox). The card
-           reads a perfect 240/s because the app really does submit 240/s — what
-           the panel shows is stutter: new, frozen, dropped, new.
-
-           Cause: the output loop presents the moment a frame is ready (the
-           takeNewest/takeNewestWait path below) and nothing in the app knows the
-           panel's refresh period, so every present races the compositor. A
-           submit landing just before a refresh shows at once; one landing just
-           after waits nearly a whole extra slot. REAL frames dodge this because
-           the game hands them over on a tidy rhythm; GEN frames are computed
-           from a real pair and inherit all of that wobble plus their own solve
-           time, so they scatter (5..13 ms typical, 29 ms worst).
-
-           Fix: learn the refresh period from the compositor's OWN latch
-           feedback (same CLOCK_MONOTONIC the present path already reads) and
-           hold each submit until the next slot boundary. Submits become evenly
-           spaced by construction instead of by luck.
-
-           The period is the MINIMUM of the last 64 inter-latch deltas, not the
-           mean: a two-slot gap is exactly the stutter we are fixing, so
-           averaging it in would inflate the grid and lock the stutter in. A
-           minimum also tracks a panel rate change (240 -> 60 Hz) within 64
-           presents, ~0.27 s at 240 Hz. */
-        static const bool paceOn = [] {
-            const char* e = getenv("LSFGVK_PACE");
-            return !(e && (e[0] == '0' || e[0] == '\0'));   // unset = ON
-        }();
-        /* Fire this far BEFORE the slot boundary, never on it. Boundary is the
-           ambiguity point: a present submitted exactly at the tick cannot know
-           whether it made that refresh or the next one, and a few microseconds
-           decide. That ambiguity IS the skip+pileup pair — one present lands
-           late, the next rushes to reclaim the lost slot, and they collide in
-           the same refresh. Aim early and the frame is already queued when the
-           compositor scans out. Tunable for the panel's actual commit latency;
-           0.7 ms default, measured comfortable on kennykiller DP-7 @240 Hz. */
-        static const uint64_t paceLeadNs = [] {
-            const char* e = getenv("LSFGVK_PACE_LEAD_US");
-            const long long us = e ? atoll(e) : 700;
-            return (us > 0 ? (uint64_t)us : 0ULL) * 1000ULL;
-        }();
-        constexpr size_t kPeriodWin = 64;
-        std::array<uint64_t, kPeriodWin> gapWin{};
-        size_t gapPos{ 0 }, gapFill{ 0 };
-        uint64_t lastLatchForPace{ 0 };
-        uint64_t nextSlotNs{ 0 };
-        uint64_t pacePeriodNs{ 0 };
-        auto nowNs = [] {
-            return static_cast<uint64_t>(std::chrono::duration_cast<
-                std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
-        };
-        // feed one observed latch; re-derives the grid and the next deadline
-        auto paceOnLatch = [&](uint64_t latchNs) {
-            if (!paceOn || latchNs == 0)
-                return;
-            if (lastLatchForPace != 0 && latchNs > lastLatchForPace) {
-                const uint64_t d = latchNs - lastLatchForPace;
-                if (d > 0 && d < 100'000'000ULL) { gapWin[gapPos] = d; gapPos = (gapPos + 1) % kPeriodWin; if (gapFill < kPeriodWin) ++gapFill; }
-            }
-            lastLatchForPace = latchNs;
-            if (gapFill != 0) {
-                uint64_t mn = UINT64_MAX;
-                for (size_t i = 0; i < gapFill; ++i) if (gapWin[i] && gapWin[i] < mn) mn = gapWin[i];
-                if (mn != UINT64_MAX) pacePeriodNs = mn;
-            }
-            if (pacePeriodNs != 0) {
-                /* Absolute re-anchor from the newest latch — NOT max(old, new).
-                   Keeping the old (later) deadline is what made a late present
-                   cascade: the deadline stayed in the past, so the next present
-                   also fired immediately and two submits landed in one refresh.
-                   Re-anchoring means a missed slot is simply not taken; the grid
-                   moves on and the following present waits properly again. */
-                const uint64_t want = latchNs + pacePeriodNs;
-                nextSlotNs = (want > paceLeadNs) ? (want - paceLeadNs) : 0;
-            }
-        };
-        /* Claim a slot the instant a present is SUBMITTED. Latch feedback is
-           asynchronous: after we submit a GEN present the compositor has not told
-           us it latched yet, so nextSlotNs still points at the slot we just
-           took. The REAL present for the same capture then finds it "already
-           due", skips the wait, and submits into that same slot — two presents,
-           one refresh, one of them discarded. At a game rate above half the
-           panel rate that happens on nearly every frame and reads on screen as
-           exactly the judder/glitch it is. Advancing the grid on submit (and
-           letting the async latch correct residual drift) gives every present
-           its own slot. */
-        auto paceClaimSlot = [&]() {
-            if (!paceOn || pacePeriodNs == 0)
-                return;
-            const uint64_t submit = nowNs();
-            if (nextSlotNs == 0 || submit > nextSlotNs)
-                nextSlotNs = submit;          // already late: re-anchor here
-            nextSlotNs += pacePeriodNs;       // this present owns the next slot
-        };
-        /* True when the grid is so far behind that a generated frame could not
-           land in a free slot even if we solved it right now. A capture in this
-           state must present its REAL frame instead of spending a solve on a
-           frame the panel will never show. */
-        auto paceGenSlotFree = [&]() {
-            if (!paceOn || pacePeriodNs == 0 || nextSlotNs == 0)
-                return true;                 // grid not learned yet: don't skip
-            const uint64_t now = nowNs();
-            if (now < nextSlotNs)
-                return true;                 // slot still in the future: room
-            return (now - nextSlotNs) < pacePeriodNs;
-        };
-        // hold until the next slot boundary; no-op until the grid is learned
-        auto paceWait = [&]() {
-            if (!paceOn || pacePeriodNs == 0 || nextSlotNs == 0)
-                return;
-            const uint64_t now = nowNs();
-            if (now >= nextSlotNs)
-                return;                        // already late: take the slot, do
-            const uint64_t remain = nextSlotNs - now;   // NOT chase the lost time
-            if (remain > 2 * pacePeriodNs)     // hopelessly behind: never add
-                return;                        // more than one extra slot of wait
-            if (remain > 1'500'000ULL) {      // >1.5 ms out: sleep, don't burn a core
-                std::this_thread::sleep_for(std::chrono::nanoseconds(remain - 1'000'000ULL));
-                return;
-            }
-            while (nowNs() < nextSlotNs)      // final 1.5 ms: spin for exactness
-                std::this_thread::yield();
-        };
-
         Clock::time_point statsLastTime = Clock::now();
         /* S43: lastReal/lastGen MUST be per-thread, exactly like
            statsLastTime. The app spawns one std::thread per accepted
@@ -1568,11 +1439,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             }
             cbIdx = (cbIdx + 1) % cbRingSize;
             processWsiEvents(0);
-            const auto tPace0 = Clock::now();
-            paceWait();
-            if (tPace0 != Clock::now())
-                dbg("output: REAL pace held %lld us",
-                    elapsedUs(tPace0, Clock::now()));
             const VkPresentInfoKHR presentInfo{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                 .waitSemaphoreCount = 1,
@@ -1607,7 +1473,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     // (frame captureTsNs from the layer, compositor latch).
                     g_ledgerApp.init();
                     g_ledgerApp.publish(capTsNs, latchNs);
-                    paceOnLatch(latchNs);   // S43: feed the slot grid
                     if (latchNs > submitNs && latchNs - submitNs < 100'000'000ULL) {
                         const float scanMs = static_cast<float>(
                             static_cast<double>(latchNs - submitNs) / 1e6);
@@ -1820,7 +1685,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
 
                 // exactly one present this vblank: GEN, REAL, or HOLD-LAST.
-                if (cur.active && cur.nextDest < destCount && paceGenSlotFree()) {
+                if (cur.active && cur.nextDest < destCount) {
                     // --- GEN present for destination images[cur.nextDest] ------
                     const size_t i = cur.nextDest;
                     const auto tGen0 = Clock::now();
@@ -1869,11 +1734,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             cbFences.at(cbIdx).handle());
                     }
                     processWsiEvents(0);
-                    const auto tPace0 = Clock::now();
-                    paceWait();
-                    if (tPace0 != Clock::now())
-                        dbg("output: GEN pace held %lld us",
-                            elapsedUs(tPace0, Clock::now()));
                     const VkPresentInfoKHR presentInfo{
                         .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
                         .waitSemaphoreCount = 1,
@@ -1902,8 +1762,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                probe (captureTs=0 is skipped as a stale slot). */
                             g_ledgerApp.init();
                             g_ledgerApp.publishGen(latchNs);
-                            paceOnLatch(latchNs);   // S43: feed the slot grid
-                            const uint64_t submitNs = static_cast<uint64_t>(
+                                    const uint64_t submitNs = static_cast<uint64_t>(
                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                                     tGenSubmit.time_since_epoch()).count());
                             if (latchNs > submitNs && latchNs - submitNs < 100'000'000ULL) {
@@ -1950,7 +1809,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     ++presentIdx;
                     ++presentedFrames;
                     ++cur.nextDest;
-                    paceClaimSlot();   // this present owns the next slot
                     lsfgvk::gui::g_guiState.totalGenPresents.fetch_add(1);
                     lsfgvk::gui::g_guiState.totalPresents.fetch_add(1);
                     dbg("output: GEN present dest %zu/%zu (slot %u)",
@@ -1960,7 +1818,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (!presentReal(cur.stagingIdx, cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs))
                         break;
                     lastShownStagingIdx = static_cast<int>(cur.stagingIdx);
-                    paceClaimSlot();   // this present owns the next slot
                     for (int d : cur.doneFds)   // close any never-imported gen fds
                         if (d >= 0)
                             ::close(d);
