@@ -371,16 +371,45 @@ namespace {
             VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, hostPtr, &hp);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkGetMemoryHostPointerPropertiesEXT() failed");
-        const uint32_t bits = reqs.memoryTypeBits & hp.memoryTypeBits;
-        if (!bits)
-            throw ls::vulkan_error("no common memory type for imported host pointer");
-        uint32_t mti = 0;
-        bool found = false;
-        for (uint32_t i = 0; i < 32; ++i) {
-            if (bits & (1u << i)) { mti = i; found = true; break; }
+        // VkMemoryHostPointerPropertiesEXT has NO memoryTypeBits field - only
+        // pHostPointer and attributeFlags. Reading memoryTypeBits off it gave
+        // garbage, and the loop below then took the first set bit, which is
+        // memory type 0: DEVICE_LOCAL VRAM. Importing a host pointer into VRAM
+        // fails with VK_ERROR_HOST_MEMORY_ALLOC (-1000072003), which is what
+        // the startup probe logs as "host-import shm_open FAIL".
+        //
+        // Intersect the IMAGE's memoryTypeBits with the actual memory
+        // properties and pick a HOST_VISIBLE type, preferring
+        // HOST_COHERENT so the render card's DMA and our reads agree without
+        // an explicit flush. Fall back to host-visible-only, then to any
+        // device-local type (which will fail loudly rather than silently
+        // mis-mapping).
+        VkPhysicalDeviceMemoryProperties memProps{};
+        vk.fi().GetPhysicalDeviceMemoryProperties(vk.physdev(), &memProps);
+        const auto pickHost = [&](const uint32_t requiredFlags) -> std::optional<uint32_t> {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if (!(reqs.memoryTypeBits & (1u << i)))
+                    continue;
+                const VkMemoryPropertyFlags f = memProps.memoryTypes[i].propertyFlags;
+                if ((f & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) == 0)
+                    continue;
+                if ((f & requiredFlags) == requiredFlags)
+                    return i;
+            }
+            return std::nullopt;
+        };
+        auto mtiOpt = pickHost(VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+            | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (!mtiOpt)
+            mtiOpt = pickHost(0);
+        if (!mtiOpt) {
+            for (uint32_t i = 0; i < memProps.memoryTypeCount; ++i) {
+                if (reqs.memoryTypeBits & (1u << i)) { mtiOpt = i; break; }
+            }
         }
-        if (!found)
-            throw ls::vulkan_error("no memory type index for host pointer");
+        if (!mtiOpt)
+            throw ls::vulkan_error("no host-visible memory type for host pointer import");
+        const uint32_t mti = *mtiOpt;
         const VkImportMemoryHostPointerInfoEXT importInfo{
             .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT,
             .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT,
