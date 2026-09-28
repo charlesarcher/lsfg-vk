@@ -534,11 +534,15 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
                     + " but the backend runs on " + backendId
                     + "; they must be the same physical card or the copy "
                     "reads pages this GPUVM cannot see");
-            if (backend.isCrossDevice(ctx))
-                throw ls::error(
-                    "udmabuf: backend context is cross-device, but this "
-                    "transport must import the shared buffer on the doubler "
-                    "device, not the render GPU's image");
+            // Do NOT re-assert !isCrossDevice here. The UUID check above is
+            // the real one: it proves the shared buffer is on the same
+            // physical card the backend runs on. isCrossDevice() answers a
+            // different question - whether the backend imported the RENDER
+            // GPU's image - and on the udmabuf bounce the backend never
+            // receives that image at all; it receives the shared buffer. So
+            // a cross-device flag here is expected, not a fault, and keeping
+            // this assertion was exactly the p2p assumption the transport is
+            // built not to need.
             const uint64_t wantBytes = static_cast<uint64_t>(state.shmBytes);
             if (state.udmaBufs.empty() || !state.udmaBufs.front().has_value())
                 throw ls::error("udmabuf: shared buffer not imported on the "
