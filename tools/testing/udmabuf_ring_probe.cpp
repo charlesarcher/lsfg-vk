@@ -80,6 +80,18 @@
 #ifndef DOUBLER_ONLY
 #define DOUBLER_ONLY 0
 #endif
+/* BUFFER_ONLY: import the udmabuf as a plain VkBuffer and do a pure
+ * buffer-to-buffer copy. No VkImage, no tiled layout, nothing to disagree
+ * with about row pitch. Isolates "the import maps the wrong pages" from
+ * "the linear image layout does not match what the CPU wrote". Implies
+ * DOUBLER_ONLY behaviour: only the 9060 is initialised. */
+#ifndef BUFFER_ONLY
+#define BUFFER_ONLY 0
+#endif
+#if BUFFER_ONLY && !DOUBLER_ONLY
+#undef DOUBLER_ONLY
+#define DOUBLER_ONLY 1
+#endif
 #if !FULLSCALE && (W != 512 || H != 256)
 #undef W
 #undef H
@@ -89,12 +101,30 @@
 
 static const size_t BYTES = (size_t)W * H * 4;
 
+static const char* vkResultName(VkResult r) {
+    switch (r) {
+        case VK_SUCCESS: return "VK_SUCCESS";
+        case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
+        case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+        case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
+        case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
+        case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
+        case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
+        case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
+        default: return "VkResult";
+    }
+}
+
+/// Abort on ANY non-success. Never ignore a VkResult here: a failed
+/// vkAllocateMemory followed by a vkBindBufferMemory on the uninitialised
+/// VkDeviceMemory is a segfault in the driver, which tells us nothing about
+/// why the import failed.
 #define CHK(x)                                                            \
     do {                                                                  \
         VkResult r_ = (x);                                                \
         if (r_ != VK_SUCCESS) {                                           \
-            std::fprintf(stderr, "%s:%d %s -> %d\n", __FILE__, __LINE__,   \
-                         #x, (int)r_);                                   \
+            std::fprintf(stderr, "%s:%d %s -> %d (%s)\n", __FILE__,      \
+                         __LINE__, #x, (int)r_, vkResultName(r_));        \
             std::exit(1);                                                 \
         }                                                                 \
     } while (0)
@@ -147,11 +177,36 @@ struct Gpu {
         const float prio = 1.0f;
         VkDeviceQueueCreateInfo qci{ .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
             .queueFamilyIndex = qfi, .queueCount = 1, .pQueuePriorities = &prio };
-        const char* exts[] = { "VK_KHR_external_memory_fd",
+        // Query what the device actually supports. Requesting an extension
+        // that is absent makes vkCreateDevice fail, but assuming a fixed set
+        // and never printing it means a later import runs on a device that
+        // never got the extension it needs.
+        uint32_t en = 0;
+        CHK(vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, nullptr));
+        std::vector<VkExtensionProperties> avail(en);
+        CHK(vkEnumerateDeviceExtensionProperties(pd, nullptr, &en, avail.data()));
+        // VK_KHR_external_memory is a DEPENDENCY of the other two and must be
+        // enabled alongside them, otherwise vkCreateDevice silently returns a
+        // device with no external-memory support at all.
+        const char* want[] = { "VK_KHR_external_memory",
+                               "VK_KHR_external_memory_fd",
                                "VK_EXT_external_memory_dma_buf" };
+        std::vector<const char*> exts;
+        for (const char* w : want) {
+            bool have = false;
+            for (const auto& a : avail)
+                if (std::strcmp(a.extensionName, w) == 0) { have = true; break; }
+            std::printf("    ext %-34s %s\n", w, have ? "available" : "MISSING");
+            if (!have) {
+                std::fprintf(stderr, "%s: %s not supported\n", name.c_str(), w);
+                std::exit(5);
+            }
+            exts.push_back(w);
+        }
         VkDeviceCreateInfo dci{ .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
-            .enabledExtensionCount = 2, .ppEnabledExtensionNames = exts };
+            .enabledExtensionCount = (uint32_t)exts.size(),
+            .ppEnabledExtensionNames = exts.data() };
         CHK(vkCreateDevice(pd, &dci, nullptr, &dev));
         vkGetDeviceQueue(dev, qfi, 0, &queue);
         VkCommandPoolCreateInfo pci{ .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -287,6 +342,104 @@ static void submitWait(Gpu& g, VkCommandBuffer cb) {
     vkDestroyFence(g.dev, fence, nullptr);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * BUFFER-ONLY mode: no image anywhere in the path.
+ *
+ * The image path reports a mismatch from byte 512 of row 0, which means the
+ * GPU is not reading the pages the CPU wrote. Two causes fit that: the linear
+ * image layout does not match what the CPU laid down, or the udmabuf import
+ * lands on entirely different pages. A pure buffer-to-buffer copy has no
+ * tiled layout to disagree about, so it separates the two.
+ */
+#if BUFFER_ONLY
+static VkBuffer makeBuffer(Gpu& g, VkDeviceSize bytes, VkDeviceMemory* memOut,
+                           bool hostVisible, VkBufferUsageFlags usage) {
+    VkBufferCreateInfo bi{ .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .size = bytes, .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer buf{};
+    CHK(vkCreateBuffer(g.dev, &bi, nullptr, &buf));
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.dev, buf, &req);
+    std::printf("    buffer req: size=%llu (offered %llu, %s)\n",
+        (unsigned long long)req.size, (unsigned long long)bytes,
+        req.size > bytes ? "SHORT" : "ok");
+    if (req.size > bytes)
+        std::printf("    >>> buffer needs %llu > %llu: OVERRUN\n",
+            (unsigned long long)req.size, (unsigned long long)bytes);
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(g.pd, &mp);
+    const VkMemoryPropertyFlags need = hostVisible
+        ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+        : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    uint32_t mti = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i)
+        if ((req.memoryTypeBits & (1u << i)) &&
+            (mp.memoryTypes[i].propertyFlags & need) == need) { mti = i; break; }
+    if (mti == UINT32_MAX) { std::fprintf(stderr, "no suitable memory type\n"); std::exit(2); }
+    VkMemoryAllocateInfo mai{ .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .allocationSize = req.size, .memoryTypeIndex = mti };
+    CHK(vkAllocateMemory(g.dev, &mai, nullptr, memOut));
+    CHK(vkBindBufferMemory(g.dev, buf, *memOut, 0));
+    return buf;
+}
+
+/// import the udmabuf as a plain VkBuffer on one device
+static VkBuffer importDmabufBuffer(Gpu& g, int fd, VkDeviceSize bytes,
+                                   VkDeviceMemory* memOut) {
+    // The buffer must declare the external handle types it will be bound to,
+    // or the import is rejected at bind time
+    // (VUID-vkBindBufferMemory-memory-02985).
+    VkExternalMemoryBufferCreateInfo em{ .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+    VkBufferCreateInfo bi{ .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+        .pNext = &em, .size = bytes, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE };
+    VkBuffer buf{};
+    CHK(vkCreateBuffer(g.dev, &bi, nullptr, &buf));
+    VkMemoryRequirements req{};
+    vkGetBufferMemoryRequirements(g.dev, buf, &req);
+    std::printf("    %s buffer import: req=%llu backing=%llu (%s)\n",
+        g.name.c_str(), (unsigned long long)req.size, (unsigned long long)bytes,
+        req.size > bytes ? "SHORT" : "ok");
+    if (req.size > bytes)
+        std::printf("    >>> import needs %llu > %llu: OVERRUN\n",
+            (unsigned long long)req.size, (unsigned long long)bytes);
+
+    using FdPropsFn = VkResult(VKAPI_PTR*)(VkDevice,
+        VkExternalMemoryHandleTypeFlagBits, int, VkMemoryFdPropertiesKHR*);
+    auto getFdProps = (FdPropsFn)
+        vkGetDeviceProcAddr(g.dev, "vkGetMemoryFdPropertiesKHR");
+    if (!getFdProps) { std::fprintf(stderr, "no vkGetMemoryFdPropertiesKHR\n"); std::exit(3); }
+    VkMemoryFdPropertiesKHR fp{ .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR };
+    CHK(getFdProps(g.dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, fd, &fp));
+
+    VkPhysicalDeviceMemoryProperties mp{};
+    vkGetPhysicalDeviceMemoryProperties(g.pd, &mp);
+    uint32_t mti = UINT32_MAX;
+    for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
+        if (!(req.memoryTypeBits & (1u << i))) continue;
+        if (!(fp.memoryTypeBits & (1u << i))) continue;
+        if (mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) { mti = i; break; }
+    }
+    if (mti == UINT32_MAX) { std::fprintf(stderr, "no host-visible type\n"); std::exit(2); }
+
+    VkImportMemoryFdInfoKHR imp{ .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
+        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd };
+    // NOTE: no VkMemoryDedicatedAllocateInfo here. Dedicated imports are an
+    // IMAGE feature; chaining it onto a buffer import segfaults RADV inside
+    // vkBindBufferMemory. The import chain is just VkMemoryAllocateInfo.
+    VkMemoryAllocateInfo mai{ .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        .pNext = &imp, .allocationSize = req.size, .memoryTypeIndex = mti };
+    // Allocate directly into *memOut and bind *that. Declaring a separate
+    // `mem` here and binding it left the buffer bound to VK_NULL_HANDLE, which
+    // vkBindBufferMemory accepted and the driver later segfaulted on.
+    CHK(vkAllocateMemory(g.dev, &mai, nullptr, memOut));
+    CHK(vkBindBufferMemory(g.dev, buf, *memOut, 0));
+    return buf;
+}
+#endif
+
 /// one ring slot: a udmabuf plus per-GPU images over it
 struct Slot {
     int memfd{-1};
@@ -297,9 +450,17 @@ struct Slot {
     VkDeviceMemory renderLocalMem{VK_NULL_HANDLE};
     VkImage doublerLocal{VK_NULL_HANDLE};
     VkDeviceMemory doublerLocalMem{VK_NULL_HANDLE};
+#if BUFFER_ONLY
+    VkBuffer sharedBuf{VK_NULL_HANDLE};      // udmabuf imported as a buffer
+    VkDeviceMemory sharedBufMem{VK_NULL_HANDLE};
+    VkBuffer dstBuf{VK_NULL_HANDLE};         // device-local destination
+    VkDeviceMemory dstBufMem{VK_NULL_HANDLE};
+#endif
 };
 
 static void makeSlot(Slot& sl, Gpu& render, Gpu& doubler, size_t size) {
+    const size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    const size_t imgSize = (BYTES + page - 1) & ~(page - 1);   // image only
     // udmabuf requires the backing memfd to be sealable and sealed
     // F_SEAL_SHRINK, and it must NOT carry F_SEAL_WRITE.
     sl.memfd = (int)syscall(SYS_memfd_create, "udma-ring",
@@ -321,7 +482,11 @@ static void makeSlot(Slot& sl, Gpu& render, Gpu& doubler, size_t size) {
     ::close(dev);
     if (sl.dmafd < 0) { std::perror("UDMABUF_CREATE"); std::exit(1); }
 
-#if DOUBLER_ONLY
+#if BUFFER_ONLY
+    sl.sharedBuf = importDmabufBuffer(doubler, ::dup(sl.dmafd), size, &sl.sharedBufMem);
+    sl.dstBuf = makeBuffer(doubler, imgSize, &sl.dstBufMem, true,
+        VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+#elif DOUBLER_ONLY
     sl.imgDoubler = importDmabuf(doubler, ::dup(sl.dmafd), VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT, size);
     sl.doublerLocal = allocLocal(doubler,
@@ -406,6 +571,52 @@ static void renderFill(Gpu& render, Slot& sl, uint32_t frame) {
     submitWait(render, cb);
 }
 
+#if BUFFER_ONLY
+/// pure buffer-to-buffer copy out of the shared udmabuf
+static void bufferDrain(Gpu& doubler, Slot& sl, VkDeviceSize imgSize) {
+    VkCommandBuffer cb = beginOneShot(doubler);
+    VkBufferMemoryBarrier pre{ .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = sl.sharedBuf, .offset = 0, .size = imgSize };
+    const VkMemoryBarrier noMB[1]{};
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, noMB, 1, &pre, 0, nullptr);
+    const VkBufferCopy region{ 0, 0, imgSize };
+    vkCmdCopyBuffer(cb, sl.sharedBuf, sl.dstBuf, 1, &region);
+    VkBufferMemoryBarrier post{ .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = sl.dstBuf, .offset = 0, .size = imgSize };
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+        0, 0, noMB, 1, &post, 0, nullptr);
+    submitWait(doubler, cb);
+}
+
+static bool bufferVerify(Gpu& doubler, Slot& sl, VkDeviceSize imgSize,
+                         uint32_t frame, size_t* badOut) {
+    void* lp{};
+    CHK(vkMapMemory(doubler.dev, sl.dstBufMem, 0, VK_WHOLE_SIZE, 0, &lp));
+    const auto* got = (const uint8_t*)lp;
+    char tag[16];
+    std::snprintf(tag, sizeof tag, "F%07u", frame);
+    const bool tagOk = std::memcmp(got, tag, 8) == 0;
+    size_t bad = 0, firstBad = (size_t)-1;
+    for (size_t i = 8; i < imgSize; ++i) {
+        if (got[i] != (uint8_t)((i + frame) & 0xFF)) {
+            if (firstBad == (size_t)-1) firstBad = i;
+            ++bad;
+        }
+    }
+    vkUnmapMemory(doubler.dev, sl.dstBufMem);
+    if (firstBad != (size_t)-1)
+        std::printf("    first mismatch at byte %zu (%.3f MiB in)\n",
+            firstBad, firstBad / 1048576.0);
+    *badOut = bad;
+    return tagOk && bad == 0;
+}
+#endif
+
 /// doubler GPU: DMA the shared slot into its own device-local image
 static void doublerDrain(Gpu& doubler, Slot& sl) {
     VkCommandBuffer cb = beginOneShot(doubler);
@@ -461,12 +672,40 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("udmabuf ring: %dx%d (%.2f MiB/slot), %d slots, %d iters\n",
         W, H, BYTES / 1048576.0, SLOTS, ITERS);
+#if BUFFER_ONLY
+    std::printf("BUFFER-ONLY: udmabuf as VkBuffer, pure buffer-to-buffer copy, "
+                "no VkImage in the path\n");
+#endif
 #if !FULLSCALE && !DOUBLER_ONLY
     std::printf("NOTE: reduced to 512x256 because full scale has hard-faulted "
                 "the render GPU. Rebuild with -DFULLSCALE=1 to try it.\n");
 #endif
 
-    VkInstanceCreateInfo ici{ .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    // VK_KHR_external_memory_capabilities is an INSTANCE extension and is
+    // required to enable VK_KHR_external_memory on the device. Without it in
+    // ppEnabledExtensionNames here, vkCreateDevice returns a device with no
+    // external-memory support and every later import fails.
+    uint32_t ien = 0;
+    CHK(vkEnumerateInstanceExtensionProperties(nullptr, &ien, nullptr));
+    std::vector<VkExtensionProperties> iavail(ien);
+    CHK(vkEnumerateInstanceExtensionProperties(nullptr, &ien, iavail.data()));
+    // Full dependency closure. Each of these has required extensions of its
+    // own, and enabling one without its dependency makes vkCreateInstance /
+    // vkCreateDevice return a device with no external-memory support.
+    const char* iwantAll[] = { "VK_KHR_external_memory_capabilities",
+                               "VK_KHR_get_physical_device_properties2" };
+    std::vector<const char*> iexts;
+    for (const char* w : iwantAll) {
+        bool have = false;
+        for (const auto& a : iavail)
+            if (std::strcmp(a.extensionName, w) == 0) { have = true; break; }
+        std::printf("  inst ext %-42s %s\n", w, have ? "available" : "MISSING");
+        if (have) iexts.push_back(w);
+    }
+    if (iexts.empty()) { std::fprintf(stderr, "no instance ext available\n"); return 5; }
+    VkInstanceCreateInfo ici{ .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+        .enabledExtensionCount = (uint32_t)iexts.size(),
+        .ppEnabledExtensionNames = iexts.data() };
     VkInstance inst{};
     CHK(vkCreateInstance(&ici, nullptr, &inst));
     uint32_t n = 0;
@@ -527,9 +766,14 @@ int main() {
 #else
         renderFill(render, sl, f);
 #endif
-        doublerDrain(doubler, sl);
         size_t bad = 0;
+#if BUFFER_ONLY
+        bufferDrain(doubler, sl, imgSize);
+        const bool ok = bufferVerify(doubler, sl, imgSize, f, &bad);
+#else
+        doublerDrain(doubler, sl);
         const bool ok = verify(doubler, sl, f, &bad);
+#endif
         if (!ok) {
             ++fails;
             std::printf("iter %d slot %d: MISMATCH (%zu bytes)\n", it, it % SLOTS, bad);
