@@ -39,6 +39,7 @@
 #include <vector>
 
 #include <vulkan/vulkan.h>
+#define DRM_FORMAT_MOD_LINEAR 0x301
 
 #ifndef W
 #define W 2560
@@ -188,20 +189,44 @@ struct Gpu {
         // VK_KHR_external_memory is a DEPENDENCY of the other two and must be
         // enabled alongside them, otherwise vkCreateDevice silently returns a
         // device with no external-memory support at all.
-        const char* want[] = { "VK_KHR_external_memory",
-                               "VK_KHR_external_memory_fd",
-                               "VK_EXT_external_memory_dma_buf" };
+        // Enable the full dependency closure. Enabling an extension without
+        // the extensions it depends on makes vkCreateDevice return a device
+        // that silently lacks the feature - which is exactly how this probe
+        // ended up with a working extension list and a broken import.
+        const char* want[] = {
+            "VK_KHR_external_memory",                 // root: memory handles
+            "VK_KHR_external_memory_fd",              // root: fd imports
+            "VK_EXT_external_memory_dma_buf",          // root: dma-buf
+            "VK_EXT_image_drm_format_modifier",       // root: explicit modifier
+            // dependencies of the above, per VUID-vkCreateDevice-...-01387
+            "VK_KHR_bind_memory2",
+            "VK_KHR_sampler_ycbcr_conversion",
+            "VK_KHR_image_format_list",
+            "VK_KHR_get_memory_requirements2",
+            "VK_KHR_dedicated_allocation",
+            "VK_KHR_maintenance1",
+            "VK_KHR_maintenance3",
+            "VK_KHR_sampler",
+        };
         std::vector<const char*> exts;
         for (const char* w : want) {
             bool have = false;
             for (const auto& a : avail)
                 if (std::strcmp(a.extensionName, w) == 0) { have = true; break; }
-            std::printf("    ext %-34s %s\n", w, have ? "available" : "MISSING");
-            if (!have) {
-                std::fprintf(stderr, "%s: %s not supported\n", name.c_str(), w);
+            std::printf("    ext %-38s %s\n", w, have ? "enabled" : "MISSING");
+            if (have) exts.push_back(w);
+        }
+        for (const char* need : { "VK_KHR_external_memory_fd",
+                                  "VK_EXT_external_memory_dma_buf",
+                                  "VK_EXT_image_drm_format_modifier" }) {
+            bool ok = false;
+            for (const char* e : exts)
+                if (std::strcmp(e, need) == 0) ok = true;
+            if (!ok) {
+                std::fprintf(stderr, "%s: %s unavailable; cannot import\n",
+                    name.c_str(), need);
                 std::exit(5);
             }
-            exts.push_back(w);
         }
         VkDeviceCreateInfo dci{ .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci,
@@ -221,61 +246,56 @@ struct Gpu {
 /// image that will be backed by a dma-buf. Guessing VK_FORMAT_R8G8B8A8_UNORM
 /// with TRANSFER_DST is NOT supported here
 /// (VUID-VkImageCreateInfo-pNext-00990), so we query rather than assume.
+/// Query dma-buf-capable linear image formats.
+///
+/// RADV only answers external-memory image queries for
+/// VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT with a
+/// VkPhysicalDeviceImageDrmFormatModifierInfoEXT naming DRM_FORMAT_MOD_LINEAR.
+/// Querying with plain VK_IMAGE_TILING_LINEAR is refused and comes back with
+/// compatibleHandleTypes == 0 for every format, which looks exactly like
+/// "no format is supported" and is not that at all. Ask the right way.
 static VkFormat pickLinearDmaBufFormat(Gpu& g, VkImageUsageFlags usage,
                                        const char* forWhat) {
     const VkFormat cands[] = {
         VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
-        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32,
-        VK_FORMAT_R8_UNORM,       VK_FORMAT_R8G8_UNORM,
+        VK_FORMAT_A8B8G8R8_UNORM_PACK32, VK_FORMAT_R8_UNORM, VK_FORMAT_R8G8_UNORM,
     };
     for (VkFormat f : cands) {
         VkPhysicalDeviceExternalImageFormatInfo efi{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };  // 0x200
+        VkPhysicalDeviceImageDrmFormatModifierInfoEXT dmi{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+            .drmFormatModifier = DRM_FORMAT_MOD_LINEAR };
         VkPhysicalDeviceImageFormatInfo2 ici{};
         ici.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
-        ici.pNext = &efi;
-        // this struct is {format, type, tiling, usage, flags} - no extent
+        ici.pNext = &dmi;                     // then efi, below
+        dmi.pNext = &efi;
         ici.format = f;
         ici.type = VK_IMAGE_TYPE_2D;
-        ici.tiling = VK_IMAGE_TILING_LINEAR;
+        ici.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
         ici.usage = usage;
         ici.flags = 0;
+
         VkExternalImageFormatProperties efp{
             .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
         VkImageFormatProperties2 p2{ .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
             .pNext = &efp };
         const VkResult r = vkGetPhysicalDeviceImageFormatProperties2(g.pd, &ici, &p2);
-        if (r == VK_SUCCESS && (efp.externalMemoryProperties.compatibleHandleTypes &
-                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
-            std::printf("    %s: %s format %d (linear+dma-buf ok)\n",
-                g.name.c_str(), forWhat, (int)f);
+        const bool dmabuf = (r == VK_SUCCESS) && (efp.externalMemoryProperties.compatibleHandleTypes &
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+        std::printf("    %s %s fmt %-4d usage 0x%x: rc=%-16s handles=0x%x%s\n",
+            g.name.c_str(), forWhat, (int)f, usage,
+            r == VK_SUCCESS ? "OK" : vkResultName(r),
+            r == VK_SUCCESS ? (unsigned)efp.externalMemoryProperties.compatibleHandleTypes : 0u,
+            dmabuf ? "  <- dmabuf OK" : "");
+        if (dmabuf) {
             return f;
         }
     }
-    // Report what the driver DOES accept, so the limitation is on the record
-    // rather than a bare "no".
-    std::fprintf(stderr, "%s: no linear+dma-buf format for %s. Surveying what "
-            "is supported for LINEAR + dma-buf:\n", g.name.c_str(), forWhat);
-    for (VkFormat f : cands) {
-        VkPhysicalDeviceExternalImageFormatInfo efi{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
-        VkPhysicalDeviceImageFormatInfo2 ici{};
-        ici.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
-        ici.pNext = &efi; ici.format = f; ici.type = VK_IMAGE_TYPE_2D;
-        ici.tiling = VK_IMAGE_TILING_LINEAR; ici.usage = usage; ici.flags = 0;
-        VkExternalImageFormatProperties efp{
-            .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
-        VkImageFormatProperties2 p2{ .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
-            .pNext = &efp };
-        const VkResult r = vkGetPhysicalDeviceImageFormatProperties2(g.pd, &ici, &p2);
-        std::fprintf(stderr, "  format %-4d usage 0x%x: rc=%s handles=0x%x%s\n",
-            (int)f, usage, r == VK_SUCCESS ? "OK" : vkResultName(r),
-            r == VK_SUCCESS ? (unsigned)efp.externalMemoryProperties.compatibleHandleTypes : 0u,
-            (r == VK_SUCCESS && (efp.externalMemoryProperties.compatibleHandleTypes &
-                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) ? "  <- dmabuf" : "");
-    }
+    std::fprintf(stderr, "%s: no linear+dma-buf format for %s (queried with "
+            "DRM_FORMAT_MODIFIER_EXT + DRM_FORMAT_MOD_LINEAR)\n",
+            g.name.c_str(), forWhat);
     std::exit(6);
 }
 
@@ -283,10 +303,21 @@ static VkFormat pickLinearDmaBufFormat(Gpu& g, VkImageUsageFlags usage,
 /// image's memory requirement fits the backing allocation
 static VkImage importDmabuf(Gpu& g, int fd, VkFormat fmt, VkImageUsageFlags usage,
                             VkDeviceSize backing) {
+    // Create the image exactly as the capability query described it:
+    // DRM_FORMAT_MODIFIER_EXT tiling with an explicit DRM_FORMAT_MOD_LINEAR
+    // modifier. Asking about VK_IMAGE_TILING_LINEAR and then creating with it
+    // is not the same query, and the driver rejects the mismatch.
+    VkImageDrmFormatModifierExplicitCreateInfoEXT drm{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+        .drmFormatModifier = DRM_FORMAT_MOD_LINEAR };
+    VkSubresourceLayout lay{};
+    drm.pPlaneLayouts = &lay;
+    drm.pNext = nullptr;
     VkImageCreateInfo ii{ .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-        .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
+        .pNext = &drm, .imageType = VK_IMAGE_TYPE_2D, .format = fmt,
         .extent = { W, H, 1 }, .mipLevels = 1, .arrayLayers = 1,
-        .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
         .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
     // vkCreateImage pNext: declare the external handle type the image will be
@@ -307,6 +338,14 @@ static VkImage importDmabuf(Gpu& g, int fd, VkFormat fmt, VkImageUsageFlags usag
                     g.name.c_str(), (unsigned long long)req.size,
                     (unsigned long long)backing,
                     (long long)(req.size - (VkDeviceSize)backing));
+        VkImageSubresource sub{ .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0, .arrayLayer = 0 };
+        VkSubresourceLayout sl{};
+        vkGetImageSubresourceLayout(g.dev, img, &sub, &sl);
+        std::printf("    %s: SUBRESOURCE offset=%llu rowPitch=%llu size=%llu"
+                    " (bufferRowPitch would be %d)\n",
+            g.name.c_str(), (unsigned long long)sl.offset,
+            (unsigned long long)sl.rowPitch, (unsigned long long)sl.size, W * 4);
     } else {
         std::printf("    %s: image %llu fits udmabuf %llu (slack %lld)\n",
             g.name.c_str(), (unsigned long long)req.size,
