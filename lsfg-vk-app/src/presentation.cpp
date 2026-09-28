@@ -952,6 +952,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::mutex m;
         std::condition_variable cv;
         std::deque<PendingFrame> q;
+        // Shutdown: without this, takeNewestWait() parks on the cv forever and
+        // runPresent's join() hangs instead of reporting the error that caused
+        // the teardown. Set stop() wakes every waiter.
+        bool stopped{ false };
+        void stop() {
+            {
+                std::lock_guard<std::mutex> lk(m);
+                stopped = true;
+            }
+            cv.notify_all();
+        }
         // Blocking variant: waits on the cv until a frame arrives or the
         // timeout expires (timeout serves WSI event pumping only; frame
         // arrival wakes instantly - zero poll latency). Returns nullopt on
@@ -959,7 +970,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::optional<PendingFrame> takeNewestWait(unsigned timeoutMs) {
             std::unique_lock<std::mutex> lk(m);
             cv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
-                [this] { return !q.empty(); });
+                [this] { return !q.empty() || stopped; });
             if (q.empty())
                 return std::nullopt;
             return takeNewestLocked();
@@ -1603,9 +1614,19 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // instantly on arrival; 15 ms cap only pumps WSI events). The
                 // taken frame is fully consumed into cur - fds never dropped.
                 if (!cur.active) {
+                    // Shutdown: never park here. takeNewestWait() returns
+                    // nullopt once inbox.stop() is set, and the stop check keeps
+                    // the loop from re-entering, so join() cannot hang.
+                    if (stop.load(std::memory_order_relaxed)
+                            || failed.load(std::memory_order_relaxed))
+                        return false;
                     auto pf = inbox.takeNewest();
                     if (!pf)
                         pf = inbox.takeNewestWait(15);
+                    if (!pf
+                        && (stop.load(std::memory_order_relaxed)
+                            || failed.load(std::memory_order_relaxed)))
+                        return false;
                     if (pf) {
                         wantDropWsi.store(false, std::memory_order_relaxed);
                         // RE2 boot is 1920x1080. Exclusive overlay on that
@@ -2771,6 +2792,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // --- run both until stop/failure, then join and tear down cleanly --------
     std::thread inputThread(inputLoop);
     std::thread outputThread(outputLoop);
+    // Order matters: set stop, then wake the output thread's condvar wait, THEN
+    // join. Without inbox.stop() a worker parked in takeNewestWait() never
+    // returns and this hangs forever instead of surfacing the error that
+    // caused the teardown (seen 2026-09-28: input thread stuck in exportFd,
+    // runPresent stuck in join).
+    inbox.stop();   // the output thread's cv wait must be woken, or join hangs
     inputThread.join();
     outputThread.join();
 
