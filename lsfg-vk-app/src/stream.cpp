@@ -34,6 +34,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <linux/udmabuf.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <linux/memfd.h>
@@ -272,13 +274,33 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     }
     for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
         const uint64_t bytes = (static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull;
-        const bool posixShm =
+        // Host-buffer bounce: same memfd staging the shm path builds, but the
+        // app's GPU DMAs out of the shared mapping instead of the CPU copying
+        // out of it. The render card's leg is identical either way - it DMAs
+        // into this buffer - so the only difference is who does the second
+        // hop. No p2p, no CPU frame copy.
+        const bool hostBounce =
             conf.presentation == ls::Presentation::External
-            && (envFlagOn("LSFGVK_POSIX_SHM")
-                || conf.transport == ls::Transport::PosixShm);
+            && !envFlagOn("LSFGVK_POSIX_SHM")
+            // DecoupledDma is the historical name for the old dual-host
+            // bounce; Udmabuf is the buffer-based one that is proven to work
+            // on this platform. Both are the same staging shape here, the
+            // difference is only the import on the app side.
+            && (conf.transport == ls::Transport::Udmabuf
+                || conf.transport == ls::Transport::DecoupledDma);
+        const bool posixShm = hostBounce
+            || (conf.presentation == ls::Presentation::External
+                && (envFlagOn("LSFGVK_POSIX_SHM")
+                    || conf.transport == ls::Transport::PosixShm));
         if (posixShm) {
         const uint64_t mapBytes = bytes + 4096ull;
-        const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", MFD_CLOEXEC));
+        // udmabuf REQUIRES the backing memfd to be sealable and sealed
+        // F_SEAL_SHRINK (and must NOT carry F_SEAL_WRITE), so the flag set
+        // differs between the bounce and the plain POSIX-shm staging.
+        const int mfdFlags = hostBounce
+            ? (MFD_CLOEXEC | MFD_ALLOW_SEALING)
+            : MFD_CLOEXEC;
+        const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", mfdFlags));
         if (memfd < 0 || ::ftruncate(memfd, static_cast<off_t>(mapBytes)) != 0)
             throw ls::error("memfd_create/ftruncate failed for POSIX staging");
         void* map = ::mmap(nullptr, static_cast<size_t>(mapBytes),
@@ -289,6 +311,57 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         }
         ::memset(map, 0, static_cast<size_t>(mapBytes));
         (void)::mlock(map, static_cast<size_t>(mapBytes));
+
+        // Host-buffer bounce: wrap these exact pages in a udmabuf so OUR gpu
+        // can import them and DMA out with no CPU copy. The layer keeps
+        // receiving the plain memfd below and keeps DMAing into it, so the
+        // two processes share one physical allocation:
+        //
+        //     render GPU --DMA--> system memory --DMA--> doubler GPU
+        //
+        // No p2p (the two cards have no usable cross-device page-table
+        // mapping here) and no host-pointer import (radv rejects mmap'd
+        // shared mappings for external_memory_host). Proven by
+        // tools/testing/test_udmabuf.sh.
+        if (hostBounce) {
+            if (::fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+                ::munmap(map, static_cast<size_t>(mapBytes));
+                ::close(memfd);
+                throw ls::error("F_ADD_SEALS(F_SEAL_SHRINK) failed for udmabuf staging");
+            }
+            int udev = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+            if (udev < 0) {
+                ::munmap(map, static_cast<size_t>(mapBytes));
+                ::close(memfd);
+                throw ls::error("open /dev/udmabuf failed for host bounce");
+            }
+            udmabuf_create uc{};
+            uc.memfd = static_cast<uint32_t>(memfd);
+            uc.flags = UDMABUF_FLAGS_CLOEXEC;
+            uc.offset = 0;
+            uc.size = bytes;   // page-aligned by construction; excludes the seq word
+            const int udfd = ::ioctl(udev, UDMABUF_CREATE, &uc);
+            ::close(udev);
+            if (udfd < 0) {
+                ::munmap(map, static_cast<size_t>(mapBytes));
+                ::close(memfd);
+                throw ls::error("UDMABUF_CREATE failed for host bounce");
+            }
+            state.udmaFds.at(i) = udfd;
+        }
+
+        state.shmMaps.at(i) = map;
+        if (hostBounce) {
+            // The bounce's whole point: our GPU DMAs out of the SAME physical
+            // pages the render card DMAs into, so there is no CPU-side staging
+            // buffer at all. Leave hostPtrs null - that null IS the signal the
+            // shm branch uses to skip its 14 MiB memcpy - and leave
+            // sourceImages empty so the fallback at presentation.cpp:2403
+            // cannot pull us back onto the copy path either.
+            state.dmaMaps.at(i) = map;
+            LSFG_FRAME_DBG("host-bounce staging slot %zu size=%llu (no CPU copy)",
+                i, (unsigned long long)bytes);
+        } else {
         void* host = nullptr;
         if (::posix_memalign(&host, 4096, static_cast<size_t>(bytes)) != 0) {
             ::munmap(map, static_cast<size_t>(mapBytes));
@@ -300,8 +373,10 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
                 | VK_IMAGE_USAGE_SAMPLED_BIT,
             host, bytes);
-        state.shmMaps.at(i) = map;
         state.hostPtrs.at(i) = host;
+            LSFG_FRAME_DBG("posix-shm staging slot %zu size=%llu",
+                i, (unsigned long long)bytes);
+        }
         state.shmSeq.at(i) = reinterpret_cast<uint32_t*>(
             static_cast<char*>(map) + static_cast<size_t>(bytes));
         state.shmSeen.at(i) = 0;
@@ -312,7 +387,6 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             throw ls::error("dup() failed for POSIX staging memfd");
         conn.attachFd(sendFd);
         conn.send(Staging{});
-        LSFG_FRAME_DBG("posix-shm staging slot %zu size=%llu", i, (unsigned long long)bytes);
         continue;
         }
         state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },

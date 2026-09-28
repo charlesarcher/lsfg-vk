@@ -373,3 +373,78 @@ void CommandBuffer::submit(const vk::Vulkan& vk) const {
     if (!fence.wait(vk))
         throw ls::vulkan_error(VK_TIMEOUT, "Fence::wait() timed out");
 }
+
+void CommandBuffer::copyBufferToImage(const vk::Vulkan& vk,
+        const vk::Buffer& buffer, const vk::Image& image,
+        uint32_t width, uint32_t height) const {
+    const VkImageMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = image.handle(),
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1
+        }
+    };
+    vk.df().CmdPipelineBarrier(*this->commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, VK_NULL_HANDLE, 0, VK_NULL_HANDLE, 1, &barrier);
+
+    const VkBufferImageCopy region{
+        .bufferOffset = 0,
+        // TEXELS, not bytes
+        .bufferRowLength = width,
+        .bufferImageHeight = height,
+        .imageSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { width, height, 1 }
+    };
+    vk.df().CmdCopyBufferToImage(*this->commandBuffer, buffer.handle(), image.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
+
+void CommandBuffer::copyImageToBuffer(const vk::Vulkan& vk,
+        const vk::Image& image, const vk::Buffer& buffer,
+        uint32_t width, uint32_t height) const {
+    const VkBufferMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        // the render card's DMA wrote these pages, not the host
+        .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .buffer = buffer.handle(),
+        .offset = 0,
+        .size = VK_WHOLE_SIZE
+    };
+    vk.df().CmdPipelineBarrier(*this->commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, VK_NULL_HANDLE, 1, &barrier, 0, VK_NULL_HANDLE);
+
+    const VkBufferImageCopy region{
+        .bufferOffset = 0,
+        .bufferRowLength = width,
+        .bufferImageHeight = height,
+        .imageSubresource = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .mipLevel = 0,
+            .baseArrayLayer = 0,
+            .layerCount = 1
+        },
+        .imageOffset = { 0, 0, 0 },
+        .imageExtent = { width, height, 1 }
+    };
+    vk.df().CmdCopyImageToBuffer(*this->commandBuffer, image.handle(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buffer.handle(), 1, &region);
+}

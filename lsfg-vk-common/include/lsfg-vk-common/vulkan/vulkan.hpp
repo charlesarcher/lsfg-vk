@@ -83,6 +83,7 @@ namespace vk {
         PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
         PFN_vkCmdDispatch CmdDispatch;
         PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+        PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
         PFN_vkCmdCopyImage CmdCopyImage;
         PFN_vkCmdCopyImage2 CmdCopyImage2;
         PFN_vkCmdWriteTimestamp CmdWriteTimestamp;

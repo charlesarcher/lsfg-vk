@@ -1891,10 +1891,44 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::vector<vk::CommandBuffer> snapCbs;
         std::vector<vk::CommandBuffer> computeCbs;
         std::vector<vk::Fence> snapFences;
+        // Per-frame timing for the udmabuf transport. The two questions this
+        // pass is meant to answer: does the 36.6 ms park survive on the buffer
+        // bounce (step 3), and what does removing the blocking fence wait add
+        // on top (step 4)? So measure the copy, the park, and the
+        // present-to-present interval, and report p50/p99.
+        struct UdmaTiming {
+            std::vector<double> copyMs, parkMs, frameMs;
+            std::chrono::steady_clock::time_point lastPresent{};
+            bool haveLast{ false };
+        } udmaT{};
+        auto stat = [](std::vector<double>& v, const char* label) {
+            if (v.empty()) return;
+            std::sort(v.begin(), v.end());
+            const double p50 = v[v.size() / 2];
+            const double p99 = v[std::min(v.size() - 1, (size_t)(v.size() * 0.99))];
+            std::fprintf(stderr,
+                "udmabuf-timing: %-8s n=%zu p50=%.2f p99=%.2f max=%.2f ms\n",
+                label, v.size(), p50, p99, v.back());
+        };
+        auto dumpTiming = [&]() {
+            stat(udmaT.copyMs, "copy");
+            stat(udmaT.parkMs, "park");
+            stat(udmaT.frameMs, "frame");
+        };
+
+        // The udmabuf bounce submits its own copy of the staging slot into
+        // genSources. It MUST NOT reuse snapCbs/snapFences: the snapshot block
+        // below already begin/end/submits snapCbs.at(sidx), and doing that to
+        // the same command buffer twice loses the context.
+        std::vector<vk::CommandBuffer> bounceCbs;
+        std::vector<vk::Fence> bounceFences;
         for (size_t i = 0; i < ls::ipc::STAGING_RING_DEPTH; ++i) {
             snapCbs.emplace_back(vk, vk.transferCmdPoolHandle());
             computeCbs.emplace_back(vk, vk.transferCmdPoolHandle());
             snapFences.emplace_back(vk, true);
+            bounceCbs.emplace_back(vk, vk.transferCmdPoolHandle());
+            // signalled so the first use of each slot passes the reuse guard
+            bounceFences.emplace_back(vk, true);
         }
         vk::CommandBuffer gfxCb{ vk };
         std::optional<vk::Shader> swizzleShader;
@@ -2126,6 +2160,104 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         }
                     }
                 }
+                // Host-buffer bounce: the render card DMAs into the shared
+                // mapping (state.dmaMaps), and OUR GPU DMAs out of that same
+                // mapping into genSources. Deliberately no CPU copy - the shm
+                // branch below owns the memcpy and is skipped on this transport
+                // because hostPtrs is null there.
+                if (state.shmBytes && sidx < state.dmaMaps.size()
+                        && state.dmaMaps.at(sidx) && sidx < snapCbs.size()) {
+                    if (captureFd >= 0) {
+                        // The render card's own sync_fd: signalled only once its
+                        // capture blit into this slot has landed. A timeout
+                        // abandons the slot rather than copying a torn frame.
+                        //
+                        // THIS is the park: the app is idle here waiting for
+                        // the render GPU. If the 36.6 ms shows up in parkMs
+                        // rather than copyMs, the transport is not the cost.
+                        const auto parkT0 = std::chrono::steady_clock::now();
+                        pollfd pfd{};
+                        pfd.fd = captureFd;
+                        pfd.events = POLLIN;
+                        const int prReady = ::poll(&pfd, 1, 2000);
+                        udmaT.parkMs.push_back(
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - parkT0).count());
+                        if (prReady <= 0) {
+                            ::close(captureFd);
+                            captureFd = -1;
+                            conn.send(ls::ipc::Release{ sidx });
+                            ++g_framesDropped;
+                            if (prReady == 0)
+                                continue;
+                            throw ls::error("poll() on bounce slot-ready failed");
+                        }
+                        ::close(captureFd);
+                        captureFd = -1;
+                    }
+                    // The shared slot is a BUFFER, not an image. A
+                    // dma-buf backed linear image import is not usable on
+                    // this driver (queried correctly, every format comes
+                    // back with compatibleHandleTypes == 0), and a buffer has
+                    // no modifier or pitch for the two GPUs to disagree
+                    // about. Proven both legs at 2560x1440, 200 iterations,
+                    // no faults: tools/testing/udmabuf_transport_probe.cpp.
+                    if (!state.udmaBufs.at(sidx).has_value()) {
+                        const int ufd = state.udmaFds.at(sidx);
+                        if (ufd < 0)
+                            throw ls::error("udmabuf slot has no dma-buf fd");
+                        state.udmaBufs.at(sidx).emplace(vk, ::dup(ufd),
+                            static_cast<size_t>(state.shmBytes),
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                          | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                        LSFG_FRAME_DBG("udmabuf: imported slot %u fd=%d as VkBuffer",
+                            sidx, ufd);
+                    }
+                    auto& bcb = bounceCbs.at(sidx);
+                    auto& bFence = bounceFences.at(sidx);
+                    if (!bFence.wait(vk, 0)) {
+                        // NO DROPS: a busy slot must wait for its own fence.
+                        // Falling through here would silently substitute a
+                        // CPU copy for a frame we promised to DMA.
+                        bFence.wait(vk, UINT64_MAX);
+                    }
+                    bFence.reset(vk);
+                    const auto copyT0 = std::chrono::steady_clock::now();
+                    bcb.begin(vk);
+                    bcb.copyBufferToImage(vk,
+                        state.udmaBufs.at(sidx).value(),
+                        *state.genSources.at(sidx),
+                        state.width, state.height);
+                    bcb.end(vk);
+                    {
+                        std::lock_guard<std::mutex> lk(submitMtx);
+                        bcb.submit(vk, {}, VK_NULL_HANDLE, 0,
+                            {}, copyDone.handle(), 0,
+                            bFence.handle(), vk.dmaQueueHandle());
+                    }
+                    // The park: this blocking wait is the ~36.6 ms the whole
+                    // investigation is chasing. It is KEPT for this pass on
+                    // purpose, so udmabuf alone can be measured before the
+                    // fence wait is touched.
+                    bFence.wait(vk, UINT64_MAX);
+                    const auto copyT1 = std::chrono::steady_clock::now();
+                    udmaT.copyMs.push_back(
+                        std::chrono::duration<double, std::milli>(copyT1 - copyT0).count());
+                    if (udmaT.haveLast)
+                        udmaT.frameMs.push_back(
+                            std::chrono::duration<double, std::milli>(copyT1 - udmaT.lastPresent).count());
+                    udmaT.lastPresent = copyT1;
+                    udmaT.haveLast = true;
+                    LSFG_FRAME_DBG("udmabuf: GPU copy shared buffer -> genSources slot %u",
+                        sidx);
+                    if (udmaT.frameMs.size() == 200) {
+                        dumpTiming();
+                        std::fprintf(stderr,
+                            "udmabuf-timing: 200 frames captured; "
+                            "baseline p99 15.12 ms, doubled p99 14.68 ms\n");
+                    }
+                }
+
                 if (state.shmBytes && sidx < state.shmMaps.size()
                         && state.shmMaps.at(sidx) && state.hostPtrs.at(sidx)) {
                     if (captureFd >= 0) {
@@ -2280,11 +2412,27 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     captureFd = -1;
                     waitWriteDone = true;
                 }
-                auto& srcLazy = state.aImports.at(sidx).has_value()
-                    ? state.aImports.at(sidx)
-                    : state.sourceImages.at(sidx);
+                // Source for the present-time blit. Three cases:
+                //   aImports  - cross-device imported capture (p2p path)
+                //   hostImages- udmabuf bounce: our own import of the shared
+                //               system memory, which is the whole point of
+                //               that transport
+                //   sourceImages - POSIX-shm staging image
+                // On the bounce path sourceImages is deliberately empty, so
+                // falling back to it would throw "lazy: no value present".
+                // On the udmabuf path the bounce above ALREADY copied the
+                // shared buffer into genSources, so genSources is both the
+                // bounce destination and the present source. There is no
+                // separate host image to blit from, and re-blitting would
+                // overwrite the frame we just DMA'd.
+                const bool bounceSrc = state.udmaBufs.at(sidx).has_value();
+                auto& srcLazy = bounceSrc
+                    ? state.genSources.at(sidx)
+                    : (state.aImports.at(sidx).has_value()
+                        ? state.aImports.at(sidx)
+                        : state.sourceImages.at(sidx));
                 auto& snapLazy = state.genSources.at(sidx);
-                const bool fromA = state.aImports.at(sidx).has_value();
+                const bool fromA = state.aImports.at(sidx).has_value() && !bounceSrc;
                 const bool swizzleBlit = fromA
                     && state.captureFormat != state.sourceFormat
                     && state.sourceImages.at(sidx).has_value();
@@ -2302,7 +2450,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     : (state.shmBytes ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));
                 const uint32_t srcQ = (fromA && !hostDma) ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
                 const uint32_t dstQ = (fromA && !hostDma) ? vk.transferQueueFamilyIndex() : VK_QUEUE_FAMILY_IGNORED;
-                if (swizzleBlit) {
+                if (bounceSrc) {
+                    // genSources already holds this frame; the bounce fence
+                    // orders it against the present. Nothing to snapshot.
+                } else if (swizzleBlit) {
                     static bool loggedBlit = false;
                     if (!loggedBlit) {
                         loggedBlit = true;

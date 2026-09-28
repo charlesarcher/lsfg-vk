@@ -602,6 +602,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .CmdBindDescriptorSets = dpa<PFN_vkCmdBindDescriptorSets>(f, d, "vkCmdBindDescriptorSets"),
         .CmdDispatch = dpa<PFN_vkCmdDispatch>(f, d, "vkCmdDispatch"),
         .CmdCopyBufferToImage = dpa<PFN_vkCmdCopyBufferToImage>(f, d, "vkCmdCopyBufferToImage"),
+        .CmdCopyImageToBuffer = dpa<PFN_vkCmdCopyImageToBuffer>(f, d, "vkCmdCopyImageToBuffer"),
         .CmdCopyImage = dpa<PFN_vkCmdCopyImage>(f, d, "vkCmdCopyImage"),
         .CmdCopyImage2 = dpa_optional<PFN_vkCmdCopyImage2>(f, d, "vkCmdCopyImage2"),
         .CmdWriteTimestamp = dpa<PFN_vkCmdWriteTimestamp>(f, d, "vkCmdWriteTimestamp"),

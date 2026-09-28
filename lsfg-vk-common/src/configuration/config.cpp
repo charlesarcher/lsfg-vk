@@ -122,10 +122,11 @@ namespace {
             return Transport::PosixShm;
         if (str == "dmabuf" || str == "dma" || str == "dma_buf")
             return Transport::DmaBuf;
-        if (str == "decoupled" || str == "decoupled_dma" || str == "zero_copy" || str == "dma_no_sync")
+        if (str == "udmabuf" || str == "udma" || str == "bounce")
+            return Transport::Udmabuf;
             return Transport::DecoupledDma;
         throw ls::error("unknown transport mode: " + str
-            + " (allowed values: 'shm', 'dmabuf', 'decoupled')");
+            + " (allowed values: 'shm', 'dmabuf', 'decoupled', 'udmabuf')");
     }
     /// parse the global configuration
     GlobalConf parseGlobalConf(const toml::table& tbl) {
