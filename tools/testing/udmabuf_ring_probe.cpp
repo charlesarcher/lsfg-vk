@@ -60,6 +60,26 @@
 #ifndef FULLSCALE
 #define FULLSCALE 0
 #endif
+/* Slack past the end of the image, page-aligned.
+ *
+ * The faulting accesses are SDMA READS (RW=0x1, client TCP 0x8) on the RENDER
+ * card, at page-aligned addresses past the end of the allocation. A read that
+ * faults just beyond the last row is the signature of a linear copy that
+ * prefetches or rounds up past the final row, not of a buffer that failed to
+ * map (that would fault INSIDE the buffer). So the cheap test is to pad, not
+ * to shrink: if 64 KiB of slack makes the full-size read clean, every slot
+ * just needs padding and nothing else changes. */
+#ifndef PAD_BYTES
+#define PAD_BYTES (64 * 1024)
+#endif
+/* Doubler-only mode: exercise the shared-memory import on the 9060 ALONE.
+ * No render GPU is touched, so nothing here can wedge the card that actually
+ * killed gfx_v12_0. The buffer is filled by the CPU through an mmap of the
+ * same memfd, which is legitimate for this test: we are probing whether the
+ * doubler can map and read the whole allocation, not benchmarking DMA. */
+#ifndef DOUBLER_ONLY
+#define DOUBLER_ONLY 0
+#endif
 #if !FULLSCALE && (W != 512 || H != 256)
 #undef W
 #undef H
@@ -301,6 +321,13 @@ static void makeSlot(Slot& sl, Gpu& render, Gpu& doubler, size_t size) {
     ::close(dev);
     if (sl.dmafd < 0) { std::perror("UDMABUF_CREATE"); std::exit(1); }
 
+#if DOUBLER_ONLY
+    sl.imgDoubler = importDmabuf(doubler, ::dup(sl.dmafd), VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT, size);
+    sl.doublerLocal = allocLocal(doubler,
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        &sl.doublerLocalMem, true);
+#else
     sl.imgRender = importDmabuf(render, ::dup(sl.dmafd), VK_FORMAT_R8G8B8A8_UNORM,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT, size);
     sl.imgDoubler = importDmabuf(doubler, ::dup(sl.dmafd), VK_FORMAT_R8G8B8A8_UNORM,
@@ -308,10 +335,30 @@ static void makeSlot(Slot& sl, Gpu& render, Gpu& doubler, size_t size) {
     sl.renderLocal = allocLocal(render,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
         &sl.renderLocalMem, true);
+#endif
     sl.doublerLocal = allocLocal(doubler,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         &sl.doublerLocalMem, true);
 }
+
+
+#if DOUBLER_ONLY
+/// Fill the shared buffer through an mmap of the same memfd the udmabuf
+/// backs. This is CPU setup, not the transport under test: we want the
+/// doubler's READ path exercised over a known pattern, and we do not want
+/// the render GPU anywhere near this run.
+static void cpuFillShared(Slot& sl, size_t imgSize, uint32_t frame) {
+    void* m = ::mmap(nullptr, imgSize, PROT_READ | PROT_WRITE, MAP_SHARED,
+                     sl.memfd, 0);
+    if (m == MAP_FAILED) { std::perror("mmap shared"); std::exit(1); }
+    auto* px = (uint8_t*)m;
+    for (size_t i = 0; i < imgSize; ++i) px[i] = (uint8_t)((i + frame) & 0xFF);
+    char tag[16];
+    std::snprintf(tag, sizeof tag, "F%07u", frame);
+    std::memcpy(px, tag, 8);
+    ::munmap(m, imgSize);
+}
+#endif
 
 /// render GPU: CPU fills a pattern, then DMA it into the shared slot
 static void renderFill(Gpu& render, Slot& sl, uint32_t frame) {
@@ -395,7 +442,7 @@ static bool verify(Gpu& doubler, Slot& sl, uint32_t frame, size_t* badOut) {
     std::snprintf(tag, sizeof tag, "F%07u", frame);
     const bool tagOk = std::memcmp(got, tag, 8) == 0;
     size_t bad = 0, firstBad = (size_t)-1;
-    for (size_t i = 8; i < BYTES; ++i) {
+    for (size_t i = 8; i < BYTES; ++i) {   // image region only; padding is slack
         if (got[i] != (uint8_t)((i + frame) & 0xFF)) {
             if (firstBad == (size_t)-1) firstBad = i;
             ++bad;
@@ -414,7 +461,7 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("udmabuf ring: %dx%d (%.2f MiB/slot), %d slots, %d iters\n",
         W, H, BYTES / 1048576.0, SLOTS, ITERS);
-#if !FULLSCALE
+#if !FULLSCALE && !DOUBLER_ONLY
     std::printf("NOTE: reduced to 512x256 because full scale has hard-faulted "
                 "the render GPU. Rebuild with -DFULLSCALE=1 to try it.\n");
 #endif
@@ -449,13 +496,21 @@ int main() {
     std::printf("  render = 9070 (index %d), doubler = 9060 (index %d)\n", ri, di);
 
     Gpu render, doubler;
+#if DOUBLER_ONLY
+    std::printf("DOUBLER-ONLY: the render GPU is not initialised and not touched\n");
+#else
     render.init(inst, pds[ri]);
+#endif
     doubler.init(inst, pds[di]);
 
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    const size_t size = (BYTES + page - 1) & ~(page - 1);
-    std::printf("slot allocation: %zu bytes (%.2f MiB, %zu pages)\n",
-        size, size / 1048576.0, size / page);
+    const size_t imgSize = (BYTES + page - 1) & ~(page - 1);
+    // The image is bound at offset 0 and occupies imgSize bytes; the rest is
+    // slack so an SDMA read that runs past the last row lands in padding
+    // rather than off the end of the mapping.
+    const size_t size = imgSize + ((size_t)PAD_BYTES + page - 1) & ~(page - 1);
+    std::printf("slot allocation: %zu bytes = image %zu + pad %zu (%.2f MiB, %zu pages)\n",
+        size, imgSize, size - imgSize, size / 1048576.0, size / page);
 
     std::vector<Slot> slots(SLOTS);
     for (int s = 0; s < SLOTS; ++s) {
@@ -467,7 +522,11 @@ int main() {
     for (int it = 0; it < ITERS; ++it) {
         Slot& sl = slots[it % SLOTS];
         const uint32_t f = (uint32_t)it;
+#if DOUBLER_ONLY
+        cpuFillShared(sl, imgSize, f);
+#else
         renderFill(render, sl, f);
+#endif
         doublerDrain(doubler, sl);
         size_t bad = 0;
         const bool ok = verify(doubler, sl, f, &bad);
