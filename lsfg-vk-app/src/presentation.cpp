@@ -2582,7 +2582,31 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         vk.dmaQueueHandle());
                 }
                 }
-                snapFd = snapshotSem.exportFd(vk);
+                // On the bounceSrc path there is NO submit above that signals
+                // snapshotSem, and vk::Semaphore::exportFd() on a SYNC_FD
+                // semaphore BLOCKS in the driver (drmSyncobjTimelineWait) until a
+                // signal for it is submitted. Exporting it there hung the input
+                // thread inside RADV on frame 0 (2026-09-28).
+                //
+                // We skip the export on that path. This is ONLY safe today
+                // because bFence.wait(vk, UINT64_MAX) above blocks the host
+                // until the bounce copy has fully retired, so presentReal()'s
+                // blit is already ordered against it. snapFd stays -1, the
+                // documented "no snapshot" value: PendingFrame initialises it to
+                // -1 and presentReal() guards with `if (snapFd >= 0)`.
+                //
+                // !! When that blocking fence wait is replaced by
+                // submit-and-signal, THIS PATH NEEDS A REAL SIGNAL AGAIN.
+                // Removing the host-side wait removes the only thing ordering
+                // the bounce copy against presentReal(); a submit signalling
+                // snapshotSem (or an equivalent fence handed to the blit) must
+                // be added here or the present will race the copy.
+                //
+                // The fd never crosses app.sock: it is app-local, consumed only
+                // by presentReal(), so the layer is unaffected by skipping it.
+                if (!bounceSrc) {
+                    snapFd = snapshotSem.exportFd(vk);
+                }
                 LSFG_FRAME_DBG("input: snapshot submitted xferQ=%d sameAsGfx=%d (fidx %llu)",
                     vk.transferQueueHandle() != VK_NULL_HANDLE,
                     vk.transferQueueHandle() == vk.queue() ? 1 : 0,
