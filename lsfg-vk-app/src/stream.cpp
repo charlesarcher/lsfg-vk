@@ -507,6 +507,33 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         // those instead of deleting the check keeps a broken setup from
         // passing here and faulting at the first frame.
         if (conf.transport == ls::Transport::Udmabuf) {
+            // "not cross-device" only rules out ONE wrong case. The property
+            // that matters is that the shared buffer is imported on the SAME
+            // device the backend runs on, because that is the device whose
+            // GPUVM has to read those pages. Compare the actual device, not
+            // the negation of a flag.
+            // Compare by device UUID rather than by VkPhysicalDevice handle:
+            // the handle is an enumeration-order artefact, and the UUID is the
+            // identity that survives a reboot or a reordered loader. This is
+            // the check that actually proves the buffer lives on the same
+            // physical card the backend generates frames on.
+            const auto toHex = [](const std::array<uint8_t, 16>& id) {
+                static const char* hx = "0123456789abcdef";
+                std::string out;
+                for (const uint8_t b : id) {
+                    out += hx[b >> 4];
+                    out += hx[b & 0xF];
+                }
+                return out;
+            };
+            const auto ourId = toHex(vk.deviceUUID());
+            const auto backendId = toHex(backend.selectedDeviceUUID());
+            if (ourId != backendId)
+                throw ls::error(
+                    "udmabuf: shared buffer is imported on device " + ourId
+                    + " but the backend runs on " + backendId
+                    + "; they must be the same physical card or the copy "
+                    "reads pages this GPUVM cannot see");
             if (backend.isCrossDevice(ctx))
                 throw ls::error(
                     "udmabuf: backend context is cross-device, but this "

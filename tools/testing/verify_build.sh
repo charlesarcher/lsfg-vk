@@ -16,7 +16,14 @@ set -uo pipefail
 cd "$(dirname "$0")/../.." || exit 1
 ROOT="$PWD"
 HASH="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-DIRTY="$(git status --porcelain -- . ':!thirdparty' | grep -q . && echo ' DIRTY' || echo '')"
+# A dirty tree means the hash does NOT identify what was built. Untracked build
+# output is not a source change and must not count, or the flag is noise.
+DIRTY_PATHS="$(git status --porcelain --untracked-files=no -- . ':!thirdparty')"
+if [ -n "$DIRTY_PATHS" ]; then
+    DIRTY=" DIRTY"
+else
+    DIRTY=""
+fi
 J="$(nproc)"
 
 echo "repo  $ROOT"
@@ -43,6 +50,20 @@ build_one() {
 }
 
 rc=0
+if [ -n "$DIRTY_PATHS" ]; then
+    echo "BUILD REFUSED: the tree has uncommitted source changes, so the git"
+    echo "hash does not identify what would be built. Commit first, or pass"
+    echo "--allow-dirty if you know what you are doing."
+    echo
+    printf '%s\n' "$DIRTY_PATHS" | sed 's/^/  /'
+    if [ "${1:-}" != "--allow-dirty" ]; then
+        exit 1
+    fi
+    echo
+    echo "--allow-dirty: continuing, the binaries WILL NOT match $HASH"
+    echo
+fi
+
 echo "builds:"
 build_one build         app      "build/lsfg-vk-app/lsfg-vk-app" || rc=1
 build_one build-framedbg app-dbg  "build-framedbg/lsfg-vk-app/lsfg-vk-app" || rc=1
