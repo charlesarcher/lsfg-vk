@@ -496,6 +496,21 @@ std::optional<uint32_t> vk::findTransferQFI(const VulkanInstanceFuncs& fi,
     return std::nullopt;
 }
 
+/// select the transfer family, warning ONLY when there is genuinely none.
+///
+/// std::optional::value_or() evaluates its argument eagerly, so
+/// .value_or(reportNoTransferQFI(...)) printed the refusal warning on every
+/// successful construction. That made a working device look like a broken one
+/// in the log, which is exactly the confusion it was meant to prevent.
+static uint32_t pickTransferQFIOrWarn(const VulkanInstanceFuncs& fi, VkPhysicalDevice pd) {
+    if (auto picked = vk::findTransferQFI(fi, pd))
+        return *picked;
+    std::fprintf(stderr,
+        "lsfg-vk: WARNING no non-graphics transfer queue family; image copies "
+        "will not run as DMA. Refusing to fall back to the graphics queue.\n");
+    return VK_QUEUE_FAMILY_IGNORED;
+}
+
 /// print the queue families of a device and which one we picked for DMA.
 /// This is the first thing to check when an image copy misbehaves: if
 /// transferQueueFamilyIdx is 0 or IGNORED then copies are not going through
@@ -736,8 +751,10 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         // are not DMA at all - RADV lowers them to an internal draw through
         // the color backend. Make that visible instead of inferring it later
         // from a GPU fault.
-        ? findTransferQFI(this->instance_funcs, this->phys_dev)
-            .value_or(reportNoTransferQFI(this->phys_dev))
+        // NOTE: std::optional::value_or evaluates its argument EAGERLY, so
+        // passing reportNoTransferQFI() here printed the warning even on
+        // success. Select first, then warn only if it actually failed.
+        ? pickTransferQFIOrWarn(this->instance_funcs, this->phys_dev)
         : VK_QUEUE_FAMILY_IGNORED),
     transferQueue(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
         ? getQueue(this->device_funcs, *this->device,
@@ -785,8 +802,7 @@ Vulkan::Vulkan(VkInstance instance, VkDevice device,
     // no transfer queue, and dmaQueueHandle() correctly refused. The queue
     // family itself was always there (family 1, raw 0xe = COMPUTE|TRANSFER,
     // 4 queues); nothing was selecting it.
-    transferQueueFamilyIdx(vk::findTransferQFI(this->instance_funcs, this->phys_dev)
-        .value_or(reportNoTransferQFI(this->phys_dev))),
+    transferQueueFamilyIdx(pickTransferQFIOrWarn(this->instance_funcs, this->phys_dev)),
     transferQueue(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
         ? getQueue(this->device_funcs, *this->device,
             this->setLoaderData, this->transferQueueFamilyIdx)
