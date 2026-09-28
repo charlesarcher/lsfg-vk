@@ -56,6 +56,15 @@ namespace vk {
             VkBufferUsageFlags usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT
                                      | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
+        /// get the buffer size in bytes
+        ///
+        /// The udmabuf transport asserts on this at context-open: a buffer
+        /// that is not exactly the staging slot's size means the two ends
+        /// disagree about the transfer, and the copy reads or writes past the
+        /// end rather than failing.
+        /// @return the buffer size in bytes
+        [[nodiscard]] size_t byteSize() const { return this->size; }
+
         /// get the buffer handle
         /// @return the buffer handle
         [[nodiscard]] const auto& handle() const { return this->buffer.get(); }

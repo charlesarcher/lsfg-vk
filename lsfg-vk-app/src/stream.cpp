@@ -469,6 +469,20 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     // crosses from the game device every cycle.
     //    on any throw before a successful import, close the handed dups (the
     //    backend has consumed none yet).
+    // Import the first shared buffer up front, on OUR device, before the
+    // backend context opens. The udmabuf precondition below verifies this
+    // import really happened and matches the staging slot, so it cannot be a
+    // check that passes because nothing has been tried yet.
+    if (conf.transport == ls::Transport::Udmabuf && !state.udmaFds.empty()
+            && state.udmaFds.front() >= 0) {
+        state.udmaBufs.front().emplace(
+            vk, ::dup(state.udmaFds.front()),
+            static_cast<size_t>(state.shmBytes),
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        LSFG_FRAME_DBG("udmabuf: pre-imported slot 0 fd=%d bytes=%llu",
+            state.udmaFds.front(), (unsigned long long)state.shmBytes);
+    }
+
     try {
         LSFG_FRAME_DBG("runStream: openContext start");
         auto& ctx = backend.openContext(
@@ -478,8 +492,48 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             w, h, false /*hdr: R8G8B8A8 staging, never format>57*/,
             1.0F / conf.flow_scale, conf.performance_mode);
         LSFG_FRAME_DBG("runStream: openContext done");
-        if (!backend.isCrossDevice(ctx))
+        // The precondition depends on the transport, so the check does too.
+        //
+        // p2p / dmabuf: the backend imports the render GPU's IMAGE directly, so
+        // a same-device context means the import silently landed on the wrong
+        // card. That is fatal, and the check stands unchanged.
+        //
+        // udmabuf: the backend never sees the render GPU's image at all. The
+        // shared slot crosses as a BUFFER that the backend's own device
+        // imports, and this app's GPU does the copy. "cross-device" is
+        // therefore not the property this path needs; what it needs is that
+        // the buffer really was imported on the doubler, and that its size
+        // and row length match the staging slot the app allocated. Checking
+        // those instead of deleting the check keeps a broken setup from
+        // passing here and faulting at the first frame.
+        if (conf.transport == ls::Transport::Udmabuf) {
+            if (backend.isCrossDevice(ctx))
+                throw ls::error(
+                    "udmabuf: backend context is cross-device, but this "
+                    "transport must import the shared buffer on the doubler "
+                    "device, not the render GPU's image");
+            const uint64_t wantBytes = static_cast<uint64_t>(state.shmBytes);
+            if (state.udmaBufs.empty() || !state.udmaBufs.front().has_value())
+                throw ls::error("udmabuf: shared buffer not imported on the "
+                    "doubler before the backend context opened");
+            const size_t rowPitch = static_cast<size_t>(state.rowPitch);
+            const bool sizeOk = state.udmaBufs.front()->byteSize() == wantBytes;
+            // row length is in TEXELS; the pitch the app computed must be
+            // exactly width * bytesPerPixel or the bounce copies garbage.
+            const bool pitchOk = rowPitch
+                == static_cast<size_t>(w) * 4;
+            if (!sizeOk || !pitchOk)
+                throw ls::error("udmabuf: shared buffer does not match the "
+                    "staging slot (buffer=" + std::to_string(
+                        state.udmaBufs.front()->byteSize()) + " want="
+                    + std::to_string(wantBytes) + ", rowPitch="
+                    + std::to_string(rowPitch) + " want="
+                    + std::to_string(static_cast<size_t>(w) * 4) + ")");
+            LSFG_FRAME_DBG("udmabuf: backend precondition ok (buffer=%llu pitch=%zu)",
+                (unsigned long long)wantBytes, rowPitch);
+        } else if (!backend.isCrossDevice(ctx)) {
             throw ls::error("backend context is not cross-device");
+        }
         state.context = ls::owned_ptr<ls::R<lsfgvk::backend::Context>>(
             new ls::R<lsfgvk::backend::Context>(ctx),
             [backend = &backend](ls::R<lsfgvk::backend::Context>& c) {
