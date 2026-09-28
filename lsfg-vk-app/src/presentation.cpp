@@ -2008,7 +2008,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         LSFG_FRAME_DBG("input: FRAME fd slot %u link='%s' needShare=%d",
                             sidxEarly, nlink > 0 ? link : "?", needShare);
                     }
-                    const bool isShare = nlink > 0 && std::strstr(link, "dmabuf") != nullptr;
+                    // Protocol: the FIRST fd for a slot is the share; every
+                    // later FRAME for that slot carries only the sync fd. Do
+                    // NOT gate this on readlink: on the dma-buf path the fd
+                    // can arrive as 'anon_inode:sync_file' or with an
+                    // uninformative link, and a rejected share leaves dmaFds
+                    // at -1 for the rest of the session - no import, no
+                    // conversion blit, black FG content. (See the 2026-09-27
+                    // black-screen investigation.)
+                    const bool isShare = needShare && nlink >= 0;
                     if (needShare && isShare) {
                         int keepFd = ::dup(captureFd);
                         if (keepFd < 0)

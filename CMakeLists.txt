@@ -3,6 +3,14 @@ project(lsfg-vk LANGUAGES CXX C)
 include(GNUInstallDirs)
 
 # === READ HERE FOR BUILD OPTIONS ===
+# Frame-path diagnostics. OFF in a normal build: the frame path runs a few
+# hundred times a second and the call sites are on the critical path, so this
+# is a compile-time flag (a rebuild), not a runtime env gate. See
+# lsfg-vk-common/include/lsfg-vk-common/frame_dbg.hpp.
+option(LSFGVK_FRAME_DEBUG "Compile frame-path diagnostics into the binaries" OFF)
+if(LSFGVK_FRAME_DEBUG)
+    add_compile_definitions(LSGV_FRAME_DBG=1)
+endif()
 option(LSFGVK_BUILD_LAYER        "Build the Vulkan game layer (liblsfg-vk-layer.so)" ON)
 # Backwards compatibility alias for legacy LSFGVK_BUILD_VK_LAYER
 if(DEFINED LSFGVK_BUILD_VK_LAYER AND NOT DEFINED LSFGVK_BUILD_LAYER)

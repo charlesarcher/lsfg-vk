@@ -23,9 +23,9 @@
 
 #if LSGV_FRAME_DBG_ENABLED
 #define LSFG_FRAME_DBG_PRINTF(...) ::fprintf(stderr, __VA_ARGS__)
+/// Frame-path diagnostic. Compiled out entirely in a normal build.
+#define LSFG_FRAME_DBG(...) LSFG_FRAME_DBG_PRINTF(__VA_ARGS__)
 #else
 #define LSFG_FRAME_DBG_PRINTF(...) ((void)0)
-#endif
-
-/// Frame-path diagnostic. A no-op in a normal build.
 #define LSFG_FRAME_DBG(...) ((void)0)
+#endif

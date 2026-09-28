@@ -28,6 +28,15 @@ target_compile_options(lsfg-vk-layer PRIVATE
 set_target_properties(lsfg-vk-layer PROPERTIES
     CXX_VISIBILITY_PRESET hidden)
 
+# The manifest must carry an ABSOLUTE path. The loader resolves a relative
+# library_path against the layer search path, so a bare "liblsfg-vk-layer.so"
+# silently fails to load when VK_LAYER_PATH is set - the layer just never
+# appears and the app waits forever for a stream. Point it at the real build
+# artifact; install() below copies the manifest, which keeps working because
+# the installed .so sits next to it in CMAKE_INSTALL_LIBDIR.
+set(LSFGVK_LAYER_LIBRARY_PATH
+    "${CMAKE_CURRENT_BINARY_DIR}/${CMAKE_SHARED_LIBRARY_PREFIX}lsfg-vk-layer${CMAKE_SHARED_LIBRARY_SUFFIX}")
+
 configure_file(
     "VkLayer_LSFGVK_frame_generation.json.in"
     "VkLayer_LSFGVK_frame_generation.json"
