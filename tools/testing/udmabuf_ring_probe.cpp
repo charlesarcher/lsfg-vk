@@ -216,6 +216,69 @@ struct Gpu {
     }
 };
 
+
+/// Ask the driver which (format, usage) combinations it accepts for a LINEAR
+/// image that will be backed by a dma-buf. Guessing VK_FORMAT_R8G8B8A8_UNORM
+/// with TRANSFER_DST is NOT supported here
+/// (VUID-VkImageCreateInfo-pNext-00990), so we query rather than assume.
+static VkFormat pickLinearDmaBufFormat(Gpu& g, VkImageUsageFlags usage,
+                                       const char* forWhat) {
+    const VkFormat cands[] = {
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_B8G8R8A8_UNORM,
+        VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+        VK_FORMAT_R8_UNORM,       VK_FORMAT_R8G8_UNORM,
+    };
+    for (VkFormat f : cands) {
+        VkPhysicalDeviceExternalImageFormatInfo efi{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+        VkPhysicalDeviceImageFormatInfo2 ici{};
+        ici.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+        ici.pNext = &efi;
+        // this struct is {format, type, tiling, usage, flags} - no extent
+        ici.format = f;
+        ici.type = VK_IMAGE_TYPE_2D;
+        ici.tiling = VK_IMAGE_TILING_LINEAR;
+        ici.usage = usage;
+        ici.flags = 0;
+        VkExternalImageFormatProperties efp{
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+        VkImageFormatProperties2 p2{ .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+            .pNext = &efp };
+        const VkResult r = vkGetPhysicalDeviceImageFormatProperties2(g.pd, &ici, &p2);
+        if (r == VK_SUCCESS && (efp.externalMemoryProperties.compatibleHandleTypes &
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) {
+            std::printf("    %s: %s format %d (linear+dma-buf ok)\n",
+                g.name.c_str(), forWhat, (int)f);
+            return f;
+        }
+    }
+    // Report what the driver DOES accept, so the limitation is on the record
+    // rather than a bare "no".
+    std::fprintf(stderr, "%s: no linear+dma-buf format for %s. Surveying what "
+            "is supported for LINEAR + dma-buf:\n", g.name.c_str(), forWhat);
+    for (VkFormat f : cands) {
+        VkPhysicalDeviceExternalImageFormatInfo efi{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+            .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+        VkPhysicalDeviceImageFormatInfo2 ici{};
+        ici.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+        ici.pNext = &efi; ici.format = f; ici.type = VK_IMAGE_TYPE_2D;
+        ici.tiling = VK_IMAGE_TILING_LINEAR; ici.usage = usage; ici.flags = 0;
+        VkExternalImageFormatProperties efp{
+            .sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES };
+        VkImageFormatProperties2 p2{ .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+            .pNext = &efp };
+        const VkResult r = vkGetPhysicalDeviceImageFormatProperties2(g.pd, &ici, &p2);
+        std::fprintf(stderr, "  format %-4d usage 0x%x: rc=%s handles=0x%x%s\n",
+            (int)f, usage, r == VK_SUCCESS ? "OK" : vkResultName(r),
+            r == VK_SUCCESS ? (unsigned)efp.externalMemoryProperties.compatibleHandleTypes : 0u,
+            (r == VK_SUCCESS && (efp.externalMemoryProperties.compatibleHandleTypes &
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)) ? "  <- dmabuf" : "");
+    }
+    std::exit(6);
+}
+
 /// import a dma-buf as a LINEAR 2D image on one device, reporting whether the
 /// image's memory requirement fits the backing allocation
 static VkImage importDmabuf(Gpu& g, int fd, VkFormat fmt, VkImageUsageFlags usage,
@@ -226,15 +289,15 @@ static VkImage importDmabuf(Gpu& g, int fd, VkFormat fmt, VkImageUsageFlags usag
         .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR,
         .usage = usage, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
         .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED };
-    VkImportMemoryFdInfoKHR imp{ .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
-        .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd };
-    VkMemoryDedicatedAllocateInfo ded{ .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-        .pNext = &imp, .image = VK_NULL_HANDLE };
-    ii.pNext = &ded;
+    // vkCreateImage pNext: declare the external handle type the image will be
+    // bound to. VkMemoryDedicatedAllocateInfo is an ALLOCATE-time struct and is
+    // not legal in this chain (VUID-VkImageCreateInfo-pNext-pNext).
+    VkExternalMemoryImageCreateInfo em{ .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+        .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT };
+    ii.pNext = &em;
 
     VkImage img{};
     CHK(vkCreateImage(g.dev, &ii, nullptr, &img));
-    ded.image = img;
 
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(g.dev, img, &req);
@@ -276,7 +339,7 @@ static VkImage importDmabuf(Gpu& g, int fd, VkFormat fmt, VkImageUsageFlags usag
     VkImportMemoryFdInfoKHR imp2{ .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
         .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, .fd = fd };
     VkMemoryDedicatedAllocateInfo ded2{ .sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
-        .pNext = &imp2, .image = img };
+        .pNext = &imp2, .image = img };   // allocate-time chain: dedicated -> import
     VkMemoryAllocateInfo mai{ .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = &ded2, .allocationSize = req.size, .memoryTypeIndex = mti };
     VkDeviceMemory mem{};
@@ -461,6 +524,13 @@ struct Slot {
 static void makeSlot(Slot& sl, Gpu& render, Gpu& doubler, size_t size) {
     const size_t page = (size_t)sysconf(_SC_PAGESIZE);
     const size_t imgSize = (BYTES + page - 1) & ~(page - 1);   // image only
+#if !BUFFER_ONLY
+    // Query a supported linear+dma-buf format per role rather than assuming
+    // R8G8B8A8_UNORM works for both.
+    const VkFormat fmtDst = DOUBLER_ONLY ? VK_FORMAT_R8G8B8A8_UNORM
+        : pickLinearDmaBufFormat(render, VK_IMAGE_USAGE_TRANSFER_DST_BIT, "render dst");
+    const VkFormat fmtSrc = pickLinearDmaBufFormat(doubler, VK_IMAGE_USAGE_TRANSFER_SRC_BIT, "doubler src");
+#endif
     // udmabuf requires the backing memfd to be sealable and sealed
     // F_SEAL_SHRINK, and it must NOT carry F_SEAL_WRITE.
     sl.memfd = (int)syscall(SYS_memfd_create, "udma-ring",
@@ -487,15 +557,15 @@ static void makeSlot(Slot& sl, Gpu& render, Gpu& doubler, size_t size) {
     sl.dstBuf = makeBuffer(doubler, imgSize, &sl.dstBufMem, true,
         VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
 #elif DOUBLER_ONLY
-    sl.imgDoubler = importDmabuf(doubler, ::dup(sl.dmafd), VK_FORMAT_R8G8B8A8_UNORM,
+    sl.imgDoubler = importDmabuf(doubler, ::dup(sl.dmafd), fmtSrc,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT, size);
     sl.doublerLocal = allocLocal(doubler,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
         &sl.doublerLocalMem, true);
 #else
-    sl.imgRender = importDmabuf(render, ::dup(sl.dmafd), VK_FORMAT_R8G8B8A8_UNORM,
+    sl.imgRender = importDmabuf(render, ::dup(sl.dmafd), fmtDst,
         VK_IMAGE_USAGE_TRANSFER_DST_BIT, size);
-    sl.imgDoubler = importDmabuf(doubler, ::dup(sl.dmafd), VK_FORMAT_R8G8B8A8_UNORM,
+    sl.imgDoubler = importDmabuf(doubler, ::dup(sl.dmafd), fmtSrc,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT, size);
     sl.renderLocal = allocLocal(render,
         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
