@@ -473,6 +473,9 @@ std::optional<uint32_t> vk::findTransferQFI(const VulkanInstanceFuncs& fi,
     std::vector<VkQueueFamilyProperties> queues(queueCount);
     fi.GetPhysicalDeviceQueueFamilyProperties(physdev, &queueCount, queues.data());
 
+    // Prefer a TRANSFER-ONLY family. RADV exposes its DMA family as
+    // COMPUTE|TRANSFER rather than transfer-only, so this usually finds
+    // nothing and the second pass below is what actually matches on RADV.
     for (uint32_t i = 0; i < queueCount; ++i) {
         const auto flags = queues.at(i).queueFlags;
         if ((flags & VK_QUEUE_TRANSFER_BIT)
@@ -480,6 +483,10 @@ std::optional<uint32_t> vk::findTransferQFI(const VulkanInstanceFuncs& fi,
                 && !(flags & VK_QUEUE_COMPUTE_BIT))
             return i;
     }
+    // Next best: TRANSFER without GRAPHICS. A family carrying GRAPHICS is NOT
+    // acceptable: RADV lowers vkCmdCopyImage on a graphics queue to an
+    // internal draw that writes through the color backend (UTCL2 client CB)
+    // rather than issuing a DMA.
     for (uint32_t i = 0; i < queueCount; ++i) {
         const auto flags = queues.at(i).queueFlags;
         if ((flags & VK_QUEUE_TRANSFER_BIT) && !(flags & VK_QUEUE_GRAPHICS_BIT))
@@ -487,6 +494,41 @@ std::optional<uint32_t> vk::findTransferQFI(const VulkanInstanceFuncs& fi,
     }
 
     return std::nullopt;
+}
+
+/// print the queue families of a device and which one we picked for DMA.
+/// This is the first thing to check when an image copy misbehaves: if
+/// transferQueueFamilyIdx is 0 or IGNORED then copies are not going through
+/// SDMA. It used to be completely invisible, which cost a whole debugging
+/// session to establish by hand.
+static void reportQueueLayout(const vk::Vulkan& v) {
+    uint32_t qc{};
+    v.fi().GetPhysicalDeviceQueueFamilyProperties(v.physdev(), &qc, VK_NULL_HANDLE);
+    if (qc == 0) return;
+    std::vector<VkQueueFamilyProperties> qp(qc);
+    v.fi().GetPhysicalDeviceQueueFamilyProperties(v.physdev(), &qc, qp.data());
+    std::fprintf(stderr, "lsfg-vk: queue families (%u):", qc);
+    for (uint32_t i = 0; i < qc; ++i) {
+        char b[32] = {0};
+        if (qp.at(i).queueFlags & VK_QUEUE_GRAPHICS_BIT) b[0] = 'G'; b[1] = '\0';
+        if (qp.at(i).queueFlags & VK_QUEUE_COMPUTE_BIT)  b[0] = 'C'; b[1] = '\0';
+        if (qp.at(i).queueFlags & VK_QUEUE_TRANSFER_BIT) b[0] = 'T'; b[1] = '\0';
+        std::fprintf(stderr, " %u[%s]%s", i, b,
+            i == v.graphicsQFI() ? "*g"
+            : (i == v.transferQFI() ? "*x" : ""));
+    }
+    std::fprintf(stderr, "  (graphics=%u transfer=%s)\n",
+        v.graphicsQFI(),
+        v.transferQFI() == VK_QUEUE_FAMILY_IGNORED ? "NONE" : "set");
+}
+
+/// called when no non-graphics transfer family exists. Returns IGNORED (so
+/// transferQueue stays null and no copy gets submitted) but says so loudly.
+static uint32_t reportNoTransferQFI(VkPhysicalDevice) {
+    std::fprintf(stderr,
+        "lsfg-vk: WARNING no non-graphics transfer queue family; image copies "
+        "will not run as DMA. Refusing to fall back to the graphics queue.\n");
+    return VK_QUEUE_FAMILY_IGNORED;
 }
 
 /// initialize vulkan instance function pointers
@@ -670,7 +712,12 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         this->queueFamilyIdx
     )),
     transferQueueFamilyIdx(enableTransferQueue
-        ? findTransferQFI(this->instance_funcs, this->phys_dev).value_or(VK_QUEUE_FAMILY_IGNORED)
+        // No silent fallback. If we end up on a graphics family, image copies
+        // are not DMA at all - RADV lowers them to an internal draw through
+        // the color backend. Make that visible instead of inferring it later
+        // from a GPU fault.
+        ? findTransferQFI(this->instance_funcs, this->phys_dev)
+            .value_or(reportNoTransferQFI(this->phys_dev))
         : VK_QUEUE_FAMILY_IGNORED),
     transferQueue(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
         ? getQueue(this->device_funcs, *this->device,
@@ -684,6 +731,7 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
         *this->device, cachefile
     )),
     cachefile(cachefile) {
+    reportQueueLayout(*this);
 }
 
 Vulkan::Vulkan(VkInstance instance, VkDevice device,
@@ -713,6 +761,7 @@ Vulkan::Vulkan(VkInstance instance, VkDevice device,
         *this->device, cachefile
     )),
     cachefile(cachefile) {
+    reportQueueLayout(*this);
 }
 
 std::optional<uint32_t> Vulkan::findMemoryTypeIndex(

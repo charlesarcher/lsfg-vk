@@ -268,8 +268,14 @@ namespace vk {
         /// DMA-in uses the existing transfer queue. Do not request a second
         /// queue in that family (that hung the offload GPU).
         [[nodiscard]] VkQueue dmaQueueHandle() const {
-            return this->transferQueue != VK_NULL_HANDLE
-                ? this->transferQueue : this->computeQueue;
+            // Never hand back the graphics/compute queue. Callers use this for
+            // image<->image and image<->buffer copies, and RADV lowers those to
+            // an internal draw (color backend, UTCL2 client CB) when they are
+            // recorded on a graphics queue. That is not a DMA: it has faulted
+            // this GPU with an over-read past the end of the destination.
+            // A null transfer queue is the safe answer - the caller must not
+            // submit a copy at all.
+            return this->transferQueue;
         }
 
         /// get the transfer command pool
@@ -323,6 +329,13 @@ namespace vk {
         /// get instance-level function pointers
         /// @return the instance function pointers
         [[nodiscard]] const auto& fi() const { return this->instance_funcs; }
+
+        /// queue family used for graphics/compute work
+        [[nodiscard]] uint32_t graphicsQFI() const { return this->queueFamilyIdx; }
+        /// queue family used for DMA (image<->image, image<->buffer). This is
+        /// VK_QUEUE_FAMILY_IGNORED when no non-graphics transfer family was
+        /// found, in which case no copy may be submitted.
+        [[nodiscard]] uint32_t transferQFI() const { return this->transferQueueFamilyIdx; }
         /// get device-level function pointers
         /// @return the device function pointers
         [[nodiscard]] const auto& df() const { return this->device_funcs; }
