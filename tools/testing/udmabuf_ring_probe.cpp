@@ -52,6 +52,20 @@
 #ifndef ITERS
 #define ITERS 200
 #endif
+/* SAFETY: this probe has hard-faulted the render GPU on this box. An
+ * over-read past the end of the shared mapping wedges gfx_v12_0, and the
+ * card then survives rocm-smi --gpureset, PCI hotplug AND a driver rebind
+ * - only a power cycle recovers it. Default to the small size that is known
+ * good; opt in to full scale with -DFULLSCALE=1. */
+#ifndef FULLSCALE
+#define FULLSCALE 0
+#endif
+#if !FULLSCALE && (W != 512 || H != 256)
+#undef W
+#undef H
+#define W 512
+#define H 256
+#endif
 
 static const size_t BYTES = (size_t)W * H * 4;
 
@@ -400,6 +414,10 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("udmabuf ring: %dx%d (%.2f MiB/slot), %d slots, %d iters\n",
         W, H, BYTES / 1048576.0, SLOTS, ITERS);
+#if !FULLSCALE
+    std::printf("NOTE: reduced to 512x256 because full scale has hard-faulted "
+                "the render GPU. Rebuild with -DFULLSCALE=1 to try it.\n");
+#endif
 
     VkInstanceCreateInfo ici{ .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
     VkInstance inst{};
