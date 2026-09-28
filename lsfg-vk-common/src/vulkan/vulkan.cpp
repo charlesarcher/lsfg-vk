@@ -509,11 +509,15 @@ static void reportQueueLayout(const vk::Vulkan& v) {
     v.fi().GetPhysicalDeviceQueueFamilyProperties(v.physdev(), &qc, qp.data());
     std::fprintf(stderr, "lsfg-vk: queue families (%u):", qc);
     for (uint32_t i = 0; i < qc; ++i) {
-        char b[32] = {0};
-        if (qp.at(i).queueFlags & VK_QUEUE_GRAPHICS_BIT) b[0] = 'G'; b[1] = '\0';
-        if (qp.at(i).queueFlags & VK_QUEUE_COMPUTE_BIT)  b[0] = 'C'; b[1] = '\0';
-        if (qp.at(i).queueFlags & VK_QUEUE_TRANSFER_BIT) b[0] = 'T'; b[1] = '\0';
-        std::fprintf(stderr, " %u[%s]%s", i, b,
+        // print ALL capability bits, not just one: writing to b[0] meant a
+        // COMPUTE|TRANSFER family printed as just "T", which is exactly the
+        // ambiguity that made this bug hard to read.
+        const VkQueueFlags f = qp.at(i).queueFlags;
+        const bool g = (f & VK_QUEUE_GRAPHICS_BIT) != 0;
+        const bool c = (f & VK_QUEUE_COMPUTE_BIT) != 0;
+        const bool t = (f & VK_QUEUE_TRANSFER_BIT) != 0;
+        std::fprintf(stderr, " %u[raw=0x%x qc=%u %s%s%s]%s", i, (unsigned)f,
+            qp.at(i).queueCount, g ? "G" : "-", c ? "C" : "-", t ? "T" : "-",
             i == v.graphicsQFI() ? "*g"
             : (i == v.transferQFI() ? "*x" : ""));
     }
@@ -529,6 +533,21 @@ static uint32_t reportNoTransferQFI(VkPhysicalDevice) {
         "lsfg-vk: WARNING no non-graphics transfer queue family; image copies "
         "will not run as DMA. Refusing to fall back to the graphics queue.\n");
     return VK_QUEUE_FAMILY_IGNORED;
+}
+
+/// report the family that WAS chosen, with its raw flags, so a refusal can be
+/// compared against what the driver actually offered
+static void reportTransferChoice(const VulkanInstanceFuncs& fi, VkPhysicalDevice pd) {
+    uint32_t qc{};
+    fi.GetPhysicalDeviceQueueFamilyProperties(pd, &qc, VK_NULL_HANDLE);
+    std::vector<VkQueueFamilyProperties> qp(qc);
+    fi.GetPhysicalDeviceQueueFamilyProperties(pd, &qc, qp.data());
+    std::fprintf(stderr, "lsfg-vk: transfer selection over %u families:", qc);
+    for (uint32_t i = 0; i < qc; ++i)
+        std::fprintf(stderr, " %u:0x%x", i, (unsigned)qp.at(i).queueFlags);
+    auto pick = vk::findTransferQFI(fi, pd);
+    std::fprintf(stderr, " -> %s\n",
+        pick ? std::to_string(*pick).c_str() : "NONE");
 }
 
 /// initialize vulkan instance function pointers
@@ -733,6 +752,7 @@ Vulkan::Vulkan(const std::string& appName, version appVersion,
     )),
     cachefile(cachefile) {
     reportQueueLayout(*this);
+    reportTransferChoice(this->instance_funcs, this->phys_dev);
 }
 
 Vulkan::Vulkan(VkInstance instance, VkDevice device,
@@ -758,11 +778,29 @@ Vulkan::Vulkan(VkInstance instance, VkDevice device,
         *this->device,
         this->queueFamilyIdx
     )),
+    // This constructor adopts an EXTERNALLY created VkDevice, so it has to do
+    // the transfer-family selection itself. It used to skip these entirely,
+    // which left transferQueueFamilyIdx at its default IGNORED, transferQueue
+    // null and transferCmdPool empty - so every copy on this path silently had
+    // no transfer queue, and dmaQueueHandle() correctly refused. The queue
+    // family itself was always there (family 1, raw 0xe = COMPUTE|TRANSFER,
+    // 4 queues); nothing was selecting it.
+    transferQueueFamilyIdx(vk::findTransferQFI(this->instance_funcs, this->phys_dev)
+        .value_or(reportNoTransferQFI(this->phys_dev))),
+    transferQueue(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+        ? getQueue(this->device_funcs, *this->device,
+            this->setLoaderData, this->transferQueueFamilyIdx)
+        : VK_NULL_HANDLE),
+    transferCmdPool(this->transferQueueFamilyIdx != VK_QUEUE_FAMILY_IGNORED
+        ? createCommandPool(this->device_funcs,
+            *this->device, this->transferQueueFamilyIdx)
+        : ls::owned_ptr<VkCommandPool>{}),
     pipelineCache(createPipelineCache(this->device_funcs,
         *this->device, cachefile
     )),
     cachefile(cachefile) {
     reportQueueLayout(*this);
+    reportTransferChoice(this->instance_funcs, this->phys_dev);
 }
 
 std::optional<uint32_t> Vulkan::findMemoryTypeIndex(

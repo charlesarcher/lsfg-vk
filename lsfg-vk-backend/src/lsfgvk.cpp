@@ -308,7 +308,13 @@ namespace {
                 "lsfg-vk-engine", vk::version{2, 0, 0},
                 cacheKeyedSelector,
                 false, std::nullopt,
-                cachefile, enableDmaBufExtensions
+                cachefile, enableDmaBufExtensions,
+                // The capture blit is a copy, and a copy recorded on a
+                // graphics family is not a DMA: radv lowers it to an internal
+                // draw that writes through the color backend. This device was
+                // being built with no transfer family at all, so every
+                // capture copy went through the graphics path.
+                true            // enableTransferQueue
             };
         } catch (const std::exception& e) {
             throw backend::error("Unable to initialize Vulkan", e);
