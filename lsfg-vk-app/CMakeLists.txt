@@ -9,6 +9,9 @@ set(APP_SOURCES
     "src/wsi/backend_wayland.cpp")
 
 add_executable(lsfg-vk-app ${APP_SOURCES})
+# The SEGV handler walks RBP. -O2 omits frame pointers unless told not to.
+target_compile_options(lsfg-vk-app PRIVATE
+    -fno-omit-frame-pointer -fno-optimize-sibling-calls)
 
 # the app binds the listener, completes the handshake and holds per-stream
 # state. from task 6 onward it also links the backend so it can negotiate the

@@ -81,6 +81,10 @@ std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <execinfo.h>
+#include <fcntl.h>
+#include <sys/ucontext.h>
+#include <csignal>
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
@@ -647,10 +651,129 @@ namespace {
     OverlayDisplay g_overlay;
 } // namespace
 
+// --- DIAGNOSTIC: SIGSEGV handler that reports the fault address ------------
+// SEGV_ACCERR in std::__atomic_base<bool>::store has now happened twice, with
+// no caller frames. Print which mapping si_addr lands in, and walk RBP. The
+// app is built with -fno-omit-frame-pointer so that walk is the real stack.
+// Do not "fix" the store from this. The mapping is the evidence.
+namespace {
+unsigned long lsfdgParseHex(const char* s, const char** end) {
+    unsigned long v = 0;
+    while (*s) {
+        unsigned d;
+        if (*s >= '0' && *s <= '9') d = static_cast<unsigned>(*s - '0');
+        else if (*s >= 'a' && *s <= 'f') d = static_cast<unsigned>(*s - 'a' + 10);
+        else if (*s >= 'A' && *s <= 'F') d = static_cast<unsigned>(*s - 'A' + 10);
+        else break;
+        v = (v << 4) | d;
+        ++s;
+    }
+    if (end) *end = s;
+    return v;
+}
+void lsfdgWrite(const char* s) {
+    size_t n = 0;
+    while (s[n] != '\0') ++n;
+    if (n) (void) ::write(STDERR_FILENO, s, n);
+}
+} // namespace
+extern "C" void lsfdgSegvHandler(int sig, siginfo_t* si, void* ctx) {
+    static volatile sig_atomic_t inHandler;
+    if (inHandler) {
+        ::signal(sig, SIG_DFL);
+        ::raise(sig);
+        return;
+    }
+    inHandler = 1;
+    const void* addr = si ? si->si_addr : nullptr;
+    char buf[256];
+    int n = ::snprintf(buf, sizeof(buf),
+        "\n[SEGV] signal=%d code=%d si_addr=%p tid=%ld\n",
+        sig, si ? si->si_code : 0, addr, static_cast<long>(::gettid()));
+    if (n > 0) (void) ::write(STDERR_FILENO, buf, static_cast<size_t>(n));
+
+    const int mfd = ::open("/proc/self/maps", O_RDONLY);
+    if (mfd < 0) {
+        lsfdgWrite("[SEGV] /proc/self/maps unreadable\n");
+    } else {
+        const unsigned long target = reinterpret_cast<unsigned long>(addr);
+        char chunk[1024];
+        char line[512];
+        size_t llen = 0;
+        int found = 0;
+        ssize_t nr;
+        while ((nr = ::read(mfd, chunk, sizeof(chunk))) > 0 && !found) {
+            for (ssize_t i = 0; i < nr && !found; ++i) {
+                if (chunk[i] != '\n') {
+                    if (llen + 1 < sizeof(line))
+                        line[llen++] = chunk[i];
+                    continue;
+                }
+                line[llen] = '\0';
+                const char* dash = nullptr;
+                const unsigned long start = lsfdgParseHex(line, &dash);
+                if (dash && *dash == '-') {
+                    const unsigned long end = lsfdgParseHex(dash + 1, nullptr);
+                    if (target >= start && target < end) {
+                        lsfdgWrite("[SEGV] si_addr mapping: ");
+                        (void) ::write(STDERR_FILENO, line, llen);
+                        lsfdgWrite("\n");
+                        found = 1;
+                    }
+                }
+                llen = 0;
+            }
+        }
+        ::close(mfd);
+        if (!found)
+            lsfdgWrite("[SEGV] si_addr is not in any mapping\n");
+    }
+
+    if (ctx) {
+        auto* uc = static_cast<ucontext_t*>(ctx);
+        const unsigned long rip = static_cast<unsigned long>(
+            uc->uc_mcontext.gregs[REG_RIP]);
+        unsigned long rbp = static_cast<unsigned long>(
+            uc->uc_mcontext.gregs[REG_RBP]);
+        n = ::snprintf(buf, sizeof(buf), "[SEGV] fp rip=%#lx rbp=%#lx\n", rip, rbp);
+        if (n > 0) (void) ::write(STDERR_FILENO, buf, static_cast<size_t>(n));
+        for (int i = 0; i < 32 && rbp > 0x10000 && (rbp & 7) == 0; ++i) {
+            const unsigned long next = *reinterpret_cast<unsigned long*>(rbp);
+            const unsigned long ret = *reinterpret_cast<unsigned long*>(rbp + 8);
+            n = ::snprintf(buf, sizeof(buf), "[SEGV] fp[%d] %#lx\n", i, ret);
+            if (n > 0) (void) ::write(STDERR_FILENO, buf, static_cast<size_t>(n));
+            if (next <= rbp)
+                break;
+            rbp = next;
+        }
+    }
+
+    lsfdgWrite("[SEGV] backtrace:\n");
+    void* frames[64];
+    const int cnt = ::backtrace(frames, 64);
+    ::backtrace_symbols_fd(frames, cnt, STDERR_FILENO);
+    n = ::snprintf(buf, sizeof(buf), "[SEGV] end tid=%ld (%d frames)\n",
+        static_cast<long>(::gettid()), cnt);
+    if (n > 0) (void) ::write(STDERR_FILENO, buf, static_cast<size_t>(n));
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+static void lsfdgInstallSegvHandler() {
+    struct sigaction sa {};
+    sa.sa_sigaction = lsfdgSegvHandler;
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    ::sigaction(SIGSEGV, &sa, nullptr);
+    ::sigaction(SIGBUS, &sa, nullptr);
+}
+
+
 void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const vk::Vulkan& vk, lsfgvk::backend::Instance& backend,
         const ls::GameConf& conf, std::string_view session,
         const std::atomic<bool>& stop) {
+    lsfdgInstallSegvHandler();   // DIAGNOSTIC: report si_addr on SIGSEGV
+
     const uint32_t w = state.width, h = state.height;
     bool dropOverlay = false;
     /* S43b: claim a reference on the shared card for the life of this stream.
@@ -947,6 +1070,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // loop that owns it) can both reach them.
     static uint64_t g_framesDropped;
     static uint64_t g_framesOut;
+
 
     struct Inbox {
         std::mutex m;
@@ -1848,7 +1972,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         i, destCount, cur.stagingIdx);
                 } else if (cur.active) {
                     // --- REAL present: this frame's private snapshot -----------
-                    if (!presentReal(cur.stagingIdx, cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs))
+                    std::fprintf(stderr, "[M3] f=%llu tid=%ld REAL present ATTEMPTED "
+                        "slot=%u\n", (unsigned long long)cur.stagingIdx, ::gettid(),
+                        cur.stagingIdx);
+                    const bool presOk = presentReal(cur.stagingIdx,
+                        cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs);
+                    std::fprintf(stderr, "[M4] f=%llu tid=%ld REAL present RESULT ok=%d\n",
+                        (unsigned long long)cur.stagingIdx, ::gettid(), presOk ? 1 : 0);
+                    if (!presOk)
                         break;
                     lastShownStagingIdx = static_cast<int>(cur.stagingIdx);
                     for (int d : cur.doneFds)   // close any never-imported gen fds
@@ -2260,7 +2391,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     // investigation is chasing. It is KEPT for this pass on
                     // purpose, so udmabuf alone can be measured before the
                     // fence wait is touched.
-                    bFence.wait(vk, UINT64_MAX);
+                    const bool copySignalled = bFence.wait(vk, UINT64_MAX);
+                    std::fprintf(stderr, "[M2] f=%llu tid=%ld copy FENCE signalled=%d\n",
+                        (unsigned long long)fidx, ::gettid(), copySignalled ? 1 : 0);
+                    if (!copySignalled)
+                        throw ls::vulkan_error(VK_TIMEOUT,
+                            "udmabuf bounce copy fence timed out");
                     const auto copyT1 = std::chrono::steady_clock::now();
                     udmaT.copyMs.push_back(
                         std::chrono::duration<double, std::milli>(copyT1 - copyT0).count());
