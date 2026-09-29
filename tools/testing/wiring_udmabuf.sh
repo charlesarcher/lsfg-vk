@@ -118,7 +118,7 @@ fi
 # --- 30 s, sampled ------------------------------------------------------
 for t in 10 20 30; do
     sleep 10
-    FR=$(grep -ac 'input: FRAME' /tmp/t_app.log 2>/dev/null)
+    FR=$(grep -ac 'FRAME recv ' /tmp/t_app.log 2>/dev/null)
     GC=$(grep -ac 'copy SUBMITTED' /tmp/t_app.log 2>/dev/null)
     M2=$(grep -ac 'copy FENCE signalled=1' /tmp/t_app.log 2>/dev/null)
     M3=$(grep -ac 'REAL present ATTEMPTED' /tmp/t_app.log 2>/dev/null)

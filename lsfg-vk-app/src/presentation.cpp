@@ -2146,6 +2146,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (!frame)
                     continue;
 
+                std::fprintf(stderr, "FRAME recv f=%llu slot=%u\n",
+                    (unsigned long long)fidx, frame->stagingIdx);
+
                 int captureFd = conn.takeReceivedFd();
                 static bool loggedCap = false;
                 if (!loggedCap && captureFd >= 0) {
