@@ -1031,12 +1031,8 @@ void ImGuiHud::setupThemeAndFont() {
         // pick inactive slot + fence discipline (S40: submit WITH fence, wait
         // BLOCKING on the fence of the slot we are about to overwrite)
         const uint8_t next = static_cast<uint8_t>(this->active ^ 1);
-        auto& fence = *this->rtFence[next];
-        if (this->rtFenceSignaled[next]) {
-            (void)fence.wait(this->vk, UINT64_MAX);
-            fence.reset(this->vk);
-            this->hostDump();   /* diag: dump the pm image readback */
-        }
+        // Wait is immediately before RenderDrawData. Both slots share one
+        // ImGui vertex/index pair, so waiting only on next is not enough.
         // ---- imgui frame -------------------------------------------------
         ImGui_ImplVulkan_NewFrame();
         ImGui::NewFrame();
@@ -1062,6 +1058,20 @@ void ImGuiHud::setupThemeAndFont() {
         rbi.pClearValues = &clear;
         if (auto brp = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass"); brp)
             brp(this->cmdbuf.raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        // Both slots share one ImGui vertex/index pair. Wait every slot that
+        // has been submitted, or the other slot's draw is still in flight when
+        // RenderDrawData destroys that pair. Reset only next, the slot this
+        // tick overwrites. A flag stays false until the first submit, so a
+        // fence created unsignaled is never waited.
+        for (uint8_t s = 0; s < 2; ++s) {
+            if (!this->rtFenceSignaled[s])
+                continue;
+            (void)(*this->rtFence[s]).wait(this->vk, UINT64_MAX);
+        }
+        if (this->rtFenceSignaled[next]) {
+            (*this->rtFence[next]).reset(this->vk);
+            this->hostDump();
+        }
         ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf.raw());
         /* DIAG: after draw, CmdClearColorImage cyan to prove the
            canvas accepts writes in THIS pass sequence (runs before
@@ -1243,7 +1253,7 @@ void ImGuiHud::setupThemeAndFont() {
         }
         this->cmdbuf.end(this->vk);
         this->cmdbuf.submit(this->vk, {}, VK_NULL_HANDLE, 0,
-            {}, VK_NULL_HANDLE, 0, fence.handle());
+            {}, VK_NULL_HANDLE, 0, (*this->rtFence[next]).handle());
         this->rtFenceSignaled[next] = true;
         this->rtGeneral[next] = true;
         this->rtLastAccess[next] = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
