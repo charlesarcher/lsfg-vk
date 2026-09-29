@@ -381,10 +381,16 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             static_cast<char*>(map) + static_cast<size_t>(bytes));
         state.shmSeen.at(i) = 0;
         state.shmBytes = static_cast<size_t>(bytes);
-        const int sendFd = ::dup(memfd);
-        ::close(memfd);
+        // The doubler imports this same udmabuf fd as a VkBuffer. Send that fd,
+        // not the memfd: a memfd is not a dma-buf and the render GPU cannot
+        // import it. The memfd stays mapped here for the seq word only.
+        const int sendFd = hostBounce ? ::dup(state.udmaFds.at(i)) : ::dup(memfd);
         if (sendFd < 0)
-            throw ls::error("dup() failed for POSIX staging memfd");
+            throw ls::error("dup() failed");
+        ::close(memfd);
+        if (hostBounce)
+            std::fprintf(stderr,
+                "UDMABUF_SEND slot=%zu fd=%d (udmabuf, not memfd)\n", i, sendFd);
         conn.attachFd(sendFd);
         conn.send(Staging{});
         continue;

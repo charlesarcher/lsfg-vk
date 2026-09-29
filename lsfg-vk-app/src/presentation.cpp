@@ -2169,15 +2169,19 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // CPU copy / dual-host: render GPU already finished, so Release first is
                 // safe. dma-buf still points at the render GPU buffer — Release first
                 // lets the render GPU rewrite it while the secondary GPU copies.
+                const uint32_t sidxEarly = frame->stagingIdx;
+                const bool udmaSlot = sidxEarly < state.udmaFds.size()
+                    && state.udmaFds.at(sidxEarly) >= 0;
                 const bool dmaHop = (state.shmBytes == 0 && std::getenv("LSFGVK_DUAL_HOST") != nullptr
                     && std::getenv("LSFGVK_DUAL_HOST")[0] == '0');
-                if (!dmaHop) {
+                // udmabuf: the 9060 has not copied out yet. Releasing now lets
+                // the 9070 overwrite the slot mid-copy.
+                if (!dmaHop && !udmaSlot) {
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
                     LSFG_FRAME_DBG("input: Release first (slot %u) (fidx %llu)",
                         frame->stagingIdx, (unsigned long long)fidx);
                 }
 
-                const uint32_t sidxEarly = frame->stagingIdx;
                 if (sidxEarly < ls::ipc::STAGING_RING_DEPTH && captureFd >= 0) {
                     char link[64]{};
                     char path[64]{};
@@ -2203,7 +2207,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     // conversion blit, black FG content. (See the 2026-09-27
                     // black-screen investigation.)
                     const bool isShare = needShare && nlink >= 0;
-                    if (needShare && isShare) {
+                    if (needShare && isShare && !udmaSlot) {
                         int keepFd = ::dup(captureFd);
                         if (keepFd < 0)
                             throw ls::error("dup() failed before render dma-buf keep");
@@ -2387,6 +2391,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             {}, copyDone.handle(), 0,
                             bFence.handle(), vk.dmaQueueHandle());
                     }
+                    std::fprintf(stderr, "copy SUBMITTED f=%llu slot=%u\n",
+                        (unsigned long long)fidx, sidx);
                     // The park: this blocking wait is the ~36.6 ms the whole
                     // investigation is chasing. It is KEPT for this pass on
                     // purpose, so udmabuf alone can be measured before the
@@ -2397,6 +2403,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (!copySignalled)
                         throw ls::vulkan_error(VK_TIMEOUT,
                             "udmabuf bounce copy fence timed out");
+                    conn.send(ls::ipc::Release{ sidx });
+                    LSFG_FRAME_DBG("input: Release after udmabuf copy (slot %u)", sidx);
                     const auto copyT1 = std::chrono::steady_clock::now();
                     udmaT.copyMs.push_back(
                         std::chrono::duration<double, std::milli>(copyT1 - copyT0).count());

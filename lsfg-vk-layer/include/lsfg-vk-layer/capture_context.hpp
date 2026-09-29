@@ -88,6 +88,11 @@ namespace lsfgvk::layer {
 
         // vulkan objects (created on the game device)
         std::vector<vk::Image> localImages;   // 9070-owned capture dest; dma-buf exported on FRAME
+        // App-created udmabuf, imported here as a VkBuffer. FRAME then carries
+        // the capture semaphore's sync-fd only, not an image fd. udmaMmapFds
+        // is a dup kept for the one-shot byte check; Vulkan consumes the import.
+        std::array<std::optional<vk::Buffer>, ls::ipc::STAGING_RING_DEPTH> udmaBufs{};
+        std::array<int, ls::ipc::STAGING_RING_DEPTH> udmaMmapFds{};
         std::vector<vk::Image> hostImages;    // LINEAR images bound to host memory
         std::unique_ptr<vk::Vulkan> bVk;      // same-process 9060 device (LSFGVK_DUAL_HOST)
         std::vector<vk::Image> bHostImages;   // 9060 import of a separate malloc

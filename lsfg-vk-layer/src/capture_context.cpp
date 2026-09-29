@@ -59,6 +59,134 @@ bool rawDmaBufOn() {
     const char* e = std::getenv("LSFGVK_RAW_DMABUF");
     return e && e[0] == '1';
 }
+
+// One-shot check: copy the source into a linear host image (the driver picks
+// the pitch) and into the udmabuf (tight rows, bufferRowLength = width).
+// After the capture semaphore signals, row 1 of the linear image is the
+// source. Row 1 of the udmabuf is what the 9060 will read. They must match.
+struct UdmaByteRef {
+    vk::Image* img{nullptr};
+    void* ptr{nullptr};
+    VkDeviceSize bytes{0};
+    bool armed{false};
+    bool done{false};
+};
+UdmaByteRef& udmaByteRef() {
+    static UdmaByteRef r;
+    return r;
+}
+void armUdmaByteRef(const vk::Vulkan& vk, VkExtent2D extent) {
+    auto& r = udmaByteRef();
+    if (r.img || r.done)
+        return;
+    const VkDeviceSize bytes =
+        (static_cast<VkDeviceSize>(extent.width) * 4 * extent.height + 4095) & ~4095ull;
+    if (::posix_memalign(&r.ptr, 4096, static_cast<size_t>(bytes)) != 0)
+        return;
+    std::memset(r.ptr, 0, static_cast<size_t>(bytes));
+    try {
+        // Leaked on purpose: destroying it at exit races the device teardown.
+        r.img = new vk::Image(vk, extent, VK_FORMAT_R8G8B8A8_UNORM,
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT, r.ptr, bytes);
+        r.bytes = bytes;
+        r.armed = true;
+    } catch (const std::exception& e) {
+        std::cerr << "udmabuf-bytes: reference image failed: " << e.what() << "\n";
+        r.done = true;
+    }
+}
+void recordUdmaByteRef(const vk::Vulkan& vk, VkCommandBuffer cmd,
+        VkImage src, VkExtent2D extent) {
+    auto& r = udmaByteRef();
+    if (!r.armed || !r.img)
+        return;
+    VkImageMemoryBarrier toDst{
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = VK_ACCESS_NONE,
+        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = r.img->handle(),
+        .subresourceRange = {
+            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+            .levelCount = 1,
+            .layerCount = 1
+        }
+    };
+    vk.df().CmdPipelineBarrier(cmd,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toDst);
+    const VkImageCopy region{
+        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+        .extent = { extent.width, extent.height, 1 }
+    };
+    vk.df().CmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        r.img->handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+}
+void finishUdmaByteRef(const vk::Vulkan& vk, int syncFd, int mapFd,
+        uint32_t width, uint32_t height) {
+    auto& r = udmaByteRef();
+    if (!r.armed || r.done)
+        return;
+    r.done = true;
+    r.armed = false;
+    (void)height;
+    if (syncFd < 0 || mapFd < 0 || !r.ptr) {
+        std::cerr << "udmabuf-bytes: skipped (syncFd=" << syncFd
+            << " mapFd=" << mapFd << ")\n";
+        return;
+    }
+    const int waitFd = ::dup(syncFd);
+    pollfd pfd{};
+    pfd.fd = waitFd;
+    pfd.events = POLLIN;
+    const int pr = ::poll(&pfd, 1, 2000);
+    if (waitFd >= 0) ::close(waitFd);
+    if (pr <= 0) {
+        std::cerr << "udmabuf-bytes: sync poll failed pr=" << pr << "\n";
+        return;
+    }
+    VkSubresourceLayout layout{};
+    const VkImageSubresource sub{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+    vk.df().GetImageSubresourceLayout(vk.dev(), r.img->handle(), &sub, &layout);
+    void* mapped = ::mmap(nullptr, static_cast<size_t>(r.bytes),
+        PROT_READ, MAP_SHARED, mapFd, 0);
+    if (mapped == MAP_FAILED) {
+        std::cerr << "udmabuf-bytes: mmap failed errno=" << errno << "\n";
+        return;
+    }
+    const auto* src = static_cast<const uint8_t*>(r.ptr) + layout.offset;
+    const auto* buf = static_cast<const uint8_t*>(mapped);
+    const size_t tight = static_cast<size_t>(width) * 4;
+    const size_t srcRow = static_cast<size_t>(layout.rowPitch);
+    auto hex8 = [](const uint8_t* p) {
+        char s[32];
+        std::snprintf(s, sizeof(s), "%02x%02x%02x%02x %02x%02x%02x%02x",
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+        return std::string(s);
+    };
+    const bool have512 = 512 + 8 <= static_cast<size_t>(r.bytes);
+    const bool haveRow = srcRow + 8 <= static_cast<size_t>(r.bytes)
+        && tight + 8 <= static_cast<size_t>(r.bytes);
+    const bool m0 = std::memcmp(src, buf, 8) == 0;
+    const bool m512 = have512 && std::memcmp(src + 512, buf + 512, 8) == 0;
+    const bool mrow = haveRow && std::memcmp(src + srcRow, buf + tight, 8) == 0;
+    std::cerr << "udmabuf-bytes: rowPitch=" << layout.rowPitch
+        << " tight=" << tight
+        << " off0 match=" << m0
+        << " src=" << hex8(src) << " buf=" << hex8(buf);
+    if (have512)
+        std::cerr << " off512 match=" << m512
+            << " src=" << hex8(src + 512) << " buf=" << hex8(buf + 512);
+    if (haveRow)
+        std::cerr << " row1 match=" << mrow
+            << " src=" << hex8(src + srcRow) << " buf=" << hex8(buf + tight);
+    std::cerr << "\n";
+    ::munmap(mapped, static_cast<size_t>(r.bytes));
+}
 int createRawDmaBuf(size_t bytes, void** mapOut) {
     *mapOut = nullptr;
     const int mfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-raw",
@@ -378,6 +506,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     this->rawMemFds.fill(-1);
     this->rawReadyFds.fill(-1);
     this->bExportFds.fill(-1);
+    this->udmaMmapFds.fill(-1);
 
     // --- IPC handshake (2 s deadline on the NEGOTIATED reply) --------------
     std::filesystem::path sockPath;
@@ -508,10 +637,22 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             if (fd < 0)
                 throw ls::error("lsfg-vk: external stream error: STAGING arrived without its fd");
 
+            if (this->profile.transport == ls::Transport::Udmabuf) {
+                const int mapFd = ::dup(fd);
+                const size_t bytes = (static_cast<size_t>(this->info.extent.width) * 4
+                    * this->info.extent.height + 4095) & ~4095;
+                this->udmaBufs.at(i).emplace(vk, fd, bytes,
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                this->udmaMmapFds.at(i) = mapFd;
+                std::cerr << "lsfg-vk: imported app udmabuf as VkBuffer slot=" << i
+                    << " bytes=" << bytes << "\n";
+                continue;
+            }
             const bool posixShm = envFlagOn("LSFGVK_POSIX_SHM")
                 || this->profile.transport == ls::Transport::PosixShm;
             if (!posixShm) {
                 ::close(fd);
+                std::cerr << "lsfg-vk: STAGING fd closed, transport is not udmabuf\n";
                 continue;
             }
             const VkDeviceSize hostSize = [&] {
@@ -600,7 +741,9 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         this->localCopyOnly = this->fake
             || (std::getenv("LSFGVK_LOCAL_COPY")
                 && std::getenv("LSFGVK_LOCAL_COPY")[0] == '1');
-        if (this->fake && !exportIsolatedOn()) {
+        if (this->udmaBufs.at(0))
+            std::cerr << "lsfg-vk: capture dst=app udmabuf VkBuffer (no image fd)\n";
+        if (this->fake && !exportIsolatedOn() && !this->udmaBufs.at(0)) {
             this->localImages.reserve(STAGING_RING_DEPTH);
             const VkImageUsageFlags localUsage =
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
@@ -898,6 +1041,8 @@ CaptureContext& CaptureContext::operator=(CaptureContext&& o) noexcept {
 }
 
 CaptureContext::~CaptureContext() {
+    for (int fd : this->udmaMmapFds)
+        if (fd >= 0) ::close(fd);
     this->copyHop.reset();
     if (this->vkPtr) {
         try {
@@ -1263,7 +1408,45 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     cmdbuf.begin(vk);
     static const bool emptyFrame = std::getenv("LSFGVK_EMPTY_FRAME")
         && std::getenv("LSFGVK_EMPTY_FRAME")[0] == '1';
-    if (!emptyFrame && !exportIsolatedOn()) {
+    if (!emptyFrame && !exportIsolatedOn() && this->udmaBufs.at(slot)) {
+        const uint32_t w = this->info.extent.width;
+        const uint32_t h = this->info.extent.height;
+        VkImageMemoryBarrier toSrc = barrierHelper(srcImage,
+            VK_ACCESS_NONE, VK_ACCESS_TRANSFER_READ_BIT,
+            dummySrc ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        vk.df().CmdPipelineBarrier(cmdbuf.raw(),
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toSrc);
+        armUdmaByteRef(vk, this->info.extent);
+        recordUdmaByteRef(vk, cmdbuf.raw(), srcImage, this->info.extent);
+        const VkBufferImageCopy region{
+            .bufferOffset = 0,
+            .bufferRowLength = w,
+            .bufferImageHeight = h,
+            .imageSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = 1
+            },
+            .imageExtent = { w, h, 1 }
+        };
+        vk.df().CmdCopyImageToBuffer(cmdbuf.raw(), srcImage,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            this->udmaBufs.at(slot)->handle(), 1, &region);
+        VkImageMemoryBarrier back = barrierHelper(srcImage,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            dummySrc ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                     : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        vk.df().CmdPipelineBarrier(cmdbuf.raw(),
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &back);
+        static uint32_t nUdmaCopy = 0;
+        if (nUdmaCopy < 8) {
+            ++nUdmaCopy;
+            std::cerr << "lsfg-vk: udmabuf copyImageToBuffer slot=" << slot << "\n";
+        }
+    } else if (!emptyFrame && !exportIsolatedOn()) {
     const vk::Image& dstImage = !this->hostImages.empty()
         ? this->hostImages.at(slot)
         : this->localImages.at(slot);
@@ -1426,6 +1609,9 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
         throw ls::error(std::string("lsfg-vk: external stream error: export sync fd failed: ") + e.what(), e);
     }
+    if (slot < this->udmaBufs.size() && this->udmaBufs.at(slot))
+        finishUdmaByteRef(vk, syncFd, this->udmaMmapFds.at(slot),
+            this->info.extent.width, this->info.extent.height);
     if (this->copyHop && syncFd >= 0) {
         if (slot < this->shmMaps.size() && this->shmMaps.at(slot)
                 && this->hostPtrsA.at(slot) && this->hostAllocSize > 0) {
@@ -1470,7 +1656,13 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // send FRAME (owns fd on success, closes on failure path via Connection)
     try {
         int sendFd = syncFd;
-        if (exportIsolatedOn() && this->fake && isIsolated(swapchain)) {
+        if (slot < this->udmaBufs.size() && this->udmaBufs.at(slot)) {
+            static bool loggedUdmaFrame = false;
+            if (!loggedUdmaFrame) {
+                loggedUdmaFrame = true;
+                std::cerr << "lsfg-vk: FRAME carries udmabuf sync_fd only (no image fd)\n";
+            }
+        } else if (exportIsolatedOn() && this->fake && isIsolated(swapchain)) {
             auto& iso = isolatedAt(swapchain);
             if (imageIdx < iso.exportFds.size() && iso.exportFds.at(imageIdx) >= 0) {
                 if (!this->dmaBufSent.at(slot)) {
