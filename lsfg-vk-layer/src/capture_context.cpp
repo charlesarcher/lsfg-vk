@@ -965,6 +965,8 @@ CaptureContext::CaptureContext(CaptureContext&& o) noexcept :
     fake(o.fake),
     lastImageGateFence(o.lastImageGateFence),
     localImages(std::move(o.localImages)),
+    udmaBufs(std::move(o.udmaBufs)),
+    udmaMmapFds(o.udmaMmapFds),
     hostImages(std::move(o.hostImages)),
     bVk(std::move(o.bVk)),
     bHostImages(std::move(o.bHostImages)),
@@ -1011,6 +1013,7 @@ CaptureContext::CaptureContext(CaptureContext&& o) noexcept :
     o.capturePool = VK_NULL_HANDLE;
     o.captureQ = VK_NULL_HANDLE;
     o.bExportFds.fill(-1);
+    o.udmaMmapFds.fill(-1);
     o.localExportFds.fill(-1);
     o.rawExportFds.fill(-1);
     o.rawMemFds.fill(-1);
