@@ -2244,11 +2244,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 auto& computeCb = computeCbs.at(sidx);
                 if (!snapCbFence.wait(vk, 0)) {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
-                    // Overlay did not sample this write. Free it unless it is
-                    // the slot the in-flight coprocessor copy is still reading.
-                    if (dmaHop
-                            && static_cast<int>(frame->stagingIdx) != pendingDmaRelease)
+                    // Overlay did not sample this write. Return the slot, or the
+                    // ring fills and the layer stops. The dmaHop path keeps the
+                    // one slot a coprocessor copy is still reading.
+                    if (!dmaHop
+                            || static_cast<int>(frame->stagingIdx) != pendingDmaRelease) {
                         conn.send(ls::ipc::Release{ frame->stagingIdx });
+                        std::fprintf(stderr,
+                            "Release skip slot=%u f=%llu\n",
+                            frame->stagingIdx, (unsigned long long)fidx);
+                    }
                     LSFG_FRAME_DBG("input: snapshot skip (cb busy) (fidx %llu)",
                         (unsigned long long)fidx);
                 } else {
