@@ -88,6 +88,7 @@ std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -115,6 +116,93 @@ std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
 
 namespace ls::presentation {
 namespace {
+    /// Per-present stage times. Off unless LSFGVK_DBG is set to something
+    /// other than "0". The off path is one flag check: no clock, no poll,
+    /// no allocation. When on, the generation sync fd is polled on the CPU
+    /// before import so that wait is a number instead of being buried in
+    /// QueuePresent. That poll is not on the default path.
+    struct StageTimes {
+        bool on{ false };
+        std::vector<int64_t> acquire, blit, genPresent, fenceWait, syncFd;
+        std::atomic<uint64_t> pushed{ 0 }, dropped{ 0 };
+        std::atomic<uint64_t> genCount{ 0 }, realCount{ 0 };
+        Clock::time_point lastDump{};
+        bool dumped{ false };
+
+        StageTimes() {
+            const char* e = std::getenv("LSFGVK_DBG");
+            on = e && e[0] && std::strcmp(e, "0") != 0;
+            if (!on)
+                return;
+            constexpr size_t cap = 200000;
+            acquire.reserve(cap);
+            blit.reserve(cap);
+            genPresent.reserve(cap);
+            fenceWait.reserve(cap);
+            syncFd.reserve(cap);
+            std::fprintf(stderr,
+                "stage-time on (LSFGVK_DBG); sync-fd wait is a CPU poll before import\n");
+        }
+
+        void add(std::vector<int64_t>& v, int64_t us) {
+            if (v.size() < v.capacity())
+                v.push_back(us);
+        }
+
+        static void printOne(const char* name, std::vector<int64_t> v) {
+            if (v.empty()) {
+                std::fprintf(stderr, "stage-time %-12s n=0\n", name);
+                return;
+            }
+            std::sort(v.begin(), v.end());
+            const size_t n = v.size();
+            const int64_t p50 = v[n / 2];
+            const int64_t p99 = v[std::min(n - 1, (n * 99) / 100)];
+            std::fprintf(stderr,
+                "stage-time %-12s n=%zu p50=%lld p99=%lld max=%lld us\n",
+                name, n, static_cast<long long>(p50),
+                static_cast<long long>(p99), static_cast<long long>(v.back()));
+        }
+
+        void dump(const char* tag) {
+            if (!on)
+                return;
+            std::fprintf(stderr,
+                "stage-time %s pushed=%llu dropped=%llu gen=%llu real=%llu\n",
+                tag,
+                static_cast<unsigned long long>(pushed.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(dropped.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(genCount.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(realCount.load(std::memory_order_relaxed)));
+            printOne("acquire", acquire);
+            printOne("blit", blit);
+            printOne("gen-present", genPresent);
+            printOne("fence-wait", fenceWait);
+            printOne("sync-fd-wait", syncFd);
+            std::fflush(stderr);
+            lastDump = Clock::now();
+            dumped = true;
+        }
+
+        void maybeDump() {
+            if (!on)
+                return;
+            if (!dumped) {
+                lastDump = Clock::now();
+                dumped = true;
+                return;
+            }
+            if (elapsedUs(lastDump, Clock::now()) >= 10'000'000)
+                dump("10s");
+        }
+    };
+
+    StageTimes& stageTimes() {
+        static StageTimes t;
+        return t;
+    }
+
+
     /// Session 40 dbl-ledger app-side sink: (capTsNs, presentedNs) per REAL
     /// present, consumed by tools/latency/probe_vk for click→photon through
     /// the doubled path. Env-gated: only mapped when LSFGVK_DBL_LEDGER=1.
@@ -1138,6 +1226,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             // not been presented yet, until the process runs out of fds.
             // Close the fds of everything older than the newest two.
             std::vector<PendingFrame> dropped;
+            if (stageTimes().on)
+                stageTimes().pushed.fetch_add(1, std::memory_order_relaxed);
             {
                 std::lock_guard<std::mutex> lk(m);
                 q.push_back(std::move(f));
@@ -1146,6 +1236,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     q.pop_front();
                 }
             }
+            if (!dropped.empty() && stageTimes().on)
+                stageTimes().dropped.fetch_add(dropped.size(), std::memory_order_relaxed);
             for (auto& old : dropped) {
                 for (int d : old.doneFds)
                     if (d >= 0) ::close(d);
@@ -1540,16 +1632,26 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         auto presentReal = [&](int stagingIdx, int snapFd, uint64_t capTsNs = 0) -> bool {
             uint32_t idx{};
             const auto tReal0 = Clock::now();
+            Clock::time_point tAcq0{};
+            if (stageTimes().on)
+                tAcq0 = Clock::now();
             if (!acquireImage(idx)) {
                 if (snapFd >= 0) ::close(snapFd);
                 return false;
             }
+            if (stageTimes().on)
+                stageTimes().add(stageTimes().acquire, elapsedUs(tAcq0, Clock::now()));
             const auto tAcquire = Clock::now();
             const VkImage dstImage = swapImages.at(idx);
             auto& srcImage = state.genSources.at(stagingIdx);
             // wait for this command buffer's previous submit to complete
+            Clock::time_point tFence0{};
+            if (stageTimes().on)
+                tFence0 = Clock::now();
             if (!cbFences.at(cbIdx).wait(vk, UINT64_MAX))
                 throw ls::vulkan_error(VK_TIMEOUT, "cb fence wait failed");
+            if (stageTimes().on)
+                stageTimes().add(stageTimes().fenceWait, elapsedUs(tFence0, Clock::now()));
             cbFences.at(cbIdx).reset(vk);
             cbs.at(cbIdx).begin(vk);
             // wait on the snapshot sync_fd semaphore (ensures copyImage done)
@@ -1562,6 +1664,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 realWaits.push_back(doneWaitSem.at(destCount).handle());
                 LSFG_FRAME_DBG("output: REAL importSyncFd %lld us", elapsedUs(tImport0, tImport1));
             }
+            Clock::time_point tBlit0{};
+            if (stageTimes().on)
+                tBlit0 = Clock::now();
             cbs.at(cbIdx).blitImage(vk,
                 {
                     makeBlitBarrier(srcImage.mut().handle(),
@@ -1582,6 +1687,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 VK_FILTER_LINEAR
             );
             drawHud(cbs.at(cbIdx), dstImage);
+            if (stageTimes().on)
+                stageTimes().add(stageTimes().blit, elapsedUs(tBlit0, Clock::now()));
             const auto tBlitEnd = Clock::now();
             cbs.at(cbIdx).end(vk);
             {
@@ -1594,9 +1701,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     cbFences.at(cbIdx).handle());
                 const auto tSubmit1 = Clock::now();
                 LSFG_FRAME_DBG("output: REAL acquire %lld us blit %lld us lock %lld us submit %lld us (total %lld us)",
-                    elapsedUs(tReal0, tAcquire), elapsedUs(tAcquire, tBlitEnd),
+                    elapsedUs(tAcq0, tAcquire), elapsedUs(tAcquire, tBlitEnd),
                     elapsedUs(tLock0, tLock1), elapsedUs(tLock1, tSubmit1),
-                    elapsedUs(tReal0, tSubmit1));
+                    elapsedUs(tAcq0, tSubmit1));
             }
             cbIdx = (cbIdx + 1) % cbRingSize;
             processWsiEvents(0);
@@ -1616,6 +1723,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
+            if (stageTimes().on)
+                stageTimes().realCount.fetch_add(1, std::memory_order_relaxed);
             // Session 40: drain presented-feedback (needs the blocking
             // roundtrip; see drainPresentFeedback docs)
             g_overlay.wsi->drainPresentFeedback();
@@ -1743,6 +1852,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
         try {
             for (;;) {
+                stageTimes().maybeDump();
                 if (stop.load(std::memory_order_relaxed)
                         || failed.load(std::memory_order_relaxed))
                     break;
@@ -1859,20 +1969,41 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (cur.active && cur.nextDest < destCount) {
                     // --- GEN present for destination images[cur.nextDest] ------
                     const size_t i = cur.nextDest;
-                    const auto tGen0 = Clock::now();
                     uint32_t idx{};
+                    Clock::time_point tAcq0{};
+                    if (stageTimes().on)
+                        tAcq0 = Clock::now();
                     if (!acquireImage(idx))
                         break;
-                    const auto tAcquire = Clock::now();
+                    if (stageTimes().on)
+                        stageTimes().add(stageTimes().acquire, elapsedUs(tAcq0, Clock::now()));
                     const VkImage dstImage = swapImages.at(idx);
                     if (cur.doneFds.at(i) >= 0) {
+                        if (stageTimes().on) {
+                            struct pollfd pfd{
+                                .fd = cur.doneFds.at(i),
+                                .events = POLLIN,
+                            };
+                            const auto tSync0 = Clock::now();
+                            ::poll(&pfd, 1, -1);
+                            stageTimes().add(stageTimes().syncFd,
+                                elapsedUs(tSync0, Clock::now()));
+                        }
                         importSyncFd(vk, doneWaitSem.at(i).handle(), cur.doneFds.at(i));
                         cur.doneFds.at(i) = -1;   // import consumed the fd
                     }
                     // wait for this command buffer's previous submit to complete
+                    Clock::time_point tFence0{};
+                    if (stageTimes().on)
+                        tFence0 = Clock::now();
                     if (!cbFences.at(cbIdx).wait(vk, UINT64_MAX))
                         throw ls::vulkan_error(VK_TIMEOUT, "cb fence wait failed");
+                    if (stageTimes().on)
+                        stageTimes().add(stageTimes().fenceWait, elapsedUs(tFence0, Clock::now()));
                     cbFences.at(cbIdx).reset(vk);
+                    Clock::time_point tBlit0{};
+                    if (stageTimes().on)
+                        tBlit0 = Clock::now();
                     cbs.at(cbIdx).begin(vk);
                     cbs.at(cbIdx).blitImage(vk,
                         {
@@ -1894,7 +2025,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         VK_FILTER_LINEAR
                     );
                     drawHud(cbs.at(cbIdx), dstImage);
-                    const auto tBlitEnd = Clock::now();
+                    if (stageTimes().on)
+                        stageTimes().add(stageTimes().blit,
+                            elapsedUs(tBlit0, Clock::now()));
                     cbs.at(cbIdx).end(vk);
                     {
                         std::lock_guard<std::mutex> lk(submitMtx);
@@ -1916,7 +2049,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     // Session 40: same as REAL — arm before the commit.
                     g_overlay.wsi->armPresentFeedback(fbHandle);
                     const auto tGenSubmit = Clock::now();
+                    Clock::time_point tPres0{};
+                    if (stageTimes().on)
+                        tPres0 = Clock::now();
                     const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+                    if (stageTimes().on) {
+                        stageTimes().add(stageTimes().genPresent,
+                            elapsedUs(tPres0, Clock::now()));
+                        stageTimes().genCount.fetch_add(1, std::memory_order_relaxed);
+                    }
                     if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                         throw ls::vulkan_error(pres, "QueuePresentKHR failed (generated)");
                     g_overlay.wsi->drainPresentFeedback();
@@ -2044,7 +2185,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     ::close(d);
             if (cur.snapFd >= 0)
                 ::close(cur.snapFd);
+            stageTimes().dump("final");
         } catch (...) {
+            stageTimes().dump("catch");
             if (cur.snapFd >= 0) ::close(cur.snapFd);
             if (!outputError)
                 outputError = std::current_exception();
