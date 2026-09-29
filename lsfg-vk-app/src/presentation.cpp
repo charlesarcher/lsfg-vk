@@ -1133,9 +1133,23 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             return PendingFrame{ std::move(oldest) };
         }
         void push(PendingFrame f) {
+            // Newest 2 only. The output thread cannot keep up with the copy
+            // thread. An unbounded queue holds one sync_fd per frame that has
+            // not been presented yet, until the process runs out of fds.
+            // Close the fds of everything older than the newest two.
+            std::vector<PendingFrame> dropped;
             {
                 std::lock_guard<std::mutex> lk(m);
                 q.push_back(std::move(f));
+                while (q.size() > 2) {
+                    dropped.push_back(std::move(q.front()));
+                    q.pop_front();
+                }
+            }
+            for (auto& old : dropped) {
+                for (int d : old.doneFds)
+                    if (d >= 0) ::close(d);
+                if (old.snapFd >= 0) ::close(old.snapFd);
             }
             cv.notify_one();
         }
