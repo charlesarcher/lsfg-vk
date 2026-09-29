@@ -9,6 +9,8 @@
 #include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <ios>
@@ -130,9 +132,28 @@ namespace {
             }
         }
 
+        // Validation, opt-in. The loader honours VK_INSTANCE_LAYERS for
+        // implicit layers only when the layer is not in the app's own list, and
+        // the whole project had been running with NO validation at all because
+        // ppEnabledLayerNames was never set here. Set it explicitly behind
+        // LSFGVK_VALIDATION=1 so a run can prove - in /proc/<pid>/maps - that
+        // the layer is actually loaded. Verify with
+        //   grep khronos_validation /proc/<pid>/maps
+        std::vector<const char*> enabledLayers;
+        if (const char* v = std::getenv("LSFGVK_VALIDATION")
+                ; v && v[0] == '1') {
+            enabledLayers.push_back("VK_LAYER_KHRONOS_validation");
+            std::fprintf(stderr,
+                "[val] requesting VK_LAYER_KHRONOS_validation in VkInstanceCreateInfo\n");
+        }
+
         const VkInstanceCreateInfo instanceInfo{
             .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pApplicationInfo = &appInfo,
+            .enabledLayerCount = static_cast<uint32_t>(enabledLayers.size()),
+            .ppEnabledLayerNames = enabledLayers.empty()
+                ? nullptr
+                : enabledLayers.data(),
             .enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size()),
             .ppEnabledExtensionNames = enabledExtensions.empty()
                 ? nullptr
@@ -141,6 +162,8 @@ namespace {
         auto res = vkCreateInstance(&instanceInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkCreateInstance() failed");
+        if (!enabledLayers.empty())
+            std::fprintf(stderr, "[val] vkCreateInstance SUCCESS with validation layer\n");
 
         auto defunc =
             ipa<PFN_vkDestroyInstance>(get_mpa(), handle, "vkDestroyInstance");
