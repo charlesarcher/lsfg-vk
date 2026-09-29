@@ -4,10 +4,12 @@
 #include "lsfg-vk-common/helpers/errors.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
+#include "lsfg-vk-common/frame_dbg.hpp"
 
 #include <algorithm>
 #include <bitset>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
 
 #include <unistd.h>
@@ -28,6 +30,12 @@ namespace {
             .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
             .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT_KHR
         };
+        // NOTE: this createImage() is NOT the one the live capture path uses.
+        // The live path is the DRM_FORMAT_MODIFIER variant below, which
+        // reports tiling=DRM_FORMAT_MODIFIER_EXT, not OPTIMAL. The earlier
+        // "tiling=OPTIMAL" reading came from a log ternary that printed every
+        // non-LINEAR value as OPTIMAL (fixed 2026-09-28). .tiling is left
+        // unset here to match its original behaviour.
         const VkImageCreateInfo imageInfo{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             .pNext = external ? &externalInfo : nullptr,
@@ -49,6 +57,18 @@ namespace {
         auto res = vk.df().CreateImage(vk.dev(), &imageInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkCreateImage() failed");
+        if (LSGV_FRAME_DBG_ENABLED) {
+            std::fprintf(stderr,
+                "lsfg-vk: createImage %ux%u fmt=%d tiling=%s external=%d "
+                "usage=0x%x\n",
+                extent.width, extent.height, static_cast<int>(format),
+                imageInfo.tiling == VK_IMAGE_TILING_LINEAR ? "LINEAR"
+                    : imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL ? "OPTIMAL"
+                    : imageInfo.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+                        ? "DRM_MODIFIER_EXT" : "OTHER",
+                external ? 1 : 0, static_cast<unsigned>(usage));
+            std::fflush(stderr);
+        }
 
         return ls::owned_ptr<VkImage>(
             new VkImage(handle),
@@ -143,6 +163,18 @@ namespace {
         auto res = vk.df().CreateImage(vk.dev(), &imageInfo, VK_NULL_HANDLE, &handle);
         if (res != VK_SUCCESS)
             throw ls::vulkan_error(res, "vkCreateImage() failed");
+        if (LSGV_FRAME_DBG_ENABLED) {
+            std::fprintf(stderr,
+                "lsfg-vk: createImage %ux%u fmt=%d tiling=%s external=%d "
+                "usage=0x%x\n",
+                extent.width, extent.height, static_cast<int>(format),
+                imageInfo.tiling == VK_IMAGE_TILING_LINEAR ? "LINEAR"
+                    : imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL ? "OPTIMAL"
+                    : imageInfo.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT
+                        ? "DRM_MODIFIER_EXT" : "OTHER",
+                external ? 1 : 0, static_cast<unsigned>(usage));
+            std::fflush(stderr);
+        }
 
         return ls::owned_ptr<VkImage>(
             new VkImage(handle),
@@ -342,7 +374,6 @@ namespace {
             .mipLevels = 1,
             .arrayLayers = 1,
             .samples = VK_SAMPLE_COUNT_1_BIT,
-            .tiling = VK_IMAGE_TILING_LINEAR,
             .usage = usage,
             .sharingMode = VK_SHARING_MODE_EXCLUSIVE
         };

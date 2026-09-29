@@ -17,6 +17,9 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <execinfo.h>
+#include <csignal>
+#include <unistd.h>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -84,11 +87,70 @@ namespace {
         std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
     }* instance_info; // NOLINT (global variable)
 
+// --- DIAGNOSTIC: SIGABRT + std::terminate --------------------------------
+// The client aborts with no error text at all (2026-09-28). An abort always
+// has a cause: either a signal we can catch, or an exception escaping a
+// noexcept boundary, which lands in std::terminate. This prints the stack and,
+// for terminate, the active exception's what(). The process is then re-raised
+// so the exit status still reports the abort.
+extern "C" void lsfdgAbortHandler(int sig) {
+    char buf[128];
+    const int n = ::snprintf(buf, sizeof(buf),
+        "\n[ABRT] signal=%d tid=%ld -- stack of the aborting thread:\n",
+        sig, ::gettid());
+    (void) ::write(STDERR_FILENO, buf, static_cast<size_t>(n));
+    void* frames[64];
+    const int cnt = ::backtrace(frames, 64);
+    ::backtrace_symbols_fd(frames, cnt, STDERR_FILENO);
+    const int m = ::snprintf(buf, sizeof(buf),
+        "[ABRT] end tid=%ld (%d frames)\n", ::gettid(), cnt);
+    (void) ::write(STDERR_FILENO, buf, static_cast<size_t>(m));
+    ::signal(sig, SIG_DFL);
+    ::raise(sig);
+}
+
+extern "C" void lsfdgTerminate() {
+    // Runs when an exception escapes noexcept, or terminate() is called
+    // directly. std::current_exception() tells us WHAT was thrown.
+    const char* what = "<no active exception>";
+    if (const auto ex = std::current_exception()) {
+        try {
+            std::rethrow_exception(ex);
+        } catch (const std::exception& e) {
+            what = e.what();
+        } catch (...) {
+            what = "<non-std::exception>";
+        }
+    }
+    char buf[512];
+    const int n = ::snprintf(buf, sizeof(buf),
+        "\n[TERM] uncaught exception escaped, tid=%ld:\n[TERM]   what()=%s\n",
+        ::gettid(), what);
+    (void) ::write(STDERR_FILENO, buf, static_cast<size_t>(n));
+    void* frames[64];
+    const int cnt = ::backtrace(frames, 64);
+    ::backtrace_symbols_fd(frames, cnt, STDERR_FILENO);
+    std::_Exit(134);
+}
+
+static void lsfdgInstallAbortHandlers() {
+    struct sigaction sa {};
+    sa.sa_handler = lsfdgAbortHandler;
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    ::sigaction(SIGABRT, &sa, nullptr);
+    ::sigaction(SIGILL, &sa, nullptr);
+    ::sigaction(SIGFPE, &sa, nullptr);
+    std::set_terminate(&lsfdgTerminate);
+}
+
     // create instance
     VkResult myvkCreateInstance(
             const VkInstanceCreateInfo* info,
             const VkAllocationCallbacks* alloc,
             VkInstance* instance) {
+    lsfdgInstallAbortHandlers();   // DIAGNOSTIC: name the abort cause
+
         // apply layer chaining
         auto* layerInfo = reinterpret_cast<VkLayerInstanceCreateInfo*>(const_cast<void*>(info->pNext));
         while (layerInfo && (layerInfo->sType != VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO
