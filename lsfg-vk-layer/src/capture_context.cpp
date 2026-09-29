@@ -623,9 +623,9 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 }
                 if (gemFd >= 0) {
                     (void)gemIsExplicitSync(gemFd);
+                    // Do NOT close gemFd: we still need it to hand the dma-buf
+                    // to the app below. The Image gets its own dup().
                     const int imp = ::dup(gemFd);
-                    ::close(gemFd);
-                    gemFd = -1;
                     if (imp < 0)
                         throw ls::error("dup() failed before dest import");
                     this->localImages.emplace_back(vk, this->info.extent,
@@ -635,20 +635,33 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                     this->localImages.emplace_back(vk, this->info.extent,
                         VK_FORMAT_R8G8B8A8_UNORM, localUsage,
                         std::nullopt, std::nullopt, this->exchangeLayout);
+                    gemFd = -1;
                 }
-                auto exp = this->localImages.back().exportDmaBuf(vk);
-                this->localExportFds.at(i) = exp.fd;
+                int exportFdForApp = -1;
+                if (gemFd >= 0) {
+                    // The image was imported FROM gemFd. Exporting it again
+                    // with vkGetMemoryFdKHR is invalid: that memory was never
+                    // created with VkExportMemoryAllocateInfo, so the
+                    // handleType was never in handleTypes
+                    // (VUID-VkMemoryGetFdInfoKHR-handleType-00671, observed
+                    // 2026-09-28 aborting the game). We already own the fd.
+                    exportFdForApp = ::dup(gemFd);
+                    ::close(gemFd);
+                } else {
+                    exportFdForApp = this->localImages.back().exportDmaBuf(vk).fd;
+                }
+                this->localExportFds.at(i) = exportFdForApp;
                 VkMemoryFdPropertiesKHR fp{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR
                 };
                 auto pr = vk.df().GetMemoryFdPropertiesKHR(vk.dev(),
                     VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-                    exp.fd, &fp);
+                    exportFdForApp, &fp);
                 std::cerr << "lsfg-vk: render dma-buf slot " << i
-                    << " fd=" << exp.fd << " props=" << pr
+                    << " fd=" << exportFdForApp << " props=" << pr
                     << " types=0x" << std::hex << fp.memoryTypeBits << std::dec
-                    << " pitch=" << exp.rowPitch
-                    << " size=" << exp.allocationSize << "\n";
+                    << " pitch=" << this->exchangeLayout.rowPitch
+                    << " size=" << gemBytes << "\n";
             }
             if (this->localCopyOnly)
                 std::cerr << "lsfg-vk: capture dst=render-owned dma-buf\n";

@@ -837,14 +837,35 @@ namespace {
         if (it == instance_info->devices.end())
             return VK_ERROR_INITIALIZATION_FAILED;
         static const bool dbg = LSGV_FRAME_DBG_ENABLED;
+        // An infinite wait is a hang with no evidence. Cap it so a fence that
+        // never signals fails loudly instead of blocking the game forever.
+        constexpr uint64_t kInfiniteNs = 0xFFFFFFFFFFFFFFFFull;
+        const uint64_t effTimeout =
+            (timeout == kInfiniteNs) ? 1000000000ull /* 1 s */ : timeout;
         if (dbg)
             std::fprintf(stderr,
-                "lsfg-vk-layer: [dbg] WaitForFences ENTER n=%u timeout=%llu fence0=%p\n",
+                "lsfg-vk-layer: [dbg] WaitForFences ENTER n=%u timeout=%llu "
+                "(eff=%llu) fence0=%p dev=%p\n",
                 fenceCount, static_cast<unsigned long long>(timeout),
-                (void*)(pFences && fenceCount ? pFences[0] : VK_NULL_HANDLE));
+                static_cast<unsigned long long>(effTimeout),
+                (void*)(pFences && fenceCount ? pFences[0] : VK_NULL_HANDLE),
+                (void*)device);
         const auto t0 = std::chrono::steady_clock::now();
         const VkResult res = it->second.df().WaitForFences(
-            device, fenceCount, pFences, waitAll, timeout);
+            device, fenceCount, pFences, waitAll, effTimeout);
+        if (res == VK_TIMEOUT) {
+            // Log and keep the caller's semantics: a timeout is NOT success.
+            // Callers retry, and the log names the device + fence that never
+            // signalled so the stall is identifiable (2026-09-28 stall).
+            std::fprintf(stderr,
+                "lsfg-vk-layer: WaitForFences TIMEOUT after %llu ns n=%u "
+                "waitAll=%u fence0=%p dev=%p -- fence did not signal\n",
+                static_cast<unsigned long long>(effTimeout), fenceCount,
+                static_cast<unsigned>(waitAll),
+                (void*)(pFences && fenceCount ? pFences[0] : VK_NULL_HANDLE),
+                (void*)device);
+            std::fflush(stderr);
+        }
         if (dbg) {
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
