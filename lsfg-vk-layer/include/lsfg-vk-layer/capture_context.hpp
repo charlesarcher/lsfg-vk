@@ -14,10 +14,15 @@
 #include "lsfg-vk-common/vulkan/vulkan.hpp"
 
 #include <array>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <queue>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <vulkan/vulkan_core.h>
@@ -69,6 +74,11 @@ namespace lsfgvk::layer {
     private:
         /// non-blocking drain of RELEASE messages; @returns count applied
         int drainReleases();
+        /// poll the capture sync-fd off the game thread, then send FRAME
+        void ensureFrameThread();
+        void enqueueDeferredFrame(int fd, uint32_t slot, uint64_t id);
+        void stopFrameThread();
+        void frameThreadMain();
         /// one round-robin probe. never waits on GPU B. nullopt = skip this capture
         [[nodiscard]] std::optional<size_t> trySelectFreeSlot();
         /// bitmap of currently free slots (bit i = slot i free); debug only
@@ -149,6 +159,20 @@ namespace lsfgvk::layer {
         const vk::Vulkan* vkPtr{nullptr};
         VkCommandPool capturePool{VK_NULL_HANDLE};
         VkQueue captureQ{VK_NULL_HANDLE};
+
+        // FRAME goes out only after the capture sync-fd signals. The game
+        // thread enqueues the fd and returns. This thread polls, then sends.
+        struct DeferredFrame {
+            int fd{-1};
+            uint32_t slot{0};
+            uint64_t id{0};
+        };
+        std::mutex ipcMu;
+        std::mutex frameMu;
+        std::condition_variable frameCv;
+        std::queue<DeferredFrame> frameQ;
+        std::thread frameThread;
+        std::atomic<bool> frameStop{false};
     };
 
 }

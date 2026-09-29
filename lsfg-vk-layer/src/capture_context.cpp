@@ -1082,6 +1082,7 @@ CaptureContext& CaptureContext::operator=(CaptureContext&& o) noexcept {
 }
 
 CaptureContext::~CaptureContext() {
+    this->stopFrameThread();
     for (int fd : this->udmaMmapFds)
         if (fd >= 0) ::close(fd);
     this->copyHop.reset();
@@ -1191,8 +1192,95 @@ CaptureContext::~CaptureContext() {
         leakBvks->push_back(std::move(this->bVk));
 }
 
+void CaptureContext::ensureFrameThread() {
+    if (this->frameThread.joinable())
+        return;
+    this->frameStop.store(false, std::memory_order_relaxed);
+    this->frameThread = std::thread([this] { this->frameThreadMain(); });
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        std::cerr << "lsfg-vk: FRAME waits for the sync fd on a side thread\n";
+    }
+}
+
+void CaptureContext::enqueueDeferredFrame(int fd, uint32_t slot, uint64_t id) {
+    {
+        std::lock_guard<std::mutex> lk(this->frameMu);
+        this->frameQ.push(DeferredFrame{ fd, slot, id });
+    }
+    this->frameCv.notify_one();
+}
+
+void CaptureContext::stopFrameThread() {
+    {
+        std::lock_guard<std::mutex> lk(this->frameMu);
+        this->frameStop.store(true, std::memory_order_relaxed);
+        while (!this->frameQ.empty()) {
+            if (this->frameQ.front().fd >= 0)
+                ::close(this->frameQ.front().fd);
+            this->frameQ.pop();
+        }
+    }
+    this->frameCv.notify_all();
+    if (this->frameThread.joinable())
+        this->frameThread.join();
+}
+
+void CaptureContext::frameThreadMain() {
+    while (true) {
+        DeferredFrame job{};
+        {
+            std::unique_lock<std::mutex> lk(this->frameMu);
+            this->frameCv.wait(lk, [&] {
+                return this->frameStop.load(std::memory_order_relaxed)
+                    || !this->frameQ.empty();
+            });
+            if (this->frameQ.empty())
+                return;
+            job = this->frameQ.front();
+            this->frameQ.pop();
+        }
+        if (job.fd < 0)
+            continue;
+        pollfd pfd{};
+        pfd.fd = job.fd;
+        pfd.events = POLLIN;
+        const int pr = ::poll(&pfd, 1, 5000);
+        const bool ready = pr > 0 && (pfd.revents & POLLIN);
+        if (!ready) {
+            std::fprintf(stderr,
+                "lsfg-vk: sync fd not signaled before FRAME id=%llu pr=%d\n",
+                (unsigned long long)job.id, pr);
+            std::fflush(stderr);
+        }
+        if (!this->ipcConn.has_value()) {
+            ::close(job.fd);
+            continue;
+        }
+        try {
+            std::lock_guard<std::mutex> lk(this->ipcMu);
+            const uint64_t capTs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            this->ipcConn->attachFd(job.fd);
+            job.fd = -1;
+            this->ipcConn->send(ls::ipc::Frame{ job.slot, capTs });
+            this->ledger.publish(capTs, job.slot);
+        } catch (const std::exception& e) {
+            if (job.fd >= 0)
+                ::close(job.fd);
+            std::cerr << "lsfg-vk: side-thread FRAME send failed: " << e.what() << "\n";
+        }
+    }
+}
+
 int CaptureContext::drainReleases() {
     if (!this->ipcConn.has_value()) return 0;
+    // The side thread may be sending FRAME. Never wait for it: a missed
+    // drain is retried on the next present.
+    std::unique_lock<std::mutex> ipcLock(this->ipcMu, std::try_to_lock);
+    if (!ipcLock.owns_lock()) return 0;
     // non-blocking drain: poll until no readable data
     int applied = 0;
     while (true) {
@@ -1723,6 +1811,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     }
 
     // send FRAME (owns fd on success, closes on failure path via Connection)
+    bool deferred = false;
     try {
         int sendFd = syncFd;
         if (slot < this->udmaBufs.size() && this->udmaBufs.at(slot)) {
@@ -1815,16 +1904,24 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 }
             }
         }
-        const uint64_t capTs = static_cast<uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-        this->ipcConn->attachFd(sendFd);
-        this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot), capTs });
-        // Session 40 dbl-ledger: publish (capTs, slot) for the click probe
-        // (env-gated, lockless single-writer shm ring).
-        this->ledger.publish(capTs, static_cast<uint64_t>(slot));
-        sendFd = -1;
-        syncFd = -1;
+        const bool deferSync = sendFd >= 0 && sendFd == syncFd;
+        if (deferSync) {
+            this->ensureFrameThread();
+            this->enqueueDeferredFrame(sendFd, static_cast<uint32_t>(slot), this->fidx);
+            sendFd = -1;
+            syncFd = -1;
+            deferred = true;
+        } else {
+            std::lock_guard<std::mutex> ipcLock(this->ipcMu);
+            const uint64_t capTs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
+            this->ipcConn->attachFd(sendFd);
+            this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot), capTs });
+            this->ledger.publish(capTs, static_cast<uint64_t>(slot));
+            sendFd = -1;
+            syncFd = -1;
+        }
     } catch (const std::exception& e) {
         if (syncFd >= 0) ::close(syncFd);
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
@@ -1833,7 +1930,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         throw ls::error(std::string("lsfg-vk: external stream error: send FRAME failed: ") + e.what(), e);
     }
 
-    phaseLog("FRAME sent");
+    phaseLog(deferred ? "FRAME queued" : "FRAME sent");
     static const bool noBusy = std::getenv("LSFGVK_NO_BUSY")
         && std::getenv("LSFGVK_NO_BUSY")[0] == '1';
     if (!noBusy)
