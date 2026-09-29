@@ -60,14 +60,15 @@ bool rawDmaBufOn() {
     return e && e[0] == '1';
 }
 
-// One-shot check: copy the source into a linear host image (the driver picks
-// the pitch) and into the udmabuf (tight rows, bufferRowLength = width).
-// After the capture semaphore signals, row 1 of the linear image is the
-// source. Row 1 of the udmabuf is what the 9060 will read. They must match.
+// One-shot check of the live copy. The pattern image is linear and is copied
+// into the captured swapchain image; copyImageToBuffer then reads that image,
+// not the pattern image. R = x, G = y, B = x>>8 xor y>>8, A = 0xA5.
 struct UdmaByteRef {
     vk::Image* img{nullptr};
     void* ptr{nullptr};
+    std::vector<uint8_t> pattern;
     VkDeviceSize bytes{0};
+    uint32_t rowPitch{0};
     bool armed{false};
     bool done{false};
 };
@@ -76,6 +77,11 @@ UdmaByteRef& udmaByteRef() {
     return r;
 }
 void armUdmaByteRef(const vk::Vulkan& vk, VkExtent2D extent) {
+    // Tool, off by default. LSFGVK_UDMA_PATTERN=1 copies the pattern into the
+    // captured swapchain image and checks the udmabuf after copyImageToBuffer.
+    const char* gate = std::getenv("LSFGVK_UDMA_PATTERN");
+    if (!gate || gate[0] != '1')
+        return;
     auto& r = udmaByteRef();
     if (r.img || r.done)
         return;
@@ -87,28 +93,52 @@ void armUdmaByteRef(const vk::Vulkan& vk, VkExtent2D extent) {
     try {
         // Leaked on purpose: destroying it at exit races the device teardown.
         r.img = new vk::Image(vk, extent, VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT, r.ptr, bytes);
+            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            r.ptr, bytes);
+        VkSubresourceLayout layout{};
+        const VkImageSubresource sub{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
+        vk.df().GetImageSubresourceLayout(vk.dev(), r.img->handle(), &sub, &layout);
+        r.rowPitch = layout.rowPitch;
+        const size_t tight = static_cast<size_t>(extent.width) * 4;
+        r.pattern.assign(tight * extent.height, 0);
+        auto* host = static_cast<uint8_t*>(r.ptr);
+        for (uint32_t y = 0; y < extent.height; ++y) {
+            for (uint32_t x = 0; x < extent.width; ++x) {
+                const uint8_t px[4] = {
+                    static_cast<uint8_t>(x & 0xff),
+                    static_cast<uint8_t>(y & 0xff),
+                    static_cast<uint8_t>(((x >> 8) ^ (y >> 8)) & 0xff),
+                    0xA5
+                };
+                std::memcpy(r.pattern.data() + static_cast<size_t>(y) * tight
+                    + static_cast<size_t>(x) * 4, px, 4);
+                std::memcpy(host + layout.offset
+                    + static_cast<size_t>(y) * layout.rowPitch
+                    + static_cast<size_t>(x) * 4, px, 4);
+            }
+        }
         r.bytes = bytes;
         r.armed = true;
+        std::cerr << "udmabuf-bytes: pattern filled rowPitch=" << layout.rowPitch
+            << " tight=" << tight
+            << " row0=" << std::hex
+            << int(r.pattern[0]) << int(r.pattern[1])
+            << " row1=" << int(r.pattern[tight + 1]) << std::dec << "\n";
     } catch (const std::exception& e) {
-        std::cerr << "udmabuf-bytes: reference image failed: " << e.what() << "\n";
+        std::cerr << "udmabuf-bytes: pattern image failed: " << e.what() << "\n";
         r.done = true;
     }
 }
-void recordUdmaByteRef(const vk::Vulkan& vk, VkCommandBuffer cmd,
-        VkImage src, VkExtent2D extent) {
-    auto& r = udmaByteRef();
-    if (!r.armed || !r.img)
-        return;
-    VkImageMemoryBarrier toDst{
+void barrierPatternSrc(const vk::Vulkan& vk, VkCommandBuffer cmd, VkImage img) {
+    VkImageMemoryBarrier toSrc{
         .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_NONE,
-        .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
+        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
         .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = r.img->handle(),
+        .image = img,
         .subresourceRange = {
             .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
             .levelCount = 1,
@@ -116,25 +146,18 @@ void recordUdmaByteRef(const vk::Vulkan& vk, VkCommandBuffer cmd,
         }
     };
     vk.df().CmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &toDst);
-    const VkImageCopy region{
-        .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-        .extent = { extent.width, extent.height, 1 }
-    };
-    vk.df().CmdCopyImage(cmd, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        r.img->handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toSrc);
 }
 void finishUdmaByteRef(const vk::Vulkan& vk, int syncFd, int mapFd,
         uint32_t width, uint32_t height) {
+    (void)height;
     auto& r = udmaByteRef();
     if (!r.armed || r.done)
         return;
     r.done = true;
     r.armed = false;
-    (void)height;
-    if (syncFd < 0 || mapFd < 0 || !r.ptr) {
+    if (syncFd < 0 || mapFd < 0 || r.pattern.empty()) {
         std::cerr << "udmabuf-bytes: skipped (syncFd=" << syncFd
             << " mapFd=" << mapFd << ")\n";
         return;
@@ -149,42 +172,57 @@ void finishUdmaByteRef(const vk::Vulkan& vk, int syncFd, int mapFd,
         std::cerr << "udmabuf-bytes: sync poll failed pr=" << pr << "\n";
         return;
     }
-    VkSubresourceLayout layout{};
-    const VkImageSubresource sub{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
-    vk.df().GetImageSubresourceLayout(vk.dev(), r.img->handle(), &sub, &layout);
     void* mapped = ::mmap(nullptr, static_cast<size_t>(r.bytes),
         PROT_READ, MAP_SHARED, mapFd, 0);
     if (mapped == MAP_FAILED) {
         std::cerr << "udmabuf-bytes: mmap failed errno=" << errno << "\n";
         return;
     }
-    const auto* src = static_cast<const uint8_t*>(r.ptr) + layout.offset;
+    const auto* expect = r.pattern.data();
     const auto* buf = static_cast<const uint8_t*>(mapped);
     const size_t tight = static_cast<size_t>(width) * 4;
-    const size_t srcRow = static_cast<size_t>(layout.rowPitch);
     auto hex8 = [](const uint8_t* p) {
         char s[32];
         std::snprintf(s, sizeof(s), "%02x%02x%02x%02x %02x%02x%02x%02x",
             p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
         return std::string(s);
     };
-    const bool have512 = 512 + 8 <= static_cast<size_t>(r.bytes);
-    const bool haveRow = srcRow + 8 <= static_cast<size_t>(r.bytes)
-        && tight + 8 <= static_cast<size_t>(r.bytes);
-    const bool m0 = std::memcmp(src, buf, 8) == 0;
-    const bool m512 = have512 && std::memcmp(src + 512, buf + 512, 8) == 0;
-    const bool mrow = haveRow && std::memcmp(src + srcRow, buf + tight, 8) == 0;
-    std::cerr << "udmabuf-bytes: rowPitch=" << layout.rowPitch
+    const bool have512 = 512 + 8 <= r.pattern.size();
+    const bool haveRow = tight + 8 <= r.pattern.size();
+    const bool m0 = std::memcmp(expect, buf, 8) == 0;
+    const bool m512 = have512 && std::memcmp(expect + 512, buf + 512, 8) == 0;
+    const bool mrow = haveRow && std::memcmp(expect + tight, buf + tight, 8) == 0;
+    const bool rowsDiffer = haveRow && std::memcmp(expect, expect + tight, 8) != 0;
+    std::cerr << "udmabuf-bytes: pattern rowPitch=" << r.rowPitch
         << " tight=" << tight
+        << " rowsDiffer=" << rowsDiffer
         << " off0 match=" << m0
-        << " src=" << hex8(src) << " buf=" << hex8(buf);
+        << " expect=" << hex8(expect) << " buf=" << hex8(buf);
     if (have512)
         std::cerr << " off512 match=" << m512
-            << " src=" << hex8(src + 512) << " buf=" << hex8(buf + 512);
+            << " expect=" << hex8(expect + 512) << " buf=" << hex8(buf + 512);
     if (haveRow)
         std::cerr << " row1 match=" << mrow
-            << " src=" << hex8(src + srcRow) << " buf=" << hex8(buf + tight);
+            << " expect=" << hex8(expect + tight) << " buf=" << hex8(buf + tight);
     std::cerr << "\n";
+    std::cerr << "udmabuf-bytes: read mmap(mapFd, offset 0) of the dup taken before import;"
+        << " copy bufferOffset=0 bufferRowLength=" << width << "\n";
+    const size_t dumpN = std::min(r.bytes, static_cast<VkDeviceSize>(8192));
+    if (FILE* df = std::fopen("/tmp/udmabuf-xy.txt", "w")) {
+        std::fprintf(df, "# off decoded_x decoded_y R G B A\n");
+        for (size_t off = 0; off + 4 <= dumpN; off += 4) {
+            const uint8_t R = buf[off], G = buf[off + 1], B = buf[off + 2], A = buf[off + 3];
+            if (A == 0xA5)
+                std::fprintf(df, "%zu %u %u %u %u %u %u\n",
+                    off, static_cast<unsigned>(R | (B << 8)), static_cast<unsigned>(G),
+                    R, G, B, A);
+            else
+                std::fprintf(df, "%zu -1 -1 %u %u %u %u\n", off, R, G, B, A);
+        }
+        std::fclose(df);
+        std::cerr << "udmabuf-bytes: wrote " << (dumpN / 4)
+            << " pixels to /tmp/udmabuf-xy.txt\n";
+    }
     ::munmap(mapped, static_cast<size_t>(r.bytes));
 }
 int createRawDmaBuf(size_t bytes, void** mapOut) {
@@ -1422,7 +1460,35 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             0, 0, nullptr, 0, nullptr, 1, &toSrc);
         armUdmaByteRef(vk, this->info.extent);
-        recordUdmaByteRef(vk, cmdbuf.raw(), srcImage, this->info.extent);
+        auto& pref = udmaByteRef();
+        const bool usePattern = pref.armed && pref.img != nullptr;
+        if (usePattern) {
+            barrierPatternSrc(vk, cmdbuf.raw(), pref.img->handle());
+            VkImageMemoryBarrier toDst = barrierHelper(srcImage,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            vk.df().CmdPipelineBarrier(cmdbuf.raw(),
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &toDst);
+            const VkImageCopy fill{
+                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+                .extent = { w, h, 1 }
+            };
+            vk.df().CmdCopyImage(cmdbuf.raw(),
+                pref.img->handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                srcImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fill);
+            VkImageMemoryBarrier filled = barrierHelper(srcImage,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            vk.df().CmdPipelineBarrier(cmdbuf.raw(),
+                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 0, nullptr, 1, &filled);
+            std::cerr << "lsfg-vk: pattern copied into swapchain image;"
+                << " copyImageToBuffer reads srcImage slot=" << slot << "\n";
+        }
         const VkBufferImageCopy region{
             .bufferOffset = 0,
             .bufferRowLength = w,
