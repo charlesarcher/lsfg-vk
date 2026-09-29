@@ -2260,7 +2260,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     LSFG_FRAME_DBG("input: snapshot skip (cb busy) (fidx %llu)",
                         (unsigned long long)fidx);
                 } else {
-                snapCbFence.reset(vk);
+                // The bounce path never submits this fence. Resetting it here
+                // leaves it unsignaled, and every later frame skips. Reset only
+                // in the branches that pass it to QueueSubmit.
                 if (dmaHop && pendingDmaRelease >= 0) {
                     const uint32_t done = static_cast<uint32_t>(pendingDmaRelease);
                     conn.send(ls::ipc::Release{ done });
@@ -2708,6 +2710,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
                         });
                     computeCb.end(vk);
+                    snapCbFence.reset(vk);
                     {
                         std::lock_guard<std::mutex> lk(submitMtx);
                         cb.submit(vk,
@@ -2744,6 +2747,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     }
                 );
                 cb.end(vk);
+                snapCbFence.reset(vk);
                 {
                     std::lock_guard<std::mutex> lk(submitMtx);
                     cb.submit(vk,
