@@ -1739,7 +1739,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         // given real frame into it (used for REAL presents and HOLD-LAST).
         auto presentReal = [&](int stagingIdx, int snapFd, uint64_t capTsNs = 0,
                 uint64_t srcFidx = UINT64_MAX) -> bool {
-            const bool dumpE = ls::colorDumpOn() && srcFidx == ls::colorDumpFidx();
+            const bool dumpE = ls::colorDumpOn() && ls::colorDumpWant(srcFidx);
             void* colorPx = nullptr;
             std::unique_ptr<vk::Image> colorImg;
             if (dumpE) {
@@ -2219,7 +2219,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             { signalSem.at(presentIdx % signalPool).handle() }, VK_NULL_HANDLE, 0,
                             cbFences.at(cbIdx).handle());
                     }
-                    if (ls::colorDumpOn() && cur.srcFidx == ls::colorDumpFidx() && i == 0) {
+                    if (ls::colorDumpOn() && ls::colorDumpWant(cur.srcFidx) && i == 0) {
                         if (!cbFences.at(cbIdx).wait(vk, UINT64_MAX))
                             std::cerr << "color-dump stage=d fence timeout\n";
                         else
@@ -3199,7 +3199,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 vk.dmaQueueHandle());
                         }
                         snapCbFence.wait(vk, UINT64_MAX);
-                        if (ls::colorDumpOn() && fidx == ls::colorDumpFidx()
+                        if (ls::colorDumpOn() && ls::colorDumpWant(fidx)
                                 && state.genSources.at(sidx).has_value()) {
                             ls::colorDumpReadback(vk, vk.dmaQueueHandle(),
                                 state.genSources.at(sidx).mut().handle(),

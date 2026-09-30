@@ -1537,7 +1537,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
 
     // Color measurement only. One frame, before the capture copy. Restores
     // PRESENT_SRC so the capture barrier below still matches.
-    if (ls::colorDumpOn() && this->fidx == ls::colorDumpFidx() && !dummySrc) {
+    if (ls::colorDumpOn() && ls::colorDumpWant(this->fidx) && !dummySrc) {
         const VkQueue q = this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue;
         ls::colorDumpReadback(vk, q, srcImage, this->info.format, this->info.extent,
             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
@@ -1657,6 +1657,8 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // same queue that the subsequent QueuePresent will wait on; using
     // vk.queue() (first-graphics) can be a different queue handle and cause
     // the present wait to block forever on some drivers.
+    std::optional<vk::Fence> hostWriteFence;
+    VkFence sigFence = VK_NULL_HANDLE;
     try {
         /* S40: in the ISOLATED (fake) path no real QueuePresent ever consumes
          * the game's present-wait semaphores — waiting them HERE makes their
@@ -1691,11 +1693,14 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             .signalSemaphoreCount = static_cast<uint32_t>(signalSems.size()),
             .pSignalSemaphores = signalSems.data()
         };
-        VkFence sigFence = VK_NULL_HANDLE;
         if (isIsolated(swapchain)) {
             auto& iso = isolatedAt(swapchain);
             if (imageIdx < iso.recycleFences.size())
                 sigFence = iso.recycleFences.at(imageIdx).handle();
+        }
+        if (sigFence == VK_NULL_HANDLE && !this->hostImages.empty()) {
+            hostWriteFence.emplace(vk, false);
+            sigFence = hostWriteFence->handle();
         }
         auto res = vk.df().QueueSubmit(
             this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue,
@@ -1708,6 +1713,13 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         throw ls::error(std::string("lsfg-vk: external stream error: capture submit failed: ") + e.what(), e);
     }
     phaseLog("blit submitted");
+    if (!this->hostImages.empty() && sigFence != VK_NULL_HANDLE) {
+        const VkResult wr = vk.df().WaitForFences(
+            vk.dev(), 1, &sigFence, VK_TRUE, UINT64_MAX);
+        if (wr != VK_SUCCESS)
+            std::cerr << "lsfg-vk: capture fence wait before 9060 copy "
+                << wr << "\n";
+    }
     static int nIsoResv = 0;
     if (nIsoResv < 16 && isIsolated(swapchain)) {
         auto& iso = isolatedAt(swapchain);
@@ -1769,7 +1781,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 this->bFences.at(slot).handle());
             if (bres != VK_SUCCESS)
                 std::cerr << "lsfg-vk: dual-host 9060 QueueSubmit " << bres << "\n";
-            if (ls::colorDumpOn() && this->fidx == ls::colorDumpFidx()
+            if (ls::colorDumpOn() && ls::colorDumpWant(this->fidx)
                     && bres == VK_SUCCESS) {
                 if (!this->bFences.at(slot).wait(bvk, UINT64_MAX)) {
                     std::cerr << "color-dump stage=b fence timeout\n";
@@ -1784,7 +1796,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                         "0 LINEAR declared ImageMode::Linear, not queried from the dma-buf");
                 }
             }
-        } else if (ls::colorDumpOn() && this->fidx == ls::colorDumpFidx()) {
+        } else if (ls::colorDumpOn() && ls::colorDumpWant(this->fidx)) {
             std::cerr << "color-dump stage=b skipped: 9060 copy not submitted this frame\n";
         }
     }

@@ -41,6 +41,33 @@ inline uint64_t colorDumpFidx() {
     return id;
 }
 
+inline bool colorDumpWant(uint64_t fidx) {
+    static const std::vector<uint64_t> ids = [] {
+        std::vector<uint64_t> out;
+        const char* list = std::getenv("LSFGVK_COLOR_DUMP_FIDXS");
+        if (list && list[0]) {
+            const char* p = list;
+            while (*p) {
+                char* end = nullptr;
+                const unsigned long long v = std::strtoull(p, &end, 10);
+                if (end == p)
+                    break;
+                out.push_back(static_cast<uint64_t>(v));
+                p = end;
+                if (*p == ',')
+                    ++p;
+            }
+        }
+        if (out.empty())
+            out.push_back(colorDumpFidx());
+        return out;
+    }();
+    for (const uint64_t id : ids)
+        if (id == fidx)
+            return true;
+    return false;
+}
+
 inline const char* vkFormatName(int fmt) {
     switch (fmt) {
     case 37: return "R8G8B8A8_UNORM";
@@ -76,9 +103,12 @@ inline void writeColorStage(const char* stage, uint32_t w, uint32_t h,
     ::mkdir("/tmp/lsfg-color", 0755);
     const PpmMap map = ppmMap(fmt);
     char ppmPath[160], rawPath[160], metaPath[160];
-    std::snprintf(ppmPath, sizeof(ppmPath), "/tmp/lsfg-color/%s.ppm", stage);
-    std::snprintf(rawPath, sizeof(rawPath), "/tmp/lsfg-color/%s.rgba", stage);
-    std::snprintf(metaPath, sizeof(metaPath), "/tmp/lsfg-color/%s.txt", stage);
+    std::snprintf(ppmPath, sizeof(ppmPath), "/tmp/lsfg-color/%s-f%llu.ppm",
+        stage, static_cast<unsigned long long>(fidx));
+    std::snprintf(rawPath, sizeof(rawPath), "/tmp/lsfg-color/%s-f%llu.rgba",
+        stage, static_cast<unsigned long long>(fidx));
+    std::snprintf(metaPath, sizeof(metaPath), "/tmp/lsfg-color/%s-f%llu.txt",
+        stage, static_cast<unsigned long long>(fidx));
     const size_t npx = static_cast<size_t>(w) * h;
     uint64_t rs = 0, gs = 0, bs = 0;
     FILE* out = std::fopen(ppmPath, "wb");
