@@ -1721,6 +1721,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             // after scanning that buffer out (latch = photon side).
             g_overlay.wsi->armPresentFeedback(fbHandle);
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+            {
+                static const bool countPresents = [] {
+                    const char* e = std::getenv("LSFGVK_PRESENT_COUNT");
+                    return e && e[0] == '1' && !e[1];
+                }();
+                if (countPresents) {
+                    std::fprintf(stderr, "present-count kind=real rc=%d\n",
+                        static_cast<int>(pres));
+                    std::fflush(stderr);
+                }
+            }
             if (pres != VK_SUCCESS && pres != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(pres, "QueuePresentKHR failed (real)");
             if (stageTimes().on)
@@ -2053,6 +2064,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (stageTimes().on)
                         tPres0 = Clock::now();
                     const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+                    {
+                        static const bool countPresents = [] {
+                            const char* e = std::getenv("LSFGVK_PRESENT_COUNT");
+                            return e && e[0] == '1' && !e[1];
+                        }();
+                        if (countPresents) {
+                            std::fprintf(stderr, "present-count kind=gen rc=%d\n",
+                                static_cast<int>(pres));
+                            std::fflush(stderr);
+                        }
+                    }
                     if (stageTimes().on) {
                         stageTimes().add(stageTimes().genPresent,
                             elapsedUs(tPres0, Clock::now()));
