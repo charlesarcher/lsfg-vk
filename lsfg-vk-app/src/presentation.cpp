@@ -2336,7 +2336,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     && std::getenv("LSFGVK_DUAL_HOST")[0] == '0');
                 // udmabuf: the 9060 has not copied out yet. Releasing now lets
                 // the 9070 overwrite the slot mid-copy.
-                if (!dmaHop && !udmaSlot) {
+                if (!dmaHop && !udmaSlot
+                        && conf.transport != ls::Transport::DecoupledDma) {
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
                     LSFG_FRAME_DBG("input: Release first (slot %u) (fidx %llu)",
                         frame->stagingIdx, (unsigned long long)fidx);
@@ -2379,6 +2380,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         ::close(captureFd);
                         captureFd = -1;
                     }
+                }
+                // Later FRAMEs on this path also carry the 9060 dma-buf, not a
+                // sync fd. The first fd is already kept. Close the dup.
+                if (conf.transport == ls::Transport::DecoupledDma
+                        && captureFd >= 0
+                        && sidxEarly < state.dmaFds.size()
+                        && state.dmaFds.at(sidxEarly) >= 0) {
+                    ::close(captureFd);
+                    captureFd = -1;
                 }
                 if (dmaHop && captureFd < 0) {
                     conn.send(ls::ipc::Release{ frame->stagingIdx });
@@ -2757,7 +2767,104 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // bounce destination and the present source. There is no
                 // separate host image to blit from, and re-blitting would
                 // overwrite the frame we just DMA'd.
-                const bool bounceSrc = state.udmaBufs.at(sidx).has_value();
+                // DecoupledDma: the FRAME fd is the layer's 9060 VRAM image.
+                // Import it once, then before every copy export that dma-buf's
+                // sync file and poll it. EXPLICIT_SYNC means the import itself
+                // does not wait. Copy into genSources, then release the slot.
+                bool decoupledFilled = false;
+                if (conf.transport == ls::Transport::DecoupledDma
+                        && sidx < state.dmaFds.size()
+                        && state.dmaFds.at(sidx) >= 0) {
+                    if (!state.aImports.at(sidx).has_value()) {
+                        try {
+                            const vk::ImageLayout aLayout{
+                                .mode = vk::ImageMode::Linear,
+                                .rowPitch = state.width * 4u,
+                            };
+                            int tryFd = ::dup(state.dmaFds.at(sidx));
+                            if (tryFd < 0)
+                                throw ls::error("dup() failed before 9060 dma-buf import");
+                            state.aImports.at(sidx).emplace(vk,
+                                VkExtent2D{ state.width, state.height },
+                                VK_FORMAT_R8G8B8A8_UNORM,
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                tryFd, std::nullopt, aLayout);
+                            std::cerr << "decoupled: imported 9060 dma-buf slot="
+                                << sidx << " fd=" << state.dmaFds.at(sidx) << "\n";
+                        } catch (const std::exception& e) {
+                            std::cerr << "decoupled: import failed slot=" << sidx
+                                << " " << e.what() << "\n";
+                        }
+                    }
+                    if (state.aImports.at(sidx).has_value()
+                            && state.genSources.at(sidx).has_value()) {
+                        const auto pollT0 = std::chrono::steady_clock::now();
+                        int syncFd = -1;
+                        int pr = -1;
+                        dma_buf_export_sync_file exp{};
+                        exp.flags = DMA_BUF_SYNC_READ;
+                        exp.fd = -1;
+                        if (::ioctl(state.dmaFds.at(sidx),
+                                DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) == 0)
+                            syncFd = exp.fd;
+                        if (syncFd >= 0) {
+                            pollfd pfd{};
+                            pfd.fd = syncFd;
+                            pfd.events = POLLIN;
+                            pr = ::poll(&pfd, 1, 2000);
+                            ::close(syncFd);
+                        } else {
+                            std::cerr << "decoupled: EXPORT_SYNC_FILE failed slot="
+                                << sidx << " errno=" << errno << "\n";
+                        }
+                        const double pollMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - pollT0).count();
+                        const auto copyT0 = std::chrono::steady_clock::now();
+                        if (!snapCbFence.wait(vk, 0))
+                            snapCbFence.wait(vk, UINT64_MAX);
+                        snapCbFence.reset(vk);
+                        cb.begin(vk);
+                        cb.copyImage(vk,
+                            {
+                                makeBlitBarrier(state.aImports.at(sidx).mut().handle(),
+                                    VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_ACCESS_TRANSFER_READ_BIT,
+                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                                makeBlitBarrier(state.genSources.at(sidx).mut().handle(),
+                                    VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                            },
+                            { state.aImports.at(sidx).mut().handle(),
+                              state.genSources.at(sidx).mut().handle() },
+                            imgExtent,
+                            {
+                                makeBlitBarrier(state.genSources.at(sidx).mut().handle(),
+                                    VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                            });
+                        cb.end(vk);
+                        {
+                            std::lock_guard<std::mutex> lk(submitMtx);
+                            cb.submit(vk, {}, VK_NULL_HANDLE, 0,
+                                {}, VK_NULL_HANDLE, 0,
+                                snapCbFence.handle(),
+                                vk.dmaQueueHandle());
+                        }
+                        snapCbFence.wait(vk, UINT64_MAX);
+                        const double copyMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - copyT0).count();
+                        std::cerr << "decoupled-copy slot=" << sidx
+                            << " pollMs=" << pollMs
+                            << " pr=" << pr
+                            << " submitToFenceMs=" << copyMs << "\n";
+                        conn.send(ls::ipc::Release{ sidx });
+                        decoupledFilled = true;
+                    }
+                }
+                const bool bounceSrc = state.udmaBufs.at(sidx).has_value()
+                    || decoupledFilled;
                 auto& srcLazy = bounceSrc
                     ? state.genSources.at(sidx)
                     : (state.aImports.at(sidx).has_value()
