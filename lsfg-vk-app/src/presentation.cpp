@@ -2450,6 +2450,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::optional<vk::Sampler> swizzleSampler;
         std::optional<vk::DescriptorPool> swizzlePool;
         std::array<std::optional<vk::DescriptorSet>, ls::ipc::STAGING_RING_DEPTH> swizzleSets;
+        std::array<std::optional<vk::DescriptorSet>, ls::ipc::STAGING_RING_DEPTH> importSwizzleSets;
         std::array<std::optional<vk::Image>, ls::ipc::STAGING_RING_DEPTH> swizzleMid;
         int pendingDmaRelease = -1;
         vk::CommandBuffer emptyGenCb{ vk };
@@ -2509,8 +2510,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (!frame)
                     continue;
 
-                std::fprintf(stderr, "FRAME recv f=%llu slot=%u\n",
-                    (unsigned long long)fidx, frame->stagingIdx);
+                std::fprintf(stderr, "FRAME recv f=%llu slot=%u fmt=%u\n",
+                    (unsigned long long)fidx, frame->stagingIdx, frame->vkFormat);
+                if (frame->vkFormat != 0)
+                    state.captureFormat = static_cast<VkFormat>(frame->vkFormat);
 
                 int captureFd = conn.takeReceivedFd();
                 static bool loggedCap = false;
@@ -2990,13 +2993,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             int tryFd = ::dup(state.dmaFds.at(sidx));
                             if (tryFd < 0)
                                 throw ls::error("dup() failed before 9060 dma-buf import");
+                            const VkFormat importFmt = state.captureFormat != VK_FORMAT_UNDEFINED
+                                ? state.captureFormat : VK_FORMAT_R8G8B8A8_UNORM;
                             state.aImports.at(sidx).emplace(vk,
                                 VkExtent2D{ state.width, state.height },
-                                VK_FORMAT_R8G8B8A8_UNORM,
-                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                                importFmt,
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                 tryFd, std::nullopt, aLayout);
                             std::cerr << "decoupled: imported 9060 dma-buf slot="
-                                << sidx << " fd=" << state.dmaFds.at(sidx) << "\n";
+                                << sidx << " fd=" << state.dmaFds.at(sidx)
+                                << " fmt=" << static_cast<unsigned>(importFmt) << "\n";
                         } catch (const std::exception& e) {
                             std::cerr << "decoupled: import failed slot=" << sidx
                                 << " " << e.what() << "\n";
@@ -3095,6 +3101,60 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             vk.df().CmdWriteTimestamp(cb.handle(),
                                 VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool, 0);
                         }
+                        const bool convert = state.captureFormat != VK_FORMAT_R8G8B8A8_UNORM
+                            && state.captureFormat != VK_FORMAT_UNDEFINED;
+                        if (convert) {
+                            if (!swizzleShader) {
+                                swizzleShader.emplace(vk, ls::swizzleSpv(), 1, 1, 0, 1);
+                                swizzleSampler.emplace(vk,
+                                    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                                    VK_COMPARE_OP_NEVER, false);
+                                swizzlePool.emplace(vk, vk::Limits{
+                                    .sets = 8,
+                                    .uniform_buffers = 1,
+                                    .samplers = 8,
+                                    .sampled_images = 8,
+                                    .storage_images = 8,
+                                });
+                                std::cerr << "decoupled: sample import fmt="
+                                    << static_cast<unsigned>(state.captureFormat)
+                                    << " into RGBA genSources\n";
+                            }
+                            if (!importSwizzleSets.at(sidx)) {
+                                importSwizzleSets.at(sidx).emplace(vk, *swizzlePool, *swizzleShader,
+                                    std::vector<ls::R<const vk::Image>>{
+                                        std::cref(state.aImports.at(sidx).mut()) },
+                                    std::vector<ls::R<const vk::Image>>{
+                                        std::cref(state.genSources.at(sidx).mut()) },
+                                    std::vector<ls::R<const vk::Sampler>>{
+                                        std::cref(*swizzleSampler) },
+                                    std::vector<ls::R<const vk::Buffer>>{});
+                            }
+                            cb.pipelineBarrier(vk,
+                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                {
+                                    makeBlitBarrier(state.aImports.at(sidx).mut().handle(),
+                                        VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_ACCESS_SHADER_READ_BIT,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL),
+                                    makeBlitBarrier(state.genSources.at(sidx).mut().handle(),
+                                        VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                                });
+                            const uint32_t gx = (state.width + 15u) / 16u;
+                            const uint32_t gy = (state.height + 15u) / 16u;
+                            cb.dispatch(vk, *swizzleShader, *importSwizzleSets.at(sidx),
+                                {}, gx, gy, 1);
+                            cb.pipelineBarrier(vk,
+                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                {
+                                    makeBlitBarrier(state.genSources.at(sidx).mut().handle(),
+                                        VK_ACCESS_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL,
+                                        VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
+                                });
+                        } else {
                         cb.copyImage(vk,
                             {
                                 makeBlitBarrier(state.aImports.at(sidx).mut().handle(),
@@ -3115,6 +3175,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
                             });
+                        }
                         if (copyTs && tsPool != VK_NULL_HANDLE)
                             vk.df().CmdWriteTimestamp(cb.handle(),
                                 VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, 1);

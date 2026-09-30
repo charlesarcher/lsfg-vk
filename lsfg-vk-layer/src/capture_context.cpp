@@ -951,11 +951,11 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                     std::memset(p, 0, static_cast<size_t>(hostSize));
                     this->hostPtrsA.at(i) = p;
                     this->hostImages.emplace_back(vk, this->info.extent,
-                        VK_FORMAT_R8G8B8A8_UNORM, hostUsage, p, hostSize);
+                        this->info.format, hostUsage, p, hostSize);
                     this->bHostImages.emplace_back(*this->bVk, this->info.extent,
-                        VK_FORMAT_R8G8B8A8_UNORM, hostUsage, p, hostSize);
+                        this->info.format, hostUsage, p, hostSize);
                     this->bVramImages.emplace_back(*this->bVk, this->info.extent,
-                        VK_FORMAT_R8G8B8A8_UNORM, vramUsage,
+                        this->info.format, vramUsage,
                         std::nullopt, std::nullopt, bLayout);
                     auto exp = this->bVramImages.back().exportDmaBuf(*this->bVk);
                     this->bExportFds.at(i) = exp.fd;
@@ -1268,7 +1268,8 @@ void CaptureContext::frameThreadMain() {
                     std::chrono::steady_clock::now().time_since_epoch()).count());
             this->ipcConn->attachFd(job.fd);
             job.fd = -1;
-            this->ipcConn->send(ls::ipc::Frame{ job.slot, capTs });
+            this->ipcConn->send(ls::ipc::Frame{
+                job.slot, capTs, static_cast<uint32_t>(this->info.format) });
             this->ledger.publish(capTs, job.slot);
         } catch (const std::exception& e) {
             if (job.fd >= 0)
@@ -1775,7 +1776,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 } else {
                     ls::colorDumpReadback(bvk, bvk.queue(),
                         this->bVramImages.at(slot).handle(),
-                        VK_FORMAT_R8G8B8A8_UNORM,
+                        this->info.format,
                         this->bVramImages.at(slot).getExtent(),
                         VK_IMAGE_LAYOUT_GENERAL,
                         "b-export", this->fidx,
@@ -1947,7 +1948,9 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
             this->ipcConn->attachFd(sendFd);
-            this->ipcConn->send(ls::ipc::Frame{ static_cast<uint32_t>(slot), capTs });
+            this->ipcConn->send(ls::ipc::Frame{
+                static_cast<uint32_t>(slot), capTs,
+                static_cast<uint32_t>(this->info.format) });
             this->ledger.publish(capTs, static_cast<uint64_t>(slot));
             sendFd = -1;
             syncFd = -1;

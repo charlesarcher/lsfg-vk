@@ -125,6 +125,9 @@ namespace ls::ipc {
         uint32_t stagingIdx;
         /// monotonic timestamp (nanoseconds) when frame was captured on the game GPU
         uint64_t captureTsNs{0};
+        /// VkFormat of the captured swapchain image. 0 means the receiver
+        /// should use the format from HELLO.
+        uint32_t vkFormat{0};
     };
 
     /// A→C backpressure ack; the app will not read this slot again until

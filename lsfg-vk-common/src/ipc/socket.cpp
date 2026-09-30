@@ -312,11 +312,12 @@ namespace ls::ipc {
         out.reserve(12);
         putU32(out, frame.stagingIdx);
         putU64(out, frame.captureTsNs);
+        putU32(out, frame.vkFormat);
         return out;
     }
 
     Frame decodeFrame(const std::span<const std::byte> payload) {
-        if (payload.size() != 4 && payload.size() != 12)
+        if (payload.size() != 4 && payload.size() != 12 && payload.size() != 16)
             throw ls::error("malformed FRAME payload: wrong size ("
                 + std::to_string(payload.size()) + " bytes)");
         std::span<const std::byte> cur = payload;
@@ -324,6 +325,8 @@ namespace ls::ipc {
         frame.stagingIdx = getU32(cur);
         if (payload.size() >= 12)
             frame.captureTsNs = getU64(cur);
+        if (payload.size() >= 16)
+            frame.vkFormat = getU32(cur);
         return frame;
     }
 
