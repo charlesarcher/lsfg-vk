@@ -117,6 +117,107 @@ std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
 
 namespace ls::presentation {
 namespace {
+    // LSFGVK_PRESENT_PACE=1 only. Timestamp is taken at the QueuePresentKHR
+    // return and stored in a shared mapping. No per-present fprintf: that
+    // write would be inside the interval being measured.
+    struct PaceSample {
+        uint64_t ns;
+        int32_t rc;
+        char kind;
+        char pad[3];
+    };
+    struct PaceHeader {
+        uint32_t magic;
+        uint32_t cap;
+        std::atomic<uint32_t> count;
+        uint32_t reserved;
+    };
+    constexpr uint32_t kPaceMagic = 0x45434150u; // 'PACE'
+    constexpr uint32_t kPaceCap = 131072u;
+    PaceHeader* g_paceHdr = nullptr;
+    PaceSample* g_paceSamples = nullptr;
+    size_t g_paceMapBytes = 0;
+    int g_paceTextFd = -1;
+    std::atomic<bool> g_paceStop{false};
+
+    void paceFlushThread() {
+        uint32_t written = 0;
+        while (!g_paceStop.load(std::memory_order_acquire)) {
+            if (g_paceHdr && g_paceTextFd >= 0) {
+                const uint32_t n = g_paceHdr->count.load(std::memory_order_acquire);
+                while (written < n && written < kPaceCap) {
+                    const PaceSample& s = g_paceSamples[written];
+                    char line[96];
+                    const int len = std::snprintf(line, sizeof(line),
+                        "present-pace kind=%c rc=%d ns=%llu\n",
+                        s.kind, s.rc,
+                        static_cast<unsigned long long>(s.ns));
+                    if (len > 0)
+                        (void)::write(g_paceTextFd, line, static_cast<size_t>(len));
+                    ++written;
+                }
+            }
+            ::usleep(20000);
+            if (g_paceHdr && g_paceMapBytes)
+                (void)::msync(g_paceHdr, g_paceMapBytes, MS_ASYNC);
+        }
+    }
+
+    void initPresentPace() {
+        static const bool on = [] {
+            const char* e = std::getenv("LSFGVK_PRESENT_PACE");
+            return e && e[0] == '1' && !e[1];
+        }();
+        if (!on || g_paceHdr)
+            return;
+        const char* binPath = "/tmp/lsfg-present-pace.bin";
+        const int fd = ::open(binPath, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) {
+            std::fprintf(stderr, "present-pace init open failed errno=%d\n", errno);
+            return;
+        }
+        g_paceMapBytes = sizeof(PaceHeader) + sizeof(PaceSample) * kPaceCap;
+        if (::ftruncate(fd, static_cast<off_t>(g_paceMapBytes)) != 0) {
+            std::fprintf(stderr, "present-pace init truncate failed errno=%d\n", errno);
+            ::close(fd);
+            return;
+        }
+        void* p = ::mmap(nullptr, g_paceMapBytes, PROT_READ | PROT_WRITE,
+            MAP_SHARED, fd, 0);
+        ::close(fd);
+        if (p == MAP_FAILED) {
+            std::fprintf(stderr, "present-pace init mmap failed errno=%d\n", errno);
+            g_paceMapBytes = 0;
+            return;
+        }
+        auto* hdr = static_cast<PaceHeader*>(p);
+        hdr->magic = kPaceMagic;
+        hdr->cap = kPaceCap;
+        hdr->count.store(0, std::memory_order_relaxed);
+        hdr->reserved = 0;
+        g_paceHdr = hdr;
+        g_paceSamples = reinterpret_cast<PaceSample*>(hdr + 1);
+        g_paceTextFd = ::open("/tmp/lsfg-present-pace.txt",
+            O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        std::thread(paceFlushThread).detach();
+        std::fprintf(stderr, "present-pace init cap=%u file=%s\n",
+            kPaceCap, binPath);
+    }
+
+    void notePresentPace(char kind, int rc) {
+        if (!g_paceHdr)
+            return;
+        timespec ts{};
+        ::clock_gettime(CLOCK_MONOTONIC, &ts);
+        const uint64_t ns = static_cast<uint64_t>(ts.tv_sec) * 1000000000ull
+            + static_cast<uint64_t>(ts.tv_nsec);
+        const uint32_t i = g_paceHdr->count.load(std::memory_order_relaxed);
+        if (i >= kPaceCap)
+            return;
+        g_paceSamples[i] = PaceSample{ns, rc, kind, {0, 0, 0}};
+        g_paceHdr->count.store(i + 1, std::memory_order_release);
+    }
+
     /// Per-present stage times. Off unless LSFGVK_DBG is set to something
     /// other than "0". The off path is one flag check: no clock, no poll,
     /// no allocation. When on, the generation sync fd is polled on the CPU
@@ -862,6 +963,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const ls::GameConf& conf, std::string_view session,
         const std::atomic<bool>& stop) {
     lsfdgInstallSegvHandler();   // DIAGNOSTIC: report si_addr on SIGSEGV
+    initPresentPace();
 
     const uint32_t w = state.width, h = state.height;
     bool dropOverlay = false;
@@ -1722,6 +1824,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             // after scanning that buffer out (latch = photon side).
             g_overlay.wsi->armPresentFeedback(fbHandle);
             const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+            notePresentPace('r', static_cast<int>(pres));
             {
                 static const bool countPresents = [] {
                     const char* e = std::getenv("LSFGVK_PRESENT_COUNT");
@@ -2065,6 +2168,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (stageTimes().on)
                         tPres0 = Clock::now();
                     const auto pres = vk.df().QueuePresentKHR(vk.queue(), &presentInfo);
+                    notePresentPace('g', static_cast<int>(pres));
                     {
                         static const bool countPresents = [] {
                             const char* e = std::getenv("LSFGVK_PRESENT_COUNT");
