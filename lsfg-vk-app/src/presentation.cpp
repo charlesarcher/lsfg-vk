@@ -21,6 +21,7 @@
 // but harmless. We only need poll/errno/close/getenv which are exposed.
 #include "lsfg-vk-app/presentation.hpp"
 #include "lsfg-vk-common/frame_dbg.hpp"
+#include "lsfg-vk-common/helpers/env_flag.hpp"
 #include "lsfg-vk-common/color_dump.hpp"
 
 #include <memory>
@@ -965,7 +966,9 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const vk::Vulkan& vk, lsfgvk::backend::Instance& backend,
         const ls::GameConf& conf, std::string_view session,
         const std::atomic<bool>& stop) {
-    lsfdgInstallSegvHandler();   // DIAGNOSTIC: report si_addr on SIGSEGV
+    static const bool dbgOn = ::envFlagOn("LSFGVK_DBG");
+    if (dbgOn)
+        lsfdgInstallSegvHandler();
     initPresentPace();
 
     const uint32_t w = state.width, h = state.height;
@@ -2333,13 +2336,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         i, destCount, cur.stagingIdx);
                 } else if (cur.active) {
                     // --- REAL present: this frame's private snapshot -----------
-                    std::fprintf(stderr, "[M3] f=%llu tid=%ld REAL present ATTEMPTED "
-                        "slot=%u\n", (unsigned long long)cur.stagingIdx, ::gettid(),
-                        cur.stagingIdx);
+                    if (dbgOn) {
+                        std::fprintf(stderr, "[M3] f=%llu tid=%ld REAL present ATTEMPTED "
+                            "slot=%u\n", (unsigned long long)cur.stagingIdx, ::gettid(),
+                            cur.stagingIdx);
+                    }
                     const bool presOk = presentReal(cur.stagingIdx,
                         cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs, cur.srcFidx);
-                    std::fprintf(stderr, "[M4] f=%llu tid=%ld REAL present RESULT ok=%d\n",
-                        (unsigned long long)cur.stagingIdx, ::gettid(), presOk ? 1 : 0);
+                    if (dbgOn) {
+                        std::fprintf(stderr, "[M4] f=%llu tid=%ld REAL present RESULT ok=%d\n",
+                            (unsigned long long)cur.stagingIdx, ::gettid(), presOk ? 1 : 0);
+                    }
                     if (!presOk)
                         break;
                     lastShownStagingIdx = static_cast<int>(cur.stagingIdx);
@@ -2510,8 +2517,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (!frame)
                     continue;
 
-                std::fprintf(stderr, "FRAME recv f=%llu slot=%u fmt=%u\n",
-                    (unsigned long long)fidx, frame->stagingIdx, frame->vkFormat);
+                if (dbgOn) {
+                    std::fprintf(stderr, "FRAME recv f=%llu slot=%u fmt=%u\n",
+                        (unsigned long long)fidx, frame->stagingIdx, frame->vkFormat);
+                }
                 if (frame->vkFormat != 0)
                     state.captureFormat = static_cast<VkFormat>(frame->vkFormat);
 
@@ -2777,15 +2786,19 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             {}, copyDone.handle(), 0,
                             bFence.handle(), vk.dmaQueueHandle());
                     }
-                    std::fprintf(stderr, "copy SUBMITTED f=%llu slot=%u\n",
-                        (unsigned long long)fidx, sidx);
+                    if (dbgOn) {
+                        std::fprintf(stderr, "copy SUBMITTED f=%llu slot=%u\n",
+                            (unsigned long long)fidx, sidx);
+                    }
                     // The park: this blocking wait is the ~36.6 ms the whole
                     // investigation is chasing. It is KEPT for this pass on
                     // purpose, so udmabuf alone can be measured before the
                     // fence wait is touched.
                     const bool copySignalled = bFence.wait(vk, UINT64_MAX);
-                    std::fprintf(stderr, "[M2] f=%llu tid=%ld copy FENCE signalled=%d\n",
-                        (unsigned long long)fidx, ::gettid(), copySignalled ? 1 : 0);
+                    if (dbgOn) {
+                        std::fprintf(stderr, "[M2] f=%llu tid=%ld copy FENCE signalled=%d\n",
+                            (unsigned long long)fidx, ::gettid(), copySignalled ? 1 : 0);
+                    }
                     if (!copySignalled)
                         throw ls::vulkan_error(VK_TIMEOUT,
                             "udmabuf bounce copy fence timed out");

@@ -149,7 +149,8 @@ static void lsfdgInstallAbortHandlers() {
             const VkInstanceCreateInfo* info,
             const VkAllocationCallbacks* alloc,
             VkInstance* instance) {
-    lsfdgInstallAbortHandlers();   // DIAGNOSTIC: name the abort cause
+        if (::envFlagOn("LSFGVK_DBG"))
+            lsfdgInstallAbortHandlers();
 
         // apply layer chaining
         auto* layerInfo = reinterpret_cast<VkLayerInstanceCreateInfo*>(const_cast<void*>(info->pNext));
@@ -899,11 +900,12 @@ namespace {
         if (it == instance_info->devices.end())
             return VK_ERROR_INITIALIZATION_FAILED;
         static const bool dbg = LSGV_FRAME_DBG_ENABLED;
-        // An infinite wait is a hang with no evidence. Cap it so a fence that
-        // never signals fails loudly instead of blocking the game forever.
+        static const bool dbgOn = ::envFlagOn("LSFGVK_DBG");
+        // The 1 s cap is a diagnostic. Off unless LSFGVK_DBG is set, so a
+        // normal infinite wait is not turned into a timeout.
         constexpr uint64_t kInfiniteNs = 0xFFFFFFFFFFFFFFFFull;
         const uint64_t effTimeout =
-            (timeout == kInfiniteNs) ? 1000000000ull /* 1 s */ : timeout;
+            (dbgOn && timeout == kInfiniteNs) ? 1000000000ull /* 1 s */ : timeout;
         if (dbg)
             std::fprintf(stderr,
                 "lsfg-vk-layer: [dbg] WaitForFences ENTER n=%u timeout=%llu "
@@ -915,7 +917,7 @@ namespace {
         const auto t0 = std::chrono::steady_clock::now();
         const VkResult res = it->second.df().WaitForFences(
             device, fenceCount, pFences, waitAll, effTimeout);
-        if (res == VK_TIMEOUT) {
+        if (dbgOn && res == VK_TIMEOUT) {
             // Log and keep the caller's semantics: a timeout is NOT success.
             // Callers retry, and the log names the device + fence that never
             // signalled so the stall is identifiable (2026-09-28 stall).
