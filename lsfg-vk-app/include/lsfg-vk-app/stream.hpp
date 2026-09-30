@@ -113,7 +113,7 @@ namespace ls::ipc {
 
         // move-only: user-declared move ops keep std::map<int,StreamState>
         // emplace/erase by value working (copy stays implicitly deleted).
-        StreamState() { dmaFds.fill(-1); dmaDstFds.fill(-1); }
+        StreamState() { dmaFds.fill(-1); dmaDstFds.fill(-1); udmaFds.fill(-1); }
         ~StreamState();
         StreamState(StreamState&&) = default;
         StreamState& operator=(StreamState&&) = default;
