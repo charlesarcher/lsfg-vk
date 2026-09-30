@@ -110,6 +110,7 @@ std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
 #include <cerrno>
 #include <time.h>
 #include <linux/dma-buf.h>
+#include <linux/sync_file.h>
 #include <xf86drm.h>
 #include <drm/amdgpu_drm.h>
 #include <vulkan/vulkan_core.h>
@@ -2830,6 +2831,40 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &exp) == 0)
                             syncFd = exp.fd;
                         if (syncFd >= 0) {
+                            static const bool syncInfo = [] {
+                                const char* e = std::getenv("LSFGVK_SYNC_INFO");
+                                return e && e[0] == '1' && !e[1];
+                            }();
+                            if (syncInfo) {
+                                static uint32_t logged = 0;
+                                sync_file_info info{};
+                                if (logged < 8
+                                        && ::ioctl(syncFd, SYNC_IOC_FILE_INFO, &info) == 0
+                                        && info.num_fences > 0 && info.num_fences < 8) {
+                                    sync_fence_info fences[8]{};
+                                    info.sync_fence_info = reinterpret_cast<uintptr_t>(fences);
+                                    const uint32_t n = info.num_fences;
+                                    if (::ioctl(syncFd, SYNC_IOC_FILE_INFO, &info) == 0) {
+                                        std::fprintf(stderr,
+                                            "sync-info slot=%u name='%.32s' nf=%u",
+                                            sidx, info.name, n);
+                                        for (uint32_t i = 0; i < n; ++i)
+                                            std::fprintf(stderr,
+                                                " driver='%.32s' timeline='%.32s' status=%d",
+                                                fences[i].driver_name, fences[i].obj_name,
+                                                fences[i].status);
+                                        std::fprintf(stderr, "\n");
+                                        std::fflush(stderr);
+                                        ++logged;
+                                    }
+                                } else if (logged < 8) {
+                                    std::fprintf(stderr,
+                                        "sync-info slot=%u ioctl_errno=%d nf=%u\n",
+                                        sidx, errno, info.num_fences);
+                                    std::fflush(stderr);
+                                    ++logged;
+                                }
+                            }
                             pollfd pfd{};
                             pfd.fd = syncFd;
                             pfd.events = POLLIN;
