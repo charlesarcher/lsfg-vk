@@ -2841,11 +2841,42 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         }
                         const double pollMs = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - pollT0).count();
+                        static const bool copyTs = [] {
+                            const char* e = std::getenv("LSFGVK_COPY_TS");
+                            return e && e[0] == '1' && !e[1];
+                        }();
+                        static PFN_vkGetCalibratedTimestampsEXT getCal = nullptr;
+                        static bool calLoaded = false;
+                        if (copyTs && !calLoaded) {
+                            calLoaded = true;
+                            getCal = reinterpret_cast<PFN_vkGetCalibratedTimestampsEXT>(
+                                vk.fi().GetDeviceProcAddr(vk.dev(),
+                                    "vkGetCalibratedTimestampsEXT"));
+                            uint32_t qcount = 0;
+                            vk.fi().GetPhysicalDeviceQueueFamilyProperties(
+                                vk.physdev(), &qcount, nullptr);
+                            std::vector<VkQueueFamilyProperties> qf(qcount);
+                            vk.fi().GetPhysicalDeviceQueueFamilyProperties(
+                                vk.physdev(), &qcount, qf.data());
+                            const uint32_t fam = vk.transferQueueFamilyIndex();
+                            const uint32_t bits = fam < qcount
+                                ? qf[fam].timestampValidBits : 0;
+                            std::fprintf(stderr,
+                                "copy-ts init pool=%d cal=%d period=%.3f fam=%u bits=%u\n",
+                                tsPool != VK_NULL_HANDLE, getCal != nullptr,
+                                static_cast<double>(tsPeriod), fam, bits);
+                            std::fflush(stderr);
+                        }
                         const auto copyT0 = std::chrono::steady_clock::now();
                         if (!snapCbFence.wait(vk, 0))
                             snapCbFence.wait(vk, UINT64_MAX);
                         snapCbFence.reset(vk);
                         cb.begin(vk);
+                        if (copyTs && tsPool != VK_NULL_HANDLE) {
+                            cb.resetQueryPool(vk, tsPool, 0, 2);
+                            vk.df().CmdWriteTimestamp(cb.handle(),
+                                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, tsPool, 0);
+                        }
                         cb.copyImage(vk,
                             {
                                 makeBlitBarrier(state.aImports.at(sidx).mut().handle(),
@@ -2866,7 +2897,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                     VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL),
                             });
+                        if (copyTs && tsPool != VK_NULL_HANDLE)
+                            vk.df().CmdWriteTimestamp(cb.handle(),
+                                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, tsPool, 1);
                         cb.end(vk);
+                        uint64_t calDev = 0;
+                        int haveCal = 0;
+                        if (copyTs && getCal) {
+                            const VkCalibratedTimestampInfoEXT info{
+                                .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT,
+                                .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT,
+                            };
+                            uint64_t maxDev = 0;
+                            if (getCal(vk.dev(), 1, &info, &calDev, &maxDev) == VK_SUCCESS)
+                                haveCal = 1;
+                        }
                         {
                             std::lock_guard<std::mutex> lk(submitMtx);
                             cb.submit(vk, {}, VK_NULL_HANDLE, 0,
@@ -2877,10 +2922,31 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         snapCbFence.wait(vk, UINT64_MAX);
                         const double copyMs = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - copyT0).count();
+                        double beforeMs = -1.0;
+                        double gpuCopyMs = -1.0;
+                        int haveQ = 0;
+                        if (copyTs && tsPool != VK_NULL_HANDLE) {
+                            uint64_t qv[2] = {0, 0};
+                            haveQ = cb.getQueryPoolResults(vk, tsPool, 0, 2, qv, true) ? 1 : 0;
+                            if (haveQ) {
+                                gpuCopyMs = (static_cast<double>(qv[1]) - static_cast<double>(qv[0]))
+                                    * static_cast<double>(tsPeriod) / 1.0e6;
+                                if (haveCal)
+                                    beforeMs = (static_cast<double>(qv[0]) - static_cast<double>(calDev))
+                                        * static_cast<double>(tsPeriod) / 1.0e6;
+                            }
+                        }
                         std::cerr << "decoupled-copy slot=" << sidx
                             << " pollMs=" << pollMs
                             << " pr=" << pr
-                            << " submitToFenceMs=" << copyMs << "\n";
+                            << " submitToFenceMs=" << copyMs;
+                        if (copyTs) {
+                            std::cerr << " beforeMs=" << beforeMs
+                                << " gpuCopyMs=" << gpuCopyMs
+                                << " haveQ=" << haveQ
+                                << " haveCal=" << haveCal;
+                        }
+                        std::cerr << "\n";
                         conn.send(ls::ipc::Release{ sidx });
                         decoupledFilled = true;
                     }
