@@ -635,19 +635,13 @@ public:
             zwlr_layer_surface_v1_set_anchor(mLayerSurface,
                 ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
                 ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-            /* S43: exclusive zone 0 = borderless fullscreen.
-
-               -1 means "claim no space", so KWin keeps the panel visible and
-               configures us to the WORK area: 2560x1382 on a 2560x1440
-               output, 58 px of panel missing. Every "1440p" run today was
-               really 1382 and nothing said so.
-
-               0 means "this surface covers the entire output", which is the
-               layer-shell spelling of borderless fullscreen: the compositor
-               hides the panel and hands us all 1440 rows. The game's own
-               window is untouched -- exclusive zone only moves the panel,
-               it does not resize or reposition other toplevels. */
-            zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, 0);
+            /* Exclusive zone is not a fullscreen flag. The protocol says 0
+               means move this surface aside so it does not cover other
+               exclusive zones (the panel). We measured that: KWin configured
+               2560x1410 on a 2560x1440 output, 30 px, which is Panel 23's
+               thickness. -1 means do not move it, and extend it to the edges
+               it is anchored to. That is the full output. */
+            zwlr_layer_surface_v1_set_exclusive_zone(mLayerSurface, -1);
             // Isolated overlay covers the output. 1 px gap was for forwarded
             // WSI occlusion; LSFGVK_OVERLAY_GAP=N restores a margin.
             int gap = 0;
