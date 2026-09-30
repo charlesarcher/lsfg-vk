@@ -91,10 +91,11 @@ The primary automated A/B benchmark for verifying frame-generation throughput re
   * `panel`: `2560x1440 MSAA 1 vsync 0`.
   * `heavy`: `2560x1440 MSAA 8 vsync 0`.
 
-- **Transports** (also configurable via `transport = "shm"|"dmabuf"|"decoupled"` in `conf.toml`):
+- **Transports** (`transport` in `conf.toml`): omitted on a cross-GPU profile selects `decoupled`. Explicit values are `shm`, `dmabuf`, `decoupled`, and `udmabuf`. `udmabuf` is an opt-in that puts the shared buffer on the game's submits and stalls about 30 ms under load.
   * `shm`: POSIX shared memory CPU copy (CopyHop pixel walk, ~2–6 ms presentation latency).
   * `dmabuf`: Direct DRM PRIME zero-copy DMA (parks ~28–38 ms on Linux implicit sync).
-  * `decoupled`: Decoupled zero-copy hardware DMA without implicit sync via `VK_EXT_external_memory_host`.
+  * `decoupled`: selected when transport is omitted and the GPUs differ.
+  * `udmabuf`: explicit opt-in only. Puts the shared buffer on the game's submits and stalls about 30 ms under load.
 
 - **Environment Overrides**:
   * `MANGOHUD=0`: Disables MangoHud for pure numeric headless A/B comparisons.

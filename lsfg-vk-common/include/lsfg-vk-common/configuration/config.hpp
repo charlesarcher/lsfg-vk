@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace ls {
@@ -91,7 +92,10 @@ namespace ls {
         /// optional output name for external presentation
         std::optional<std::string> output;
         /// transport mode for one-way external presentation
-        Transport transport{Transport::PosixShm};
+        ls::Transport transport{ls::Transport::PosixShm};
+        /// false when the profile did not set transport. Cross-GPU then
+        /// selects decoupled. udmabuf is never the default.
+        bool transportExplicit{false};
         /// custom IPC socket path override
         std::optional<std::string> socket_path;
         /// emulate isolated/fake swapchain for headless/resizing games
@@ -170,5 +174,11 @@ namespace ls {
     /// find the configuration file in the most common locations
     /// @return path to configuration file
     std::filesystem::path findConfigurationFile();
+
+    /// Resolve an omitted transport. When the profile did not set one and the
+    /// two Vulkan device names differ, select decoupled. An explicit udmabuf
+    /// logs the stall warning and is left as the opt-in.
+    void resolveUnsetTransport(GameConf& conf,
+        std::string_view localDevice, std::string_view otherDevice);
 
 }

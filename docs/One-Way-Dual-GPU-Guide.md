@@ -145,9 +145,9 @@ Consequences:
 
 ## Frame Transport Architecture & Trade-Offs
 
-`lsfg-vk` provides three distinct frame-sharing mechanisms between the game GPU and the display coprocessor. Understanding their trade-offs and kernel interactions is critical for tuning performance and latency:
+`lsfg-vk` provides three distinct frame-sharing mechanisms between the game GPU and the display coprocessor. When the two GPUs differ and `transport` is not set, both sides select decoupled. `transport = "udmabuf"` is an explicit opt-in: it puts the shared buffer on the game's submits and stalls about 30 ms under load.
 
-### 1. POSIX Shared Memory CPU Copy (`transport = "shm"`) — Default / Working 2×
+### 1. POSIX Shared Memory CPU Copy (`transport = "shm"`) — explicit opt-in, not the cross-GPU default
 - **How it works**: The layer sets up a dedicated background worker (`CopyHop`). When the game finishes rendering a frame, `CopyHop` performs a CPU pixel walk / memcpy from host-visible image memory into a shared memory (`memfd`) ring buffer. Over IPC, `lsfg-vk-app` maps the shared memory and copies pixels into the processing GPU's staging texture.
 - **Latency & Performance**: Delivers **~2.2 ms** generation latency, **~6.5 ms** real present latency, achieving **97.9%** native render throughput retention at 1440p MSAA 4.
 - **Pitfalls & Shortcomings**:

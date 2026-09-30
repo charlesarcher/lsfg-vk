@@ -134,6 +134,6 @@ namespace ls::ipc {
 /// @throws ls::error / ls::ipc::socket_error on protocol or socket failure
     void runStream(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         const std::atomic<bool>& stop, const vk::Vulkan& vk,
-        lsfgvk::backend::Instance& backend, const ls::GameConf& conf,
+        lsfgvk::backend::Instance& backend, ls::GameConf conf,
         std::string_view session);
 }

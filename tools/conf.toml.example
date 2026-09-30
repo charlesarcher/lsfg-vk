@@ -12,10 +12,8 @@ name = "app-oneway"
 gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
 presentation = "external"
 multiplier = 2
-# Transport options: "shm" (POSIX shared memory CPU copy, ~2-6ms latency),
-#                   "dmabuf" (DRM PRIME zero-copy DMA with implicit sync, ~50ms),
-#                   "decoupled" (Decoupled zero-copy DMA without implicit sync, ~4ms)
-transport = "decoupled"
+# transport omitted: cross-GPU default is decoupled. udmabuf is an explicit
+# opt-in that stalls about 30 ms under load. Do not set it here.
 
 # ── FurMark Game External Profile ─────────────────────────────────────────
 [[profile]]
@@ -24,4 +22,4 @@ active_in = "furmark"
 gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
 presentation = "external"
 multiplier = 2
-transport = "decoupled"
+# transport omitted: cross-GPU default is decoupled. Do not set udmabuf.

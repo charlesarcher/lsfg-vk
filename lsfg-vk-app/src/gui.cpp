@@ -421,9 +421,9 @@ namespace lsfgvk::gui {
             ImGui::Spacing();
 
             const char* transports[] = {
-                "POSIX SHM (CPU copy, ~2-6ms) [Recommended]",
-                "DMA-BUF (Zero-copy, ~30ms implicit-sync)",
-                "Decoupled DMA (Zero-copy, without implicit-sync)"
+                "Decoupled (cross-GPU default when transport is unset)",
+                "POSIX SHM (explicit CPU copy)",
+                "udmabuf (explicit opt-in: stalls about 30 ms under load)"
             };
             ImGui::Combo("Transport", &g_guiState.transportMode, transports, IM_ARRAYSIZE(transports));
 

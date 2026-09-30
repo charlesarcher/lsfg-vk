@@ -532,6 +532,8 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         : profile(std::move(profile)), info(std::move(info)),
           gameDeviceName(gameDeviceName), fake(this->info.fake), vkPtr(&vk),
           timingRing(vk, "layer-capture") {
+    ls::resolveUnsetTransport(this->profile, this->gameDeviceName,
+        this->profile.gpu.value_or(""));
     // only constructed for External presentation; caller guards this
     if (this->profile.presentation != ls::Presentation::External)
         throw ls::error("CaptureContext created for non-external presentation");

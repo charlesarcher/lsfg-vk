@@ -149,7 +149,7 @@ namespace {
 
 namespace ls::ipc {
 void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& stop,
-    const vk::Vulkan& vk, lsfgvk::backend::Instance& backend, const ls::GameConf& conf,
+    const vk::Vulkan& vk, lsfgvk::backend::Instance& backend, ls::GameConf conf,
     std::string_view session) {
     // own the backend for this stream's lifetime (used by the context janitor
     // below on erase); points to the process-level instance in main.cpp, so it
@@ -174,6 +174,7 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     std::cerr << "lsfg-vk-app: stream from '" << helloDeviceName(*hello) << "' "
               << hello->width << "x" << hello->height << " "
               << formatName(hello->vkFormat) << "\n";
+    ls::resolveUnsetTransport(conf, helloDeviceName(*hello), conf.gpu.value_or(""));
 
     // 2. NEGOTIATED: the staging images (created below, step 3) are ALWAYS
     //    R8G8B8A8_UNORM, 4 Bpp. negotiate the exchange

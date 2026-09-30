@@ -18,6 +18,24 @@
 
 using namespace ls;
 
+void ls::resolveUnsetTransport(GameConf& conf,
+        std::string_view localDevice, std::string_view otherDevice) {
+    if (conf.transportExplicit) {
+        if (conf.transport == Transport::Udmabuf) {
+            std::cerr << "lsfg-vk: warning: transport=udmabuf puts the shared "
+                "buffer on the game's submits and stalls about 30 ms under load\n";
+        }
+        return;
+    }
+    if (conf.presentation != Presentation::External)
+        return;
+    if (localDevice.empty() || otherDevice.empty() || localDevice == otherDevice)
+        return;
+    conf.transport = Transport::DecoupledDma;
+    std::cerr << "lsfg-vk: no transport set and devices differ ('"
+        << localDevice << "' vs '" << otherDevice << "'); using decoupled\n";
+}
+
 void ConfigFile::createDefaultConfigFile(const std::filesystem::path& path) {
     try {
         std::filesystem::create_directories(path.parent_path());
@@ -33,6 +51,10 @@ void ConfigFile::createDefaultConfigFile(const std::filesystem::path& path) {
 [global]
 # dll = '/media/games/Lossless Scaling/Lossless.dll' # if you don't have LS in the default location
 allow_fp16 = true # this will improve give a MASSIVE performance boost on AMD, but be super slow on older (!) NVIDIA GPUs
+# transport is omitted. When presentation is external and the game GPU
+# differs from gpu, decoupled is selected. udmabuf is an explicit opt-in
+# that puts the shared buffer on the game's submits and stalls about 30 ms
+# under load.
 
 [[profile]]
 name = "4x FG / 85% [Performance]"
@@ -124,6 +146,7 @@ namespace {
             return Transport::DmaBuf;
         if (str == "udmabuf" || str == "udma" || str == "bounce")
             return Transport::Udmabuf;
+        if (str == "decoupled" || str == "decoupled_dma")
             return Transport::DecoupledDma;
         throw ls::error("unknown transport mode: " + str
             + " (allowed values: 'shm', 'dmabuf', 'decoupled', 'udmabuf')");
@@ -144,6 +167,7 @@ namespace {
     }
     /// parse a game profile configuration
     GameConf parseGameConf(const toml::table& tbl) {
+        const bool transportExplicit = tbl["transport"].value<std::string>().has_value();
         const GameConf conf{
             .name = tbl["name"].value_or<std::string>("unnamed"),
             .active_in = activityFromString(tbl["active_in"]),
@@ -154,7 +178,9 @@ namespace {
             .pacing = parcingFromString(tbl["pacing"].value_or<std::string>("none")),
             .presentation = presentationFromString(tbl["presentation"].value_or<std::string>("game")),
             .output = tbl["output"].value<std::string>(),
-            .transport = transportFromString(tbl["transport"].value_or<std::string>("shm")),
+            .transport = transportFromString(transportExplicit
+                ? *tbl["transport"].value<std::string>() : "shm"),
+            .transportExplicit = transportExplicit,
             .socket_path = tbl["socket"].value<std::string>(),
             .fake_swapchain = tbl["fake_swapchain"].value_or(false),
             .layer_shell = tbl["layer_shell"].value_or(false),

@@ -9,7 +9,7 @@ name = "app-oneway"
 gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
 presentation = "external"
 multiplier = 2
-transport = "decoupled"
+# transport omitted: cross-GPU default is decoupled. Do not set udmabuf.
 output = "DP-7"
 hud = true
 
@@ -19,6 +19,6 @@ active_in = "furmark"
 gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
 presentation = "external"
 multiplier = 2
-transport = "decoupled"
+# transport omitted: cross-GPU default is decoupled. Do not set udmabuf.
 output = "DP-7"
 hud = true
