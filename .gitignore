@@ -12,6 +12,9 @@
 
 # local build/data artifacts
 /build-asan
+/build-asan-o0
+/build-framedbg
+/vk_layer_settings.txt
 /measurements/raw
 
 # local runtime logs, profiles and evidence
