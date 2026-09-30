@@ -908,9 +908,11 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             std::cerr << "lsfg-vk: capture dst=9070-host-malloc size=" << hostSize << "\n";
             this->copyHop = std::make_unique<CopyHop>();
         }
-        const bool dualHost = (this->profile.transport == ls::Transport::DecoupledDma)
-            || envFlagOn("LSFGVK_DUAL_HOST");
-        if (dualHost && this->fake && !this->shmMaps.at(0)) {
+        if (this->profile.transport == ls::Transport::DecoupledDma
+                && this->shmMaps.at(0)) {
+            std::cerr << "lsfg-vk: dual-host skipped: transport=decoupled but shmMaps set\n";
+        } else if (this->profile.transport == ls::Transport::DecoupledDma
+                && !this->shmMaps.at(0)) {
             try {
                 auto selectB = [](const vk::VulkanInstanceFuncs& fi,
                         const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
@@ -1865,7 +1867,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                     sendFd = syncFd;
                 else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
             }
-        } else if (this->fake && slot < this->bExportFds.size()
+        } else if (slot < this->bExportFds.size()
                 && this->bExportFds.at(slot) >= 0) {
             sendFd = ::dup(this->bExportFds.at(slot));
             if (sendFd < 0)
