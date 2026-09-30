@@ -282,12 +282,11 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         const bool hostBounce =
             conf.presentation == ls::Presentation::External
             && !envFlagOn("LSFGVK_POSIX_SHM")
-            // DecoupledDma is the historical name for the old dual-host
-            // bounce; Udmabuf is the buffer-based one that is proven to work
-            // on this platform. Both are the same staging shape here, the
-            // difference is only the import on the app side.
-            && (conf.transport == ls::Transport::Udmabuf
-                || conf.transport == ls::Transport::DecoupledDma);
+            // DecoupledDma must not take this path. It does not share a
+            // udmabuf with the render process: the layer closes those fds
+            // and never writes them. The app imports the layer's 9060
+            // dma-buf from FRAME instead.
+            && conf.transport == ls::Transport::Udmabuf;
         const bool posixShm = hostBounce
             || (conf.presentation == ls::Presentation::External
                 && (envFlagOn("LSFGVK_POSIX_SHM")
