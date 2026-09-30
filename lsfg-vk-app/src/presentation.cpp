@@ -21,6 +21,9 @@
 // but harmless. We only need poll/errno/close/getenv which are exposed.
 #include "lsfg-vk-app/presentation.hpp"
 #include "lsfg-vk-common/frame_dbg.hpp"
+#include "lsfg-vk-common/color_dump.hpp"
+
+#include <memory>
 
 using Clock = std::chrono::steady_clock;
 using Usec = std::chrono::microseconds;
@@ -1253,6 +1256,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         // (the app's last queue touch for this frame).
         uint64_t recvTsNs{ 0 };
         uint64_t schedDoneNs{ 0 };
+        uint64_t srcFidx{ UINT64_MAX };
     };
     // Frames abandoned without being read. MUST stay 0: no frame may ever be
     // dropped. A non-zero value means a slot's blit did not signal in time and
@@ -1540,6 +1544,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             uint64_t captureTsNs{ 0 };
             uint64_t recvTsNs{ 0 };    // Session 40 ledger stamps (see PendingFrame)
             uint64_t schedDoneNs{ 0 };
+            uint64_t srcFidx{ UINT64_MAX };
         } cur;
         int lastShownStagingIdx{ -1 }; // newest real frame actually shown (HOLD-LAST)
         uint64_t presentIdx{ 0 };      // rolling index into the signal pool
@@ -1732,7 +1737,34 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
         // present one swapchain image that blits the private snapshot of the
         // given real frame into it (used for REAL presents and HOLD-LAST).
-        auto presentReal = [&](int stagingIdx, int snapFd, uint64_t capTsNs = 0) -> bool {
+        auto presentReal = [&](int stagingIdx, int snapFd, uint64_t capTsNs = 0,
+                uint64_t srcFidx = UINT64_MAX) -> bool {
+            const bool dumpE = ls::colorDumpOn() && srcFidx == ls::colorDumpFidx();
+            void* colorPx = nullptr;
+            std::unique_ptr<vk::Image> colorImg;
+            if (dumpE) {
+                const size_t colorNb = static_cast<size_t>(extent.width) * extent.height * 4;
+                if (::posix_memalign(&colorPx, 4096, colorNb) == 0) {
+                    std::memset(colorPx, 0, colorNb);
+                    try {
+                        colorImg = std::make_unique<vk::Image>(vk, extent,
+                            static_cast<VkFormat>(g_overlay.imageFormat),
+                            VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                            colorPx, colorNb);
+                    } catch (const std::exception& e) {
+                        std::cerr << "color-dump stage=e image failed: " << e.what() << "\n";
+                        ::free(colorPx);
+                        colorPx = nullptr;
+                    }
+                }
+            }
+            auto freeColor = [&]() {
+                colorImg.reset();
+                if (colorPx) {
+                    ::free(colorPx);
+                    colorPx = nullptr;
+                }
+            };
             uint32_t idx{};
             const auto tReal0 = Clock::now();
             Clock::time_point tAcq0{};
@@ -1740,6 +1772,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 tAcq0 = Clock::now();
             if (!acquireImage(idx)) {
                 if (snapFd >= 0) ::close(snapFd);
+                freeColor();
                 return false;
             }
             if (stageTimes().on)
@@ -1789,6 +1822,24 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 imgExtent,
                 VK_FILTER_LINEAR
             );
+            if (colorImg) {
+                cbs.at(cbIdx).copyImage(vk,
+                    {
+                        makeBlitBarrier(dstImage,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
+                        makeBlitBarrier(colorImg->handle(),
+                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
+                    },
+                    { dstImage, colorImg->handle() },
+                    extent,
+                    {
+                        makeBlitBarrier(dstImage,
+                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_ACCESS_MEMORY_READ_BIT, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR),
+                    });
+            }
             drawHud(cbs.at(cbIdx), dstImage);
             if (stageTimes().on)
                 stageTimes().add(stageTimes().blit, elapsedUs(tBlit0, Clock::now()));
@@ -1807,6 +1858,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     elapsedUs(tAcq0, tAcquire), elapsedUs(tAcquire, tBlitEnd),
                     elapsedUs(tLock0, tLock1), elapsedUs(tLock1, tSubmit1),
                     elapsedUs(tAcq0, tSubmit1));
+            }
+            if (colorImg) {
+                const size_t wrote = cbIdx;
+                if (!cbFences.at(wrote).wait(vk, UINT64_MAX))
+                    std::cerr << "color-dump stage=e fence timeout\n";
+                else {
+                    char mod[96];
+                    std::snprintf(mod, sizeof(mod),
+                        "n/a (app swapchain format=%u)", g_overlay.imageFormat);
+                    ls::writeColorStage("e-present", extent.width, extent.height,
+                        static_cast<const uint8_t*>(colorPx),
+                        static_cast<int>(g_overlay.imageFormat), srcFidx,
+                        "n/a", mod);
+                }
+                freeColor();
             }
             cbIdx = (cbIdx + 1) % cbRingSize;
             processWsiEvents(0);
@@ -2048,6 +2114,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         cur.captureTsNs = pf->captureTsNs;
                         cur.recvTsNs = pf->recvTsNs;
                         cur.schedDoneNs = pf->schedDoneNs;
+                        cur.srcFidx = pf->srcFidx;
                     } else if (wantDropWsi.exchange(false, std::memory_order_relaxed)
                             && g_overlay.wsi) {
                         LSFG_FRAME_DBG("output: idle drop overlay WSI (keep IPC)");
@@ -2151,6 +2218,18 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             VK_NULL_HANDLE, 0,
                             { signalSem.at(presentIdx % signalPool).handle() }, VK_NULL_HANDLE, 0,
                             cbFences.at(cbIdx).handle());
+                    }
+                    if (ls::colorDumpOn() && cur.srcFidx == ls::colorDumpFidx() && i == 0) {
+                        if (!cbFences.at(cbIdx).wait(vk, UINT64_MAX))
+                            std::cerr << "color-dump stage=d fence timeout\n";
+                        else
+                            ls::colorDumpReadback(vk, vk.queue(),
+                                state.destinationImages.at(i).mut().handle(),
+                                VK_FORMAT_R8G8B8A8_UNORM, imgExtent,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                "d-generated", cur.srcFidx,
+                                "n/a",
+                                "n/a (destinationImages declared R8G8B8A8_UNORM)");
                     }
                     processWsiEvents(0);
                     const VkPresentInfoKHR presentInfo{
@@ -2258,7 +2337,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         "slot=%u\n", (unsigned long long)cur.stagingIdx, ::gettid(),
                         cur.stagingIdx);
                     const bool presOk = presentReal(cur.stagingIdx,
-                        cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs);
+                        cur.snapFd >= 0 ? cur.snapFd : -1, cur.captureTsNs, cur.srcFidx);
                     std::fprintf(stderr, "[M4] f=%llu tid=%ld REAL present RESULT ok=%d\n",
                         (unsigned long long)cur.stagingIdx, ::gettid(), presOk ? 1 : 0);
                     if (!presOk)
@@ -3059,6 +3138,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 vk.dmaQueueHandle());
                         }
                         snapCbFence.wait(vk, UINT64_MAX);
+                        if (ls::colorDumpOn() && fidx == ls::colorDumpFidx()
+                                && state.genSources.at(sidx).has_value()) {
+                            ls::colorDumpReadback(vk, vk.dmaQueueHandle(),
+                                state.genSources.at(sidx).mut().handle(),
+                                VK_FORMAT_R8G8B8A8_UNORM, imgExtent,
+                                VK_IMAGE_LAYOUT_GENERAL,
+                                "c-gensources", fidx,
+                                "n/a",
+                                "n/a (genSources declared R8G8B8A8_UNORM; import is linear rowPitch=w*4)");
+                        }
                         const double copyMs = std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - copyT0).count();
                         double beforeMs = -1.0;
@@ -3423,6 +3512,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 pf.schedDoneNs = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         Clock::now().time_since_epoch()).count());
+                pf.srcFidx = fidx;
                 inbox.push(std::move(pf));
                 ++frameCount;
                 ++fidx;

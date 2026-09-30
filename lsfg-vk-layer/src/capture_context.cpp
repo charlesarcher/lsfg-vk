@@ -7,6 +7,7 @@
 #include "lsfg-vk-common/vulkan/exchange.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
 #include "lsfg-vk-common/vulkan/semaphore.hpp"
+#include "lsfg-vk-common/color_dump.hpp"
 #include "swapchain.hpp"
 
 #include "lsfg-vk-layer/capture_context.hpp"
@@ -1533,6 +1534,16 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     }
     const vk::Semaphore& sigSem = *sigSemPtr;
 
+    // Color measurement only. One frame, before the capture copy. Restores
+    // PRESENT_SRC so the capture barrier below still matches.
+    if (ls::colorDumpOn() && this->fidx == ls::colorDumpFidx() && !dummySrc) {
+        const VkQueue q = this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue;
+        ls::colorDumpReadback(vk, q, srcImage, this->info.format, this->info.extent,
+            VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+            "a-swapchain", this->fidx,
+            "n/a", "n/a (game swapchain, not a dma-buf export)");
+    }
+
     // record blit info.images[imageIdx] -> staging[slot] waiting on game's
     // present wait-semaphores, signal slot's capture semaphore
     const auto& cmdbuf = this->captureCommandBuffers.at(ringIdx);
@@ -1757,6 +1768,23 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 this->bFences.at(slot).handle());
             if (bres != VK_SUCCESS)
                 std::cerr << "lsfg-vk: dual-host 9060 QueueSubmit " << bres << "\n";
+            if (ls::colorDumpOn() && this->fidx == ls::colorDumpFidx()
+                    && bres == VK_SUCCESS) {
+                if (!this->bFences.at(slot).wait(bvk, UINT64_MAX)) {
+                    std::cerr << "color-dump stage=b fence timeout\n";
+                } else {
+                    ls::colorDumpReadback(bvk, bvk.queue(),
+                        this->bVramImages.at(slot).handle(),
+                        VK_FORMAT_R8G8B8A8_UNORM,
+                        this->bVramImages.at(slot).getExtent(),
+                        VK_IMAGE_LAYOUT_GENERAL,
+                        "b-export", this->fidx,
+                        "n/a (exportDmaBuf stores fd/size/pitch only)",
+                        "0 LINEAR declared ImageMode::Linear, not queried from the dma-buf");
+                }
+            }
+        } else if (ls::colorDumpOn() && this->fidx == ls::colorDumpFidx()) {
+            std::cerr << "color-dump stage=b skipped: 9060 copy not submitted this frame\n";
         }
     }
 
