@@ -84,6 +84,7 @@ namespace {
         vk::VulkanInstanceFuncs funcs;
 
         std::unordered_map<VkDevice, vk::Vulkan> devices;
+        std::unordered_map<VkQueue, VkDevice> queues; //!< queue -> owning device
         std::unordered_map<VkSwapchainKHR, ls::R<vk::Vulkan>> swapchains;
         std::unordered_map<VkSwapchainKHR, SwapchainInfo> swapchainInfos;
     }* instance_info; // NOLINT (global variable)
@@ -385,8 +386,45 @@ static void lsfdgInstallAbortHandlers() {
         return VK_SUCCESS;
     }
 
+    // record which device owns a queue so device-level dispatch keys on the
+    // dispatching object's device, never on devices.begin()
+    static void recordQueueDevice(VkQueue queue, VkDevice device) {
+        if (queue != VK_NULL_HANDLE)
+            instance_info->queues[queue] = device;
+    }
+
+    void myvkGetDeviceQueue(VkDevice device, uint32_t family, uint32_t index,
+            VkQueue* queue) {
+        auto next = reinterpret_cast<PFN_vkGetDeviceQueue>(
+            instance_info->funcs.GetDeviceProcAddr(device, "vkGetDeviceQueue"));
+        if (!next) {
+            std::cerr << "lsfg-vk: next layer's vkGetDeviceQueue is null\n";
+            return;
+        }
+        next(device, family, index, queue);
+        recordQueueDevice(queue ? *queue : VK_NULL_HANDLE, device);
+    }
+
+    void myvkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* info,
+            VkQueue* queue) {
+        auto next = reinterpret_cast<PFN_vkGetDeviceQueue2>(
+            instance_info->funcs.GetDeviceProcAddr(device, "vkGetDeviceQueue2"));
+        if (!next) {
+            std::cerr << "lsfg-vk: next layer's vkGetDeviceQueue2 is null\n";
+            return;
+        }
+        next(device, info, queue);
+        recordQueueDevice(queue ? *queue : VK_NULL_HANDLE, device);
+    }
+
     // destroy device
     void myvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
+        // drop queue entries owned by this device
+        if (instance_info)
+            for (auto q = instance_info->queues.begin(); q != instance_info->queues.end();)
+                q = q->second == device ? instance_info->queues.erase(q)
+                                        : std::next(q);
+
         // destroy layer instance
         auto it = instance_info->devices.find(device);
         if (it != instance_info->devices.end()) {
@@ -1016,21 +1054,29 @@ namespace {
         }
         if (!instance_info || instance_info->devices.empty())
             return VK_ERROR_INITIALIZATION_FAILED;
-        const auto& devVk = instance_info->devices.begin()->second;
-        PFN_vkQueueSubmit2 next = devVk.df().QueueSubmit2;
+        // dispatch on the queue's own device. devices.begin() is unordered-map
+        // order: a second device with a null slot moves begin() onto it and the
+        // submit then returns -8 for a queue that belongs to the first device.
+        const auto qit = instance_info->queues.find(queue);
+        VkDevice dev = qit != instance_info->queues.end() ? qit->second
+            : (instance_info->devices.size() == 1 ? instance_info->devices.begin()->first
+                                                  : VK_NULL_HANDLE);
+        const auto dit = dev != VK_NULL_HANDLE ? instance_info->devices.find(dev)
+                                               : instance_info->devices.end();
+        const bool queueDeviceKnown = dit != instance_info->devices.end();
+        PFN_vkQueueSubmit2 next = queueDeviceKnown ? dit->second.df().QueueSubmit2 : nullptr;
         if (!next || next == myvkQueueSubmit2) {
             next = reinterpret_cast<PFN_vkQueueSubmit2>(
-                instance_info->funcs.GetDeviceProcAddr(
-                    instance_info->devices.begin()->first, "vkQueueSubmit2"));
+                instance_info->funcs.GetDeviceProcAddr(dev, "vkQueueSubmit2"));
         }
         if (!next || next == myvkQueueSubmit2) {
             if (::envFlagOn("LSFGVK_MEASURE")) {
-                const auto begin = instance_info->devices.begin();
                 std::fprintf(stderr,
-                    "lsfg-vk-measure: submit2-lookup queue=%p begin-device=%p slot=%p devices=%zu next=%p reason=%s\n",
+                    "lsfg-vk-measure: submit2-lookup queue=%p queue-device=%p slot=%p devices=%zu next=%p reason=%s\n",
                     static_cast<void*>(queue),
-                    static_cast<void*>(begin->first),
-                    reinterpret_cast<const void*>(devVk.df().QueueSubmit2),
+                    static_cast<void*>(dev),
+                    reinterpret_cast<const void*>(queueDeviceKnown
+                        ? dit->second.df().QueueSubmit2 : nullptr),
                     instance_info->devices.size(),
                     reinterpret_cast<void*>(next),
                     next == myvkQueueSubmit2 ? "next-is-self" : "next-null");
@@ -1045,9 +1091,9 @@ namespace {
             static std::atomic<int> n{0};
             if (n.fetch_add(1) < 3 || sr != VK_SUCCESS) {
                 std::fprintf(stderr,
-                    "lsfg-vk-measure: submit2 queue=%p begin-device=%p pending=%zu downchain=%d returned=%d\n",
+                    "lsfg-vk-measure: submit2 queue=%p queue-device=%p pending=%zu downchain=%d returned=%d\n",
                     static_cast<void*>(queue),
-                    static_cast<void*>(instance_info->devices.begin()->first),
+                    static_cast<void*>(dev),
                     pending.size(),
                     static_cast<int>(sr), static_cast<int>(sr));
                 std::fflush(stderr);
@@ -1316,6 +1362,8 @@ VkResult vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVers
                 { "vkQueuePresentKHR", VKPTR(myvkQueuePresentKHR) },
                 { "vkQueueSubmit2", VKPTR(myvkQueueSubmit2) },
                 { "vkQueueSubmit2KHR", VKPTR(myvkQueueSubmit2) },
+                { "vkGetDeviceQueue", VKPTR(myvkGetDeviceQueue) },
+                { "vkGetDeviceQueue2", VKPTR(myvkGetDeviceQueue2) },
                 { "vkDestroySwapchainKHR", VKPTR(myvkDestroySwapchainKHR) }
 #undef VKPTR
             },
