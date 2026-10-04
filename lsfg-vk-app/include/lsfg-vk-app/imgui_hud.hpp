@@ -23,7 +23,7 @@ namespace ls::hud {
     /// the StreamState::streamId (0 when not stream-scoped), @p detail is
     /// pre-formatted key=value text. One atomic flag per what-kind keeps the
     /// tick lines from flooding a 132/s present loop.
-    void traceLine(const char* what, uint32_t streamId, const std::string& detail);
+    void traceLine(const char* what, uint32_t streamId, const char* detail);
 
     /// dear imgui overlay for the doubler window (S40+ Phase A).
     /// renders an interactive OFFSCREEN tooltip-card (imgui) into a small

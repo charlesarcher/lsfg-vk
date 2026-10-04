@@ -66,7 +66,11 @@ namespace ls::hud {
         }
     }
 
-    void traceLine(const char* what, uint32_t streamId, const std::string& detail) {
+    /* Fixed-buffer trace. Callers pass a preformatted char[] and never a
+       std::string: building a temporary std::string per line at 700 kHz made
+       ASan abort inside ~basic_string()::~basic_string() and destroyed the
+       runs it was meant to measure (2026-10-04). */
+    void traceLine(const char* what, uint32_t streamId, const char* detail) {
         static std::mutex mtx;
         const auto now = std::chrono::system_clock::now();
         const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -78,7 +82,7 @@ namespace ls::hud {
             "TRACE %lld.%06lld what=%s stream=%u tid=%ld %s\n",
             static_cast<long long>(secs.count()),
             static_cast<unsigned long long>(us.count()),
-            what, streamId, static_cast<long>(::gettid()), detail.c_str());
+            what, streamId, static_cast<long>(::gettid()), detail);
         std::fflush(stderr);
     }
 
@@ -1038,8 +1042,9 @@ void ImGuiHud::setupThemeAndFont() {
            same command buffer concurrently, which is the SIGSEGV. Checked
            with a plain load, never a wait: the present path must not block. */
         this->traceStreamId.store(streamId, std::memory_order_relaxed);
-        ls::hud::traceLine("hud-adopt", streamId,
-            "previous-owner=" + std::to_string(prev));
+        char tb[64];
+        std::snprintf(tb, sizeof tb, "previous-owner=%u", prev);
+        ls::hud::traceLine("hud-adopt", streamId, tb);
         this->cmdbufGeneration.fetch_add(1, std::memory_order_acq_rel);
     }
 
@@ -1063,12 +1068,16 @@ void ImGuiHud::setupThemeAndFont() {
            stream id to show whether two threads are ever inside at once. */
         static std::atomic<int> s_tickSeq{0};
         const int seq = s_tickSeq.fetch_add(1, std::memory_order_relaxed);
-        ls::hud::traceLine("tick-enter", this->traceStreamId,
-            "seq=" + std::to_string(seq) + " dt=" + std::to_string(dt));
+        char tb[96];
+        std::snprintf(tb, sizeof tb, "seq=%d dt=%.6f", seq,
+            static_cast<double>(dt));
+        ls::hud::traceLine("tick-enter", this->traceStreamId, tb);
         struct TickExit {
             uint32_t stream; int seq;
             ~TickExit() {
-                ls::hud::traceLine("tick-exit", stream, "seq=" + std::to_string(seq));
+                char b[48];
+                std::snprintf(b, sizeof b, "seq=%d", seq);
+                ls::hud::traceLine("tick-exit", stream, b);
             }
         } tickExit{ this->traceStreamId, seq };
         /* S42f-v2: cadence-only gate (no content hash — the hash-gate

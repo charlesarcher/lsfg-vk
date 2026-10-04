@@ -56,9 +56,12 @@ void ls::ipc::setRetireOlderStream(
 }
 
 StreamState::~StreamState() {
-    ls::hud::traceLine("stream-close", this->streamId,
-        "tid=" + std::to_string(static_cast<long>(::gettid()))
-        + " extent=" + std::to_string(this->width) + "x" + std::to_string(this->height));
+    {
+        char tb[160];
+        std::snprintf(tb, sizeof tb, "extent=%ux%u",
+            this->width, this->height);
+        ls::hud::traceLine("stream-close", this->streamId, tb);
+    }
     // RADV FreeMemory on HOST_ALLOCATION_BIT frees the posix_memalign
     // pointer and aborts the overlay on FurMark swapchain recreate.
     if (this->shmBytes == 0)
@@ -193,12 +196,13 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     static std::atomic<uint32_t> s_nextStreamId{1};
     state.streamId = s_nextStreamId.fetch_add(1, std::memory_order_relaxed);
     state.deviceName = helloDeviceName(*hello);
-    ls::hud::traceLine("stream-open", state.streamId,
-        "pid=" + std::to_string(static_cast<long>(::getpid()))
-        + " tid=" + std::to_string(static_cast<long>(::gettid()))
-        + " dev='" + helloDeviceName(*hello) + "'"
-        + " extent=" + std::to_string(hello->width) + "x" + std::to_string(hello->height)
-        + " fmt=" + formatName(hello->vkFormat));
+    {
+        char tb[320];
+        std::snprintf(tb, sizeof tb, "pid=%ld extent=%ux%u fmt=%d",
+            static_cast<long>(::getpid()), hello->width, hello->height,
+            static_cast<int>(hello->vkFormat));
+        ls::hud::traceLine("stream-open", state.streamId, tb);
+    }
     /* A game that recreates its swapchain (a resolution change) opens a NEW
        connection while the OLD one is still live. Both then drive the one
        process-wide overlay card: two output threads inside ImGuiHud::tick on

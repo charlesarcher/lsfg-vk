@@ -452,8 +452,9 @@ int main(int argc, char** argv) {
                             doomed.push_back(fd);
                 }
                 for (int fd : doomed) {
-                    ls::hud::traceLine("stream-retire", newId,
-                        "doomed-fd=" + std::to_string(fd) + " dev='" + dev + "'");
+                    char tb[128];
+                    std::snprintf(tb, sizeof tb, "doomed-fd=%d", fd);
+                    ls::hud::traceLine("stream-retire", newId, tb);
                     ::shutdown(fd, SHUT_RDWR);
                 }
             });

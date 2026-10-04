@@ -1278,12 +1278,29 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         // runPresent's join() hangs instead of reporting the error that caused
         // the teardown. Set stop() wakes every waiter.
         bool stopped{ false };
+        /* probe accessors: the stopped flag and queue depth are read while
+           the output thread decides whether to wait or re-enter */
+        bool isStopped() { std::lock_guard<std::mutex> lk(m); return stopped; }
+        size_t size() { std::lock_guard<std::mutex> lk(m); return q.size(); }
         void stop() {
             {
                 std::lock_guard<std::mutex> lk(m);
                 stopped = true;
             }
             cv.notify_all();
+            /* WHO stopped the inbox? The whole present loop depends on this
+               being reachable only at teardown; a caller that stops it early
+               turns takeNewestWait into a no-wait spin. Log the backtrace. */
+            ls::hud::traceLine("inbox-stop", 0, "");
+            {
+                char b[256];
+                int n = snprintf(b, sizeof b,
+                    "TRACE-BT tid=%ld\n", (long)::gettid());
+                void* frames[24];
+                int k = backtrace(frames, 24);
+                backtrace_symbols_fd(frames, k, STDERR_FILENO);
+                (void)n;
+            }
         }
         // Blocking variant: waits on the cv until a frame arrives or the
         // timeout expires (timeout serves WSI event pumping only; frame
@@ -2056,9 +2073,33 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     if (stop.load(std::memory_order_relaxed)
                             || failed.load(std::memory_order_relaxed))
                         return false;
+                    /* RETIRE PROBE: fixed buffer, raw integers only. */
                     auto pf = inbox.takeNewest();
-                    if (!pf)
+                    const uint32_t pfFast = pf ? 1u : 0u;
+                    {
+                        char tb[320];
+                        std::snprintf(tb, sizeof tb,
+                            "cur.active=%d cur.stagingIdx=%u stop=%d failed=%d "
+                            "inboxStopped=%d inboxQ=%zu pfFast=%d",
+                            cur.active ? 1 : 0, cur.stagingIdx,
+                            stop.load() ? 1 : 0, failed.load() ? 1 : 0,
+                            inbox.isStopped() ? 1 : 0, inbox.size(),
+                            (int)pfFast);
+                        ls::hud::traceLine("block-enter", state.streamId, tb);
+                    }
+                    if (!pf) {
                         pf = inbox.takeNewestWait(15);
+                        /* Why did the blocking call return at once? Either the
+                           queue was non-empty (a real frame) or the cv woke on
+                           `stopped` with nothing queued. Distinguish the two. */
+                        char tb[320];
+                        std::snprintf(tb, sizeof tb,
+                            "engaged=%d reason=%s inboxStopped=%d inboxQ=%zu",
+                            pf ? 1 : 0, pf ? "frame" : "empty",
+                            inbox.isStopped() ? 1 : 0, inbox.size());
+                        ls::hud::traceLine("takeNewestWait-ret",
+                            state.streamId, tb);
+                    }
                     if (!pf
                         && (stop.load(std::memory_order_relaxed)
                             || failed.load(std::memory_order_relaxed)))
@@ -2122,6 +2163,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         cur.recvTsNs = pf->recvTsNs;
                         cur.schedDoneNs = pf->schedDoneNs;
                         cur.srcFidx = pf->srcFidx;
+                        {
+                            char tb[160];
+                            std::snprintf(tb, sizeof tb,
+                                "cur.active=%d cur.stagingIdx=%u",
+                                cur.active ? 1 : 0, cur.stagingIdx);
+                            ls::hud::traceLine("block-exit", state.streamId, tb);
+                        }
                     } else if (wantDropWsi.exchange(false, std::memory_order_relaxed)
                             && g_overlay.wsi) {
                         LSFG_FRAME_DBG("output: idle drop overlay WSI (keep IPC)");
@@ -3612,9 +3660,29 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     // returns and this hangs forever instead of surfacing the error that
     // caused the teardown (seen 2026-09-28: input thread stuck in exportFd,
     // runPresent stuck in join).
+    /* Wait for the loops to end on their OWN stop/failed condition before
+       touching the inbox. Stopping it here (2026-10-04) satisfied the cv
+       predicate on the very first takeNewestWait, so the 15 ms wait never
+       happened and the output loop spun: 558368 block-enter in one FurMark
+       run and 53704 in RE2, against 7952 and 1 frames actually delivered.
+       Both loops set failed from their catch(...) and break on stop/failed at
+       the top of their poll loops, so this wait is bounded. */
+    while (!stop.load(std::memory_order_relaxed)
+            && !failed.load(std::memory_order_relaxed))
+        ::usleep(1000);
+    /* Still required, and still before the joins: whichever loop is parked in
+       takeNewestWait() returns once `stopped` is set, so join() cannot hang.
+       This is the 2026-09-28 protection and it is unchanged. */
     inbox.stop();   // the output thread's cv wait must be woken, or join hangs
+    {
+        char tb[128];
+        std::snprintf(tb, sizeof tb, "stop=%d failed=%d waited-for-loops=1",
+            stop.load() ? 1 : 0, failed.load() ? 1 : 0);
+        ls::hud::traceLine("pre-join", 0, tb);
+    }
     inputThread.join();
     outputThread.join();
+    ls::hud::traceLine("post-join", 0, "both-joined=1");
 
     // close any fds still in the inbox (the input may have pushed after the
     // output's drain) and idle the device before the RAII guard destroys WSI.
