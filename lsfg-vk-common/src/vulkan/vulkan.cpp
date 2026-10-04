@@ -630,6 +630,13 @@ VulkanInstanceFuncs vk::initVulkanInstanceFuncs(VkInstance i, PFN_vkGetInstanceP
 /// initialize vulkan device function pointers
 VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevice d,
         bool graphical) {
+    const auto queueSubmit2 = dpa_optional<PFN_vkQueueSubmit2>(f, d, "vkQueueSubmit2");
+    if (const char* m = std::getenv("LSFGVK_MEASURE"); m && m[0] == '1') {
+        std::fprintf(stderr,
+            "lsfg-vk-measure: ptr-write site=initVulkanDeviceFuncs device=%p name=vkQueueSubmit2 old=null new=%p\n",
+            static_cast<void*>(d), reinterpret_cast<const void*>(queueSubmit2));
+        std::fflush(stderr);
+    }
     return {
         .GetDeviceQueue = dpa<PFN_vkGetDeviceQueue>(f, d, "vkGetDeviceQueue"),
         .DeviceWaitIdle = dpa<PFN_vkDeviceWaitIdle>(f, d, "vkDeviceWaitIdle"),
@@ -665,7 +672,7 @@ VulkanDeviceFuncs vk::initVulkanDeviceFuncs(const VulkanInstanceFuncs& f, VkDevi
         .CmdWriteTimestamp = dpa<PFN_vkCmdWriteTimestamp>(f, d, "vkCmdWriteTimestamp"),
         .CmdResetQueryPool = dpa<PFN_vkCmdResetQueryPool>(f, d, "vkCmdResetQueryPool"),
         .QueueSubmit = dpa<PFN_vkQueueSubmit>(f, d, "vkQueueSubmit"),
-        .QueueSubmit2 = dpa_optional<PFN_vkQueueSubmit2>(f, d, "vkQueueSubmit2"),
+        .QueueSubmit2 = queueSubmit2,
         .AllocateDescriptorSets = dpa<PFN_vkAllocateDescriptorSets>(f, d,
             "vkAllocateDescriptorSets"),
         .FreeDescriptorSets = dpa<PFN_vkFreeDescriptorSets>(f, d, "vkFreeDescriptorSets"),

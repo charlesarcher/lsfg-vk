@@ -364,6 +364,19 @@ static void lsfdgInstallAbortHandlers() {
                     graphical, setLoaderData
                 )
             );
+            if (::envFlagOn("LSFGVK_MEASURE")) {
+                const auto stored = instance_info->devices.find(*device);
+                const auto begin = instance_info->devices.begin();
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: device-map site=myvkCreateDevice device=%p QueueSubmit2=%p begin=%p devices=%zu\n",
+                    static_cast<void*>(*device),
+                    stored == instance_info->devices.end() ? nullptr
+                        : reinterpret_cast<const void*>(stored->second.df().QueueSubmit2),
+                    begin == instance_info->devices.end() ? nullptr
+                        : static_cast<void*>(begin->first),
+                    instance_info->devices.size());
+                std::fflush(stderr);
+            }
         } catch (const std::exception& e) {
             std::cerr << "lsfg-vk: something went wrong during lsfg-vk initialization:\n";
             std::cerr << "- " << e.what() << '\n';
@@ -376,8 +389,30 @@ static void lsfdgInstallAbortHandlers() {
     void myvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
         // destroy layer instance
         auto it = instance_info->devices.find(device);
-        if (it != instance_info->devices.end())
+        if (it != instance_info->devices.end()) {
+            if (::envFlagOn("LSFGVK_MEASURE")) {
+                const auto begin = instance_info->devices.begin();
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: device-erase site=myvkDestroyDevice device=%p QueueSubmit2=%p begin-before=%p devices-before=%zu\n",
+                    static_cast<void*>(device),
+                    reinterpret_cast<const void*>(it->second.df().QueueSubmit2),
+                    begin == instance_info->devices.end() ? nullptr
+                        : static_cast<void*>(begin->first),
+                    instance_info->devices.size());
+                std::fflush(stderr);
+            }
             instance_info->devices.erase(it);
+            if (::envFlagOn("LSFGVK_MEASURE")) {
+                const auto begin = instance_info->devices.begin();
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: device-erase site=myvkDestroyDevice device=%p begin-after=%p devices-after=%zu\n",
+                    static_cast<void*>(device),
+                    begin == instance_info->devices.end() ? nullptr
+                        : static_cast<void*>(begin->first),
+                    instance_info->devices.size());
+                std::fflush(stderr);
+            }
+        }
 
         // destroy device
         auto vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(
@@ -451,6 +486,19 @@ static void lsfdgInstallAbortHandlers() {
         if (!name) return nullptr;
 
         auto func = getProcAddr(name);
+        const bool submit2Name = std::strcmp(name, "vkQueueSubmit2") == 0
+            || std::strcmp(name, "vkQueueSubmit2KHR") == 0;
+        if (::envFlagOn("LSFGVK_MEASURE") && submit2Name) {
+            PFN_vkVoidFunction down = nullptr;
+            if (instance_info && instance_info->funcs.GetDeviceProcAddr)
+                down = instance_info->funcs.GetDeviceProcAddr(device, name);
+            std::fprintf(stderr,
+                "lsfg-vk-measure: GetDeviceProcAddr site=myvkGetDeviceProcAddr device=%p name=%s hook=%p down=%p\n",
+                static_cast<void*>(device), name,
+                reinterpret_cast<void*>(func), reinterpret_cast<void*>(down));
+            std::fflush(stderr);
+            return func ? func : down;
+        }
         if (func) return func;
 
         if (!instance_info->funcs.GetDeviceProcAddr) return nullptr;
@@ -977,9 +1025,14 @@ namespace {
         }
         if (!next || next == myvkQueueSubmit2) {
             if (::envFlagOn("LSFGVK_MEASURE")) {
+                const auto begin = instance_info->devices.begin();
                 std::fprintf(stderr,
-                    "lsfg-vk-measure: submit2 queue=%p pending=%zu downchain=not-called returned=-8 reason=%s\n",
-                    static_cast<void*>(queue), pending.size(),
+                    "lsfg-vk-measure: submit2-lookup queue=%p begin-device=%p slot=%p devices=%zu next=%p reason=%s\n",
+                    static_cast<void*>(queue),
+                    static_cast<void*>(begin->first),
+                    reinterpret_cast<const void*>(devVk.df().QueueSubmit2),
+                    instance_info->devices.size(),
+                    reinterpret_cast<void*>(next),
                     next == myvkQueueSubmit2 ? "next-is-self" : "next-null");
                 std::fflush(stderr);
             }
@@ -992,8 +1045,10 @@ namespace {
             static std::atomic<int> n{0};
             if (n.fetch_add(1) < 3 || sr != VK_SUCCESS) {
                 std::fprintf(stderr,
-                    "lsfg-vk-measure: submit2 queue=%p pending=%zu downchain=%d returned=%d\n",
-                    static_cast<void*>(queue), pending.size(),
+                    "lsfg-vk-measure: submit2 queue=%p begin-device=%p pending=%zu downchain=%d returned=%d\n",
+                    static_cast<void*>(queue),
+                    static_cast<void*>(instance_info->devices.begin()->first),
+                    pending.size(),
                     static_cast<int>(sr), static_cast<int>(sr));
                 std::fflush(stderr);
             }
