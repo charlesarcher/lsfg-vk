@@ -385,8 +385,8 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
     CONSOLE_MARK="$(/usr/bin/wc -l < "$CONSOLE")"
   fi
   echo "console_mark=$CONSOLE_MARK"
-  timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" || true
-  echo "steam cli returned"
+  timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" >/dev/null 2>&1 &
+  echo "steam cli pid=$!"
   GAME_PID=""
   for _ in $(seq 1 120); do
     while read -r cand; do
