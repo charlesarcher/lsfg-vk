@@ -19,6 +19,46 @@ if [[ ! -f "$ENVFILE" ]]; then
   exit 1
 fi
 
+# Steam calls this with --game. Stay in Steam's environment so Proton
+# keeps its compat path. Do not rebuild. Do not start or look up a doubler.
+if [[ "${2:-}" == "--game" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENVFILE"
+  STEAM_ENV="${HOME}/.local/state/lsfg-vk/steam-game.env"
+  if [[ -f "$STEAM_ENV" ]]; then
+    now=$(date +%s)
+    mtime=$(stat -c %Y "$STEAM_ENV")
+    if (( now - mtime < 180 )); then
+      # shellcheck disable=SC1090
+      source "$STEAM_ENV"
+    fi
+  fi
+  if [[ "${LAYER_ON:-1}" == "0" || "${DISABLE_LSFGVK:-}" == "1" ]]; then
+    unset VK_INSTANCE_LAYERS
+    unset VK_LAYER_PATH
+    export DISABLE_LSFGVK=1
+    export LSFGVK_MEASURE=0
+  else
+    export VK_LAYER_PATH="${VK_LAYER_PATH:-$REPO/build/lsfg-vk-layer}"
+    export VK_INSTANCE_LAYERS="${VK_INSTANCE_LAYERS:-VK_LAYER_LSFGVK_frame_generation}"
+    export LSFGVK_MEASURE="${LSFGVK_MEASURE:-0}"
+    export LSFGVK_PROFILE="${LSFGVK_PROFILE:-re2-oneway}"
+  fi
+  export LSFGVK_CONFIG="${LSFGVK_CONFIG:-$REPO/tools/testing/profiles/${LSFG_CONFIG_NAME:-re2.toml}}"
+  export LSFGVK_APP_SOCK="${LSFGVK_APP_SOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/lsfg-vk/app.sock}"
+  export MESA_VK_DEVICE_SELECT="${MESA_VK_DEVICE_SELECT:-1002:7550}"
+  export DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-info}"
+  export VKD3D_DEBUG="${VKD3D_DEBUG:-warn}"
+  export DISABLE_VK_LAYER_VALVE_steam_fossilize=1
+  export DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1
+  export DISABLE_VK_LAYER_VALVE_steam_overlay=1
+  export DISABLE_VK_LAYER_VALVE_steam_overlay_1=1
+  unset ENABLE_VK_LAYER_VALVE_steam_fossilize_1
+  unset ENABLE_VK_LAYER_VALVE_steam_overlay_1
+  echo "profile $PROFILE: exec game, no doubler start" >&2
+  exec env -u LD_LIBRARY_PATH mangohud --dlsym "${@:3}"
+fi
+
 if [[ -z "${LSFG_LAUNCH_ISOLATED:-}" || -n "${LD_PRELOAD:-}${LD_LIBRARY_PATH:-}" ]]; then
   UID_N="$(id -u)"
   RUNTIME="/run/user/${UID_N}"
@@ -120,35 +160,6 @@ if /usr/bin/pgrep -x lsfg-vk-app >/dev/null \
 fi
 echo "stop: clear"
 rm -f "$SOCK"
-
-# No game command: Steam's box is launch_re2.sh, which calls this profile
-# with %command%. Do not start a doubler here. The nested call stops any
-# old one and starts a new one. steam:// does not return; do not wait on it.
-if [[ "$GAME_KIND" == "steam" && ${#GAME_ARGS[@]} -eq 0 ]]; then
-  echo "steam trigger: /usr/bin/steam steam://rungameid/${STEAM_APPID}"
-  echo "Steam calls $REPO/tools/games/launch_re2.sh, which calls this profile"
-  START_S="$(date +%s)"
-  timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" || true
-  echo "steam cli returned; waiting for the nested profile run"
-  for _ in $(seq 1 360); do
-    newest="$(ls -td /tmp/lsfg-runs/${PROFILE}/*/launch.log 2>/dev/null | head -1 || true)"
-    if [[ -n "$newest" ]]; then
-      mt="$(stat -c %Y "$newest")"
-      if [[ "$mt" -ge "$START_S" ]] && grep -q '^done$' "$newest"; then
-        echo "nested log=$newest"
-        exit 0
-      fi
-      if [[ "$mt" -ge "$START_S" ]] && grep -q 'REFUSING:' "$newest"; then
-        echo "nested log=$newest"
-        echo "nested refused"
-        exit 1
-      fi
-    fi
-    sleep 1
-  done
-  echo "REFUSING: nested profile run did not finish"
-  exit 1
-fi
 
 echo "--- verify_build ---"
 DIRTY_PATHS="$(git -C "$REPO" status --porcelain --untracked-files=no -- . ':!thirdparty')"
@@ -365,38 +376,30 @@ if [[ "$GAME_KIND" == "furmark" ]]; then
   echo "furmark exit=$?"
   set -e
 elif [[ "$GAME_KIND" == "steam" ]]; then
-  if [[ ${#GAME_ARGS[@]} -eq 0 ]]; then
-    echo "REFUSING: steam profile has no game command and was not the trigger path"
-    exit 1
-  fi
-  echo "--- game command ---"
-  printf '%q ' /usr/bin/mangohud --dlsym "${GAME_ARGS[@]}"; echo
+  write_steam_env
+  echo "Steam launch option calls $REPO/tools/games/launch_re2.sh, which calls the re2 profile"
+  echo "game start: /usr/bin/steam steam://rungameid/${STEAM_APPID}"
   CONSOLE="$HOME/.local/share/Steam/logs/console-linux.txt"
   CONSOLE_MARK=0
   if [[ -f "$CONSOLE" ]]; then
     CONSOLE_MARK="$(/usr/bin/wc -l < "$CONSOLE")"
   fi
   echo "console_mark=$CONSOLE_MARK"
-  /usr/bin/env -u LD_LIBRARY_PATH \
-    -u ENABLE_VK_LAYER_VALVE_steam_fossilize_1 \
-    -u ENABLE_VK_LAYER_VALVE_steam_overlay_1 \
-    VK_LAYER_PATH="$LAYER" \
-    VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation \
-    LSFGVK_MEASURE="${LSFGVK_MEASURE:-0}" \
-    LSFGVK_CONFIG="$CFG" \
-    LSFGVK_APP_SOCK="$SOCK" \
-    LSFGVK_PROFILE="${LSFGVK_PROFILE:-re2-oneway}" \
-    MESA_VK_DEVICE_SELECT="${MESA_VK_DEVICE_SELECT:-1002:7550}" \
-    DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-info}" \
-    VKD3D_DEBUG="${VKD3D_DEBUG:-warn}" \
-    LSFGVK_LAYER_DBG="${LSFGVK_LAYER_DBG:-0}" \
-    DISABLE_VK_LAYER_VALVE_steam_fossilize=1 \
-    DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1 \
-    DISABLE_VK_LAYER_VALVE_steam_overlay=1 \
-    DISABLE_VK_LAYER_VALVE_steam_overlay_1=1 \
-    /usr/bin/mangohud --dlsym "${GAME_ARGS[@]}" >"$OUT/game.log" 2>&1 &
-  GAME_PID=$!
-  echo "game pid=$GAME_PID"
+  timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" || true
+  echo "steam cli returned"
+  GAME_PID=""
+  for _ in $(seq 1 60); do
+    GAME_PID="$(/usr/bin/ps -eo pid,comm | /usr/bin/awk -v c="$GAME_COMM" '$2==c {print $1; exit}')"
+    if [[ -n "$GAME_PID" ]]; then
+      break
+    fi
+    sleep 1
+  done
+  if [[ -z "$GAME_PID" ]]; then
+    echo "HASH CHECK FAIL: $GAME_COMM did not start"
+    exit 1
+  fi
+  echo "game pid=$GAME_PID comm=$GAME_COMM"
   if [[ "$LAYER_ON" == "1" ]]; then
     check_layer_mapped "$GAME_PID"
   else
@@ -406,8 +409,9 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
   if [[ -n "${LSFG_MAX_TIME:-}" ]]; then
     sleep "$LSFG_MAX_TIME"
   fi
-  if [[ -f "$OUT/game.log" ]]; then
-    /usr/bin/grep -E 'lsfg-vk-measure:|DXVK:|vkd3d|Game: re2' "$OUT/game.log" \
+  CONSOLE="$HOME/.local/share/Steam/logs/console-linux.txt"
+  if [[ -f "$CONSOLE" ]]; then
+    /usr/bin/awk -v n="$CONSOLE_MARK" 'NR>n && /lsfg-vk-measure:|DXVK:|vkd3d|Game: re2/' "$CONSOLE" \
       > "$OUT/game-console.txt" || true
     echo "game-console lines=$(/usr/bin/wc -l < "$OUT/game-console.txt")"
   fi

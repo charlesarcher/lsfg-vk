@@ -16,4 +16,4 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-exec "$REPO_ROOT/tools/testing/profiles/re2.sh" "$@"
+exec "$REPO_ROOT/tools/testing/profiles/re2.sh" --game "$@"
