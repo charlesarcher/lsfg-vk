@@ -2573,6 +2573,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     char tb[96];
                     std::snprintf(tb, sizeof tb, "swapchain-destroyed=1");
                     ls::hud::traceLine("recv-close", state.streamId, tb);
+                    /* The output thread owns the card. Breaking here alone
+                       leaves it running against a swapchain the layer has just
+                       destroyed, and tick() then faults in the driver: the
+                       retired stream kept presenting while the new stream took
+                       HUD ownership. Set the flag the output loop already
+                       checks, so both threads wind down together. */
+                    failed.store(true, std::memory_order_relaxed);
                     break;
                 }
                 {
