@@ -2,8 +2,10 @@
 
 #include "lsfg-vk-common/ipc/socket.hpp"
 #include "lsfg-vk-common/ipc/protocol.hpp"
+#include "lsfg-vk-common/helpers/env_flag.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <array>
 #include <cerrno>
 #include <chrono>
@@ -631,8 +633,14 @@ namespace ls::ipc {
         // header: length prefix + magic + type
         std::array<std::byte, HEADER_LEN> header{};
         std::vector<int> fds{};
-        if (!recvFull(this->sockFd, header.data(), header.size(), deadline, fds))
+        if (!recvFull(this->sockFd, header.data(), header.size(), deadline, fds)) {
+            if (::envFlagOn("LSFGVK_MEASURE")) {
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: recv closed-by-peer fd=%d\n", this->sockFd);
+                std::fflush(stderr);
+            }
             throw ls::error("ipc connection closed by peer");
+        }
 
         std::span<const std::byte> cur = header;
         const uint32_t totalLen = getU32(cur);
@@ -646,8 +654,14 @@ namespace ls::ipc {
 
         std::vector<std::byte> payload(totalLen - HEADER_LEN);
         if (!payload.empty()
-                && !recvFull(this->sockFd, payload.data(), payload.size(), deadline, fds))
+                && !recvFull(this->sockFd, payload.data(), payload.size(), deadline, fds)) {
+            if (::envFlagOn("LSFGVK_MEASURE")) {
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: recv closed-mid-payload fd=%d\n", this->sockFd);
+                std::fflush(stderr);
+            }
             throw ls::error("ipc peer closed connection mid-payload");
+        }
 
         if (fds.size() > 1) {
             for (const int fd : fds) ::close(fd);

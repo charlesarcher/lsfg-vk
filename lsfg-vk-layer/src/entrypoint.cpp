@@ -694,6 +694,18 @@ namespace {
             res = swIt->second.get().df().AcquireNextImageKHR(
                 device, swapchain, timeout, semaphore, fence, pImageIndex);
         }
+        if (::envFlagOn("LSFGVK_MEASURE")) {
+            static std::atomic<uint64_t> n{0};
+            const uint64_t seq = n.fetch_add(1) + 1;
+            std::fprintf(stderr,
+                "lsfg-vk-measure: acquire seq=%llu tid=%ld result=%d idx=%u%s\n",
+                static_cast<unsigned long long>(seq),
+                static_cast<long>(::gettid()),
+                static_cast<int>(res),
+                pImageIndex ? *pImageIndex : 0u,
+                seq == 1 ? " first" : "");
+            std::fflush(stderr);
+        }
         if (dbgAcq) {
             const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
@@ -885,6 +897,17 @@ namespace {
                 info->pResults[i] = result;
         }
 
+        if (::envFlagOn("LSFGVK_MEASURE")) {
+            static std::atomic<uint64_t> n{0};
+            const uint64_t seq = n.fetch_add(1) + 1;
+            std::fprintf(stderr,
+                "lsfg-vk-measure: present seq=%llu tid=%ld result=%d%s\n",
+                static_cast<unsigned long long>(seq),
+                static_cast<long>(::gettid()),
+                static_cast<int>(result),
+                seq == 1 ? " first" : "");
+            std::fflush(stderr);
+        }
         return result;
 #pragma clang diagnostic pop
     }

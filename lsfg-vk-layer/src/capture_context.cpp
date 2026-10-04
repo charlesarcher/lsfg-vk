@@ -1087,6 +1087,12 @@ CaptureContext& CaptureContext::operator=(CaptureContext&& o) noexcept {
 }
 
 CaptureContext::~CaptureContext() {
+    if (this->ipcConn.has_value() && ::envFlagOn("LSFGVK_MEASURE")) {
+        std::fprintf(stderr,
+            "lsfg-vk-measure: socket close reason=CaptureContext-dtor fd=%d\n",
+            this->ipcConn->fd());
+        std::fflush(stderr);
+    }
     this->stopFrameThread();
     for (int fd : this->udmaMmapFds)
         if (fd >= 0) ::close(fd);
@@ -1972,12 +1978,25 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     } catch (const std::exception& e) {
         if (syncFd >= 0) ::close(syncFd);
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
-        // send()/recv() EPIPE handling → context marked dead → present hook
-        // throws named error; entrypoint's existing catch converts to VK_ERROR_*
+        if (::envFlagOn("LSFGVK_MEASURE")) {
+            std::fprintf(stderr,
+                "lsfg-vk-measure: FRAME send failed reason=%s\n", e.what());
+            std::fflush(stderr);
+        }
         throw ls::error(std::string("lsfg-vk: external stream error: send FRAME failed: ") + e.what(), e);
     }
 
     phaseLog(deferred ? "FRAME queued" : "FRAME sent");
+    if (::envFlagOn("LSFGVK_MEASURE")) {
+        static std::atomic<uint64_t> n{0};
+        const uint64_t seq = n.fetch_add(1) + 1;
+        if (seq <= 3) {
+            std::fprintf(stderr, "lsfg-vk-measure: FRAME seq=%llu %s\n",
+                static_cast<unsigned long long>(seq),
+                deferred ? "queued" : "sent");
+            std::fflush(stderr);
+        }
+    }
     static const bool noBusy = std::getenv("LSFGVK_NO_BUSY")
         && std::getenv("LSFGVK_NO_BUSY")[0] == '1';
     if (!noBusy)
