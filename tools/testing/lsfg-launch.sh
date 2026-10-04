@@ -19,7 +19,7 @@ if [[ ! -f "$ENVFILE" ]]; then
   exit 1
 fi
 
-if [[ -z "${LSFG_LAUNCH_ISOLATED:-}" ]]; then
+if [[ -z "${LSFG_LAUNCH_ISOLATED:-}" || -n "${LD_PRELOAD:-}${LD_LIBRARY_PATH:-}" ]]; then
   UID_N="$(id -u)"
   RUNTIME="/run/user/${UID_N}"
   WAYLAND="wayland-0"
@@ -137,6 +137,11 @@ if [[ "$GAME_KIND" == "steam" && ${#GAME_ARGS[@]} -eq 0 ]]; then
       if [[ "$mt" -ge "$START_S" ]] && grep -q '^done$' "$newest"; then
         echo "nested log=$newest"
         exit 0
+      fi
+      if [[ "$mt" -ge "$START_S" ]] && grep -q 'REFUSING:' "$newest"; then
+        echo "nested log=$newest"
+        echo "nested refused"
+        exit 1
       fi
     fi
     sleep 1
