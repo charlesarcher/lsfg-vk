@@ -106,7 +106,9 @@ mkdir -p "$OUT"
 LOG="$OUT/launch.log"
 STEAM_ENV="$HOME/.local/state/lsfg-vk/steam-game.env"
 
-APP="$REPO/build/lsfg-vk-app/lsfg-vk-app"
+# LSFG_APP lets a profile run a different doubler build (e.g. the ASan tree in
+# build-asan) without editing this script. Unset = the release binary.
+APP="${LSFG_APP:-$REPO/build/lsfg-vk-app/lsfg-vk-app}"
 LAYER="$REPO/build/lsfg-vk-layer"
 LAYER_SO="$LAYER/liblsfg-vk-layer.so"
 CFG="$REPO/tools/testing/profiles/$LSFG_CONFIG_NAME"
