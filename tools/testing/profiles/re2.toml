@@ -1,0 +1,27 @@
+version = 2
+
+[global]
+dll = "/mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll"
+allow_fp16 = true
+
+[[profile]]
+name = "app-oneway"
+gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
+presentation = "external"
+multiplier = 2
+# transport omitted: cross-GPU default is decoupled. Do not set udmabuf.
+output = "DP-7"
+hud = true
+
+[[profile]]
+name = "re2-oneway"
+active_in = [
+  "RESIDENT EVIL 2  BIOHAZARD RE2/re2.exe",
+  "RESIDENT EVIL 2  BIOHAZARD RE2\\re2.exe",
+]
+gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
+presentation = "external"
+multiplier = 2
+# transport omitted: cross-GPU default is decoupled. Do not set udmabuf.
+output = "DP-7"
+hud = true
