@@ -95,6 +95,10 @@ namespace ls::ipc {
         /// monotonic id assigned when the stream opens, so the trace lines for
         /// swapchain create / tick / close can be attributed to one stream
         uint32_t streamId{0};
+        /// game device name from HELLO; two live streams on the SAME device
+        /// mean the game recreated its swapchain (resolution change) and the
+        /// older one must be retired before the newer one drives the overlay
+        std::string deviceName;
         /// game device UUID carried over from HELLO (exporterDeviceUUID)
         std::array<uint8_t, 16> gameUuid{};
         /// negotiated drm modifier of the exchange layout
@@ -139,4 +143,11 @@ namespace ls::ipc {
         const std::atomic<bool>& stop, const vk::Vulkan& vk,
         lsfgvk::backend::Instance& backend, ls::GameConf conf,
         std::string_view session);
+
+/// install the callback runStream uses to retire older streams from the same
+    /// game device when a new one opens (a swapchain recreate). Without it two
+    /// output threads drive the one overlay card and its command buffer is
+    /// driven concurrently. Pass nullptr to disable.
+    void setRetireOlderStream(
+        std::function<void(uint32_t newStreamId, const std::string& deviceName)> fn);
 }

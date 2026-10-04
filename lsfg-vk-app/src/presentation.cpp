@@ -1734,6 +1734,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (g_imguiHud) {
                     g_imguiHud->traceStreamId.store(state.streamId,
                         std::memory_order_relaxed);
+                    g_imguiHud->adoptStream(state.streamId);
                     g_imguiHud->tick(static_cast<float>(hdt));
                 }
             } catch (const std::exception& e) {

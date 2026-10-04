@@ -82,6 +82,16 @@ namespace ls::hud {
         /// stream id stamped onto the tick trace lines; set by the caller
         /// before tick so concurrent ticks from different streams are visible
         std::atomic<uint32_t> traceStreamId{0};
+        /// bump to hand the next tick its own command buffer. A game that
+        /// recreates its swapchain runs two output threads briefly; the card's
+        /// imgui state (ImGui context, the two rt slots, rtFence, and the
+        /// ImGui_ImplVulkan vertex/index pair) is process-wide and cannot be
+        /// split per stream, so ownership is transferred instead: the new
+        /// stream takes a fresh command buffer and the old stream's ticks
+        /// become no-ops. A mutex would serialise the two streams but would
+        /// also stall the present path behind the card, which runs every
+        /// present.
+        void adoptStream(uint32_t streamId);
 
         /// render one frame (call at ~15 Hz from the OUTPUT thread):
         /// NewFrame -> widgets -> submit RT upload. cheap when hidden.
@@ -134,7 +144,12 @@ namespace ls::hud {
         bool fontsBuilt{false};
         bool fontFenceSignaled{false};   // font fence lives in imgui backend
         bool rtGeneral[2]{false, false};
-        class vk::CommandBuffer cmdbuf;
+        /// stream that currently owns the card; only its tick records
+        std::atomic<uint32_t> ownerStreamId{0};
+        /// bumped on every ownership change so the next tick rebuilds cmdbuf
+        std::atomic<uint32_t> cmdbufGeneration{0};
+        uint32_t cmdbufGen{0};                       ///< generation cmdbuf was built at
+        std::unique_ptr<vk::CommandBuffer> cmdbuf;
         float fadeLock{0.f};                     // 0..1 synthesized alpha
         bool visible{true};
         std::string fontPath;

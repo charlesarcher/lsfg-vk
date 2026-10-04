@@ -17,6 +17,7 @@
 #include "lsfg-vk-common/frame_dbg.hpp"
 #include "gui.hpp"
 #include "lsfg-vk-app/presentation.hpp"
+#include "lsfg-vk-app/imgui_hud.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
@@ -436,6 +437,26 @@ int main(int argc, char** argv) {
         std::map<int, ls::ipc::StreamState> streams;
         std::mutex streamsMtx;
         std::condition_variable streamsCv;  // signaled when a stream ends
+        /* A swapchain recreate opens a NEW connection while the old one is
+           still live. Both would drive the one overlay card. Retire the older
+           stream on the same device by shutting down its socket, which makes
+           its runStream return and its thread erase the registry entry. */
+        ls::ipc::setRetireOlderStream(
+            [&streams, &streamsMtx](uint32_t newId, const std::string& dev) {
+                std::vector<int> doomed;
+                {
+                    std::lock_guard<std::mutex> lk(streamsMtx);
+                    for (const auto& [fd, st] : streams)
+                        if (st.streamId != 0 && st.streamId != newId
+                                && st.deviceName == dev)
+                            doomed.push_back(fd);
+                }
+                for (int fd : doomed) {
+                    ls::hud::traceLine("stream-retire", newId,
+                        "doomed-fd=" + std::to_string(fd) + " dev='" + dev + "'");
+                    ::shutdown(fd, SHUT_RDWR);
+                }
+            });
 
         while (!g_stop.load()) {
             pollfd pfd[2] = {

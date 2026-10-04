@@ -129,7 +129,8 @@ namespace ls::hud {
     bool ImGuiHud::drawing() { return g_visible.load() || g_alpha.load() > 0.02f; }
 
     ImGuiHud::ImGuiHud(const vk::Vulkan& vkIn, VkExtent2D outputExtent, VkFormat format)
-        : vk(vkIn), outExtent(outputExtent), format(format), cmdbuf(vkIn) {
+        : vk(vkIn), outExtent(outputExtent), format(format),
+          cmdbuf(std::make_unique<vk::CommandBuffer>(vkIn)), cmdbufGen(0) {
         // RT size: ~output/4 with a sane floor, capped so ImGui's vertex count
         // stays negligible vs the present loop.
         const uint32_t w = std::max<uint32_t>(320, outputExtent.width / 4);
@@ -1028,9 +1029,35 @@ void ImGuiHud::setupThemeAndFont() {
         }
         this->dumpPending = false;
     }
+    void ImGuiHud::adoptStream(uint32_t streamId) {
+        const uint32_t prev = this->ownerStreamId.exchange(streamId);
+        if (prev == streamId)
+            return;
+        /* Only the owning stream may record into the card. A retired stream
+           still presents for a few ms and its tick would otherwise drive the
+           same command buffer concurrently, which is the SIGSEGV. Checked
+           with a plain load, never a wait: the present path must not block. */
+        this->traceStreamId.store(streamId, std::memory_order_relaxed);
+        ls::hud::traceLine("hud-adopt", streamId,
+            "previous-owner=" + std::to_string(prev));
+        this->cmdbufGeneration.fetch_add(1, std::memory_order_acq_rel);
+    }
+
     void ImGuiHud::tick(float dt) {
         this->ensureFade(dt);
         if (this->fadeLock <= 0.02f) return;          // zero-cost hidden path
+        /* ONE owner stream drives the card. A retired stream keeps presenting
+           but must not touch the shared command buffer. */
+        if (this->ownerStreamId.load(std::memory_order_acquire)
+                != this->traceStreamId.load(std::memory_order_relaxed))
+            return;
+        /* ownership changed: the previous owner's recording may still be
+           open, so drop that command buffer and record into a fresh one. */
+        const uint32_t gen = this->cmdbufGeneration.load(std::memory_order_acquire);
+        if (gen != this->cmdbufGen) {
+            this->cmdbufGen = gen;
+            this->cmdbuf = std::make_unique<vk::CommandBuffer>(this->vk);
+        }
         /* multi-stream trace: the card is ONE process-wide object but tick is
            called from each stream's output thread, so log entry/exit with the
            stream id to show whether two threads are ever inside at once. */
@@ -1076,7 +1103,7 @@ void ImGuiHud::setupThemeAndFont() {
                 ImGui::GetDrawData()->TotalVtxCount,
                 ImGui::GetDrawData()->TotalIdxCount);
         // ---- record RT renderpass + imgui vertices ------------------------
-        this->cmdbuf.begin(this->vk);
+        this->cmdbuf->begin(this->vk);
         /* DIAG: when dumping, the clear proves the copy path with RED */
         /* S40+ card-over: transparent-black clear (premult zeros). */
         VkClearValue clear{};
@@ -1089,7 +1116,7 @@ void ImGuiHud::setupThemeAndFont() {
         rbi.clearValueCount = 1;
         rbi.pClearValues = &clear;
         if (auto brp = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass"); brp)
-            brp(this->cmdbuf.raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
+            brp(this->cmdbuf->raw(), &rbi, VK_SUBPASS_CONTENTS_INLINE);
         // Both slots share one ImGui vertex/index pair. Wait every slot that
         // has been submitted, or the other slot's draw is still in flight when
         // RenderDrawData destroys that pair. Reset only next, the slot this
@@ -1104,13 +1131,13 @@ void ImGuiHud::setupThemeAndFont() {
             (*this->rtFence[next]).reset(this->vk);
             this->hostDump();
         }
-        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf.raw());
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), this->cmdbuf->raw());
         /* DIAG: after draw, CmdClearColorImage cyan to prove the
            canvas accepts writes in THIS pass sequence (runs before
            EndRenderPass = inside the pass = attachment write) */
         (void)0;
         if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
-            erp(this->cmdbuf.raw());
+            erp(this->cmdbuf->raw());
         /* S40+ PM pass: rt[active] holds straight-alpha imgui output; render
            the PREMULTIPLIED copy into rt[other] with the pm pipeline. The
            present-side blit samples rt[other] (markRead swaps the roles). */
@@ -1127,7 +1154,7 @@ void ImGuiHud::setupThemeAndFont() {
             const VkImageMemoryBarrier bars2[1] = { toShader };
             PFN_vkCmdPipelineBarrier barrier2 = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier");
             if (barrier2)
-                barrier2(this->cmdbuf.raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                barrier2(this->cmdbuf->raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                     0, 0, nullptr, 0, nullptr, 1, bars2);
             if (auto brp = devPfn<PFN_vkCmdBeginRenderPass>(vk, "vkCmdBeginRenderPass"); brp) {
@@ -1140,25 +1167,25 @@ void ImGuiHud::setupThemeAndFont() {
                 };
                 rbi2.clearValueCount = 1;
                 rbi2.pClearValues = &zc;
-                brp(this->cmdbuf.raw(), &rbi2, VK_SUBPASS_CONTENTS_INLINE);
+                brp(this->cmdbuf->raw(), &rbi2, VK_SUBPASS_CONTENTS_INLINE);
             }
             if (auto bsc = devPfn<PFN_vkCmdBindPipeline>(vk, "vkCmdBindPipeline"); bsc)
-                bsc(this->cmdbuf.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS, this->pmPipeline);
+                bsc(this->cmdbuf->raw(), VK_PIPELINE_BIND_POINT_GRAPHICS, this->pmPipeline);
             VkViewport vpM{ 0.f, 0.f,
                 static_cast<float>(this->rtSize.width),
                 static_cast<float>(this->rtSize.height), 0.f, 1.f };
             VkRect2D scM{ { 0, 0 }, { this->rtSize.width, this->rtSize.height } };
             if (auto sv = devPfn<PFN_vkCmdSetViewport>(vk, "vkCmdSetViewport"); sv)
-                sv(this->cmdbuf.raw(), 0, 1, &vpM);
+                sv(this->cmdbuf->raw(), 0, 1, &vpM);
             if (auto ss = devPfn<PFN_vkCmdSetScissor>(vk, "vkCmdSetScissor"); ss)
-                ss(this->cmdbuf.raw(), 0, 1, &scM);
+                ss(this->cmdbuf->raw(), 0, 1, &scM);
             if (auto bds = devPfn<PFN_vkCmdBindDescriptorSets>(vk, "vkCmdBindDescriptorSets"); bds)
-                bds(this->cmdbuf.raw(), VK_PIPELINE_BIND_POINT_GRAPHICS,
+                bds(this->cmdbuf->raw(), VK_PIPELINE_BIND_POINT_GRAPHICS,
                     this->pmPipelineLayout, 0, 1, &this->pmSet[srcSlot], 0, nullptr);
             if (auto draw = devPfn<PFN_vkCmdDraw>(vk, "vkCmdDraw"); draw)
-                draw(this->cmdbuf.raw(), 3, 1, 0, 0);
+                draw(this->cmdbuf->raw(), 3, 1, 0, 0);
             if (auto erp = devPfn<PFN_vkCmdEndRenderPass>(vk, "vkCmdEndRenderPass"); erp)
-                erp(this->cmdbuf.raw());
+                erp(this->cmdbuf->raw());
         }
         /* S40+ DIAG dump: LSFGVK_IMGUI_DUMP=1 writes the PM image once. */
         static const bool dumpPm = getenv("LSFGVK_IMGUI_DUMP") != nullptr;
@@ -1209,7 +1236,7 @@ void ImGuiHud::setupThemeAndFont() {
                 VK_ACCESS_TRANSFER_READ_BIT,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             if (auto pfn = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier"); pfn)
-                pfn(this->cmdbuf.raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                pfn(this->cmdbuf->raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar);
             VkBufferImageCopy reg{ .bufferOffset = 0,
                 .bufferRowLength = this->rtSize.width,
@@ -1219,9 +1246,9 @@ void ImGuiHud::setupThemeAndFont() {
                 .imageExtent = { this->rtSize.width, this->rtSize.height, 1 } };
             /* DIAG smoke 1: fill the buffer 0xEE to prove host mem */
             if (auto pfn = devPfn<PFN_vkCmdFillBuffer>(vk, "vkCmdFillBuffer"); pfn)
-                pfn(this->cmdbuf.raw(), buf, 0, VK_WHOLE_SIZE, 0xEEEEEEEE);
+                pfn(this->cmdbuf->raw(), buf, 0, VK_WHOLE_SIZE, 0xEEEEEEEE);
             if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
-                pfn(this->cmdbuf.raw(), this->pmImg->handle(),
+                pfn(this->cmdbuf->raw(), this->pmImg->handle(),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf, 1, &reg);
             /* second copy: the straight-alpha imgui slot.
                S41: flips the SAME slot the copy reads (rt[active]
@@ -1234,7 +1261,7 @@ void ImGuiHud::setupThemeAndFont() {
                 VK_ACCESS_TRANSFER_READ_BIT,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
             if (auto pfn = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier"); pfn)
-                pfn(this->cmdbuf.raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                pfn(this->cmdbuf->raw(), VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &bar2);
             VkBufferImageCopy reg2{ .bufferOffset = 0,
                 .bufferRowLength = this->rtSize.width,
@@ -1251,7 +1278,7 @@ void ImGuiHud::setupThemeAndFont() {
             if (auto pfn = devPfn<PFN_vkBindBufferMemory>(vk, "vkBindBufferMemory"); pfn)
                 pfn(vk.dev(), buf2, mem2, 0);
             if (auto pfn = devPfn<PFN_vkCmdCopyImageToBuffer>(vk, "vkCmdCopyImageToBuffer"); pfn)
-                pfn(this->cmdbuf.raw(), this->rt[this->active]->handle(),
+                pfn(this->cmdbuf->raw(), this->rt[this->active]->handle(),
                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, buf2, 1, &reg2);
             /* S41: FLIP BACK BOTH slots — every dump copy leaves its
                source in TRANSFER_SRC; the co over-pass samples
@@ -1273,7 +1300,7 @@ void ImGuiHud::setupThemeAndFont() {
                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) };
             if (auto pfn = devPfn<PFN_vkCmdPipelineBarrier>(vk, "vkCmdPipelineBarrier"); pfn)
-                pfn(this->cmdbuf.raw(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+                pfn(this->cmdbuf->raw(), VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
                     0, nullptr, 0, nullptr, 2, backBars);
             this->dumpBuffer2 = buf2;
@@ -1283,8 +1310,8 @@ void ImGuiHud::setupThemeAndFont() {
             this->dumpMemory = mem;
             this->dumpPending = true;
         }
-        this->cmdbuf.end(this->vk);
-        this->cmdbuf.submit(this->vk, {}, VK_NULL_HANDLE, 0,
+        this->cmdbuf->end(this->vk);
+        this->cmdbuf->submit(this->vk, {}, VK_NULL_HANDLE, 0,
             {}, VK_NULL_HANDLE, 0, (*this->rtFence[next]).handle());
         this->rtFenceSignaled[next] = true;
         this->rtGeneral[next] = true;

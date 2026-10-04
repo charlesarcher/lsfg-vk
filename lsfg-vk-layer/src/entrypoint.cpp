@@ -657,7 +657,7 @@ namespace {
 
             layer_info->root.update(); // ensure config is up to date
 
-            const bool isolated = layer_info->root.externalPresentation()
+            bool isolated = layer_info->root.externalPresentation()
                 && isolatedSwapchainEnabled();
 
             VkSwapchainCreateInfoKHR newInfo = *info;
@@ -688,12 +688,30 @@ namespace {
                         measureCreateLog(seq, "handshake", 0, "createSwapchainContext");
                     } catch (const std::exception& e) {
                         measureCreateLog(seq, "handshake", -1, e.what());
-                        throw;
+                        /* the doubler is gone or unreachable. Retiring the
+                           isolated swapchain here and returning the error makes
+                           the game recreate in a tight loop forever (408
+                           creates in 5 s on 2026-10-04). Fall back to normal
+                           presentation: the game owns its real swapchain and
+                           presents to the display directly. Once per process. */
+                        static std::atomic<bool> warned{false};
+                        if (!warned.exchange(true))
+                            std::cerr << "lsfg-vk: WARNING handshake with the doubler failed ("
+                                << e.what() << "); falling back to normal presentation. "
+                                "Further handshake failures will not be reported.\n";
+                        instance_info->swapchains.erase(handle);
+                        instance_info->swapchainInfos.erase(handle);
+                        layer_info->root.removeSwapchainContext(handle);
+                        if (isIsolated(handle))
+                            destroyIsolated(it->second, handle);
+                        isolated = false;   // fall through to the ICD path
                     }
-                    instance_info->swapchains.emplace(handle, ls::R<vk::Vulkan>(it->second));
-                    *swapchain = handle;
-                    measureCreateLog(seq, "final", 0, "VK_SUCCESS");
-                    return VK_SUCCESS;
+                    if (isolated) {
+                        instance_info->swapchains.emplace(handle, ls::R<vk::Vulkan>(it->second));
+                        *swapchain = handle;
+                        measureCreateLog(seq, "final", 0, "VK_SUCCESS");
+                        return VK_SUCCESS;
+                    }
                 } catch (...) {
                     instance_info->swapchains.erase(handle);
                     instance_info->swapchainInfos.erase(handle);
@@ -749,7 +767,18 @@ namespace {
                 measureCreateLog(seq, "handshake", 0, "createSwapchainContext");
             } catch (const std::exception& e) {
                 measureCreateLog(seq, "handshake", -1, e.what());
-                throw;
+                /* the real swapchain already exists and the game can present to
+                   it directly, so a dead doubler must not fail the create: that
+                   is what drove the 408-create spin. Keep the swapchain, drop
+                   our context, and let the game present normally. Once. */
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true))
+                    std::cerr << "lsfg-vk: WARNING handshake with the doubler failed ("
+                        << e.what() << "); falling back to normal presentation. "
+                        "Further handshake failures will not be reported.\n";
+                instance_info->swapchainInfos.erase(*swapchain);
+                measureCreateLog(seq, "final", static_cast<int>(res), "return-no-handshake");
+                return res;
             }
 
             instance_info->swapchains.emplace(*swapchain,

@@ -43,6 +43,18 @@
 
 using namespace ls::ipc;
 
+namespace {
+    /* set by the accept loop: retire every OTHER live stream that came from the
+       same game device, so a swapchain recreate does not leave two output
+       threads driving the one overlay card. nullptr = no registry (tests). */
+    std::function<void(uint32_t, const std::string&)> s_retireOlderStream;
+}
+
+void ls::ipc::setRetireOlderStream(
+        std::function<void(uint32_t, const std::string&)> fn) {
+    s_retireOlderStream = std::move(fn);
+}
+
 StreamState::~StreamState() {
     ls::hud::traceLine("stream-close", this->streamId,
         "tid=" + std::to_string(static_cast<long>(::gettid()))
@@ -180,12 +192,22 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
               << formatName(hello->vkFormat) << "\n";
     static std::atomic<uint32_t> s_nextStreamId{1};
     state.streamId = s_nextStreamId.fetch_add(1, std::memory_order_relaxed);
+    state.deviceName = helloDeviceName(*hello);
     ls::hud::traceLine("stream-open", state.streamId,
         "pid=" + std::to_string(static_cast<long>(::getpid()))
         + " tid=" + std::to_string(static_cast<long>(::gettid()))
         + " dev='" + helloDeviceName(*hello) + "'"
         + " extent=" + std::to_string(hello->width) + "x" + std::to_string(hello->height)
         + " fmt=" + formatName(hello->vkFormat));
+    /* A game that recreates its swapchain (a resolution change) opens a NEW
+       connection while the OLD one is still live. Both then drive the one
+       process-wide overlay card: two output threads inside ImGuiHud::tick on
+       the card's single command buffer, which the 2026-10-04 trace shows
+       overlapping (stream 1 seq=2 entered, stream 2 seq=3 entered before
+       stream 1's seq=2 exited) and which SIGSEGVs in vkEndCommandBuffer.
+       Retire the older stream FIRST so only one stream ever owns the card. */
+    if (auto retire = s_retireOlderStream)
+        retire(state.streamId, state.deviceName);
     ls::resolveUnsetTransport(conf, helloDeviceName(*hello), conf.gpu.value_or(""));
 
     // 2. NEGOTIATED: the staging images (created below, step 3) are ALWAYS
