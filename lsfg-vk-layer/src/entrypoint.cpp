@@ -945,7 +945,16 @@ namespace {
                         .pWaitSemaphores = p.waits.data(),
                         .pWaitDstStageMask = stages.data(),
                     };
-                    (void)p.vk->df().QueueSubmit(q, 1, &si, VK_NULL_HANDLE);
+                    const VkResult wr = p.vk->df().QueueSubmit(q, 1, &si, VK_NULL_HANDLE);
+                    if (::envFlagOn("LSFGVK_MEASURE")) {
+                        static std::atomic<int> n{0};
+                        if (n.fetch_add(1) < 3 || wr != VK_SUCCESS) {
+                            std::fprintf(stderr,
+                                "lsfg-vk-measure: submit2-wait QueueSubmit queue=%p waits=%zu result=%d\n",
+                                static_cast<void*>(q), p.waits.size(), static_cast<int>(wr));
+                            std::fflush(stderr);
+                        }
+                    }
                 }
                 try {
                     if (p.recycle != VK_NULL_HANDLE)
@@ -966,11 +975,29 @@ namespace {
                 instance_info->funcs.GetDeviceProcAddr(
                     instance_info->devices.begin()->first, "vkQueueSubmit2"));
         }
-        if (!next || next == myvkQueueSubmit2)
+        if (!next || next == myvkQueueSubmit2) {
+            if (::envFlagOn("LSFGVK_MEASURE")) {
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: submit2 queue=%p pending=%zu downchain=not-called returned=-8 reason=%s\n",
+                    static_cast<void*>(queue), pending.size(),
+                    next == myvkQueueSubmit2 ? "next-is-self" : "next-null");
+                std::fflush(stderr);
+            }
             return VK_ERROR_FEATURE_NOT_PRESENT;
+        }
         if (dbg && is1440)
             std::fprintf(stderr, "lsfg-vk-layer: [dbg] Submit2 ICD 1440\n");
         const VkResult sr = next(queue, submitCount, pSubmits, fence);
+        if (::envFlagOn("LSFGVK_MEASURE")) {
+            static std::atomic<int> n{0};
+            if (n.fetch_add(1) < 3 || sr != VK_SUCCESS) {
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: submit2 queue=%p pending=%zu downchain=%d returned=%d\n",
+                    static_cast<void*>(queue), pending.size(),
+                    static_cast<int>(sr), static_cast<int>(sr));
+                std::fflush(stderr);
+            }
+        }
         if (dbg && is1440)
             std::fprintf(stderr, "lsfg-vk-layer: [dbg] Submit2 EXIT 1440 result=%d\n",
                 static_cast<int>(sr));
