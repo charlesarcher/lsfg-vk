@@ -276,9 +276,9 @@ write_steam_env() {
     printf 'export LSFGVK_APP_SOCK=%q\n' "$SOCK"
     printf 'export LSFGVK_CONFIG=%q\n' "$CFG"
     printf 'export MESA_VK_DEVICE_SELECT=%q\n' "${MESA_VK_DEVICE_SELECT:-1002:7550}"
-    printf 'export LSFGVK_LAYER_DBG=%q\n' "${LSFGVK_LAYER_DBG:-0}"
-    printf 'export PROTON_LOG=%q\n' "${PROTON_LOG:-0}"
-    printf 'export DXVK_LOG_LEVEL=%q\n' "${DXVK_LOG_LEVEL:-info}"
+    printf 'export LSFGVK_LAYER_DBG=%q\n' "${LSFGVK_LAYER_DBG:-1}"
+    printf 'export PROTON_LOG=%q\n' "${PROTON_LOG:-1}"
+    printf 'unset DXVK_LOG_LEVEL\n' 
     printf 'export VKD3D_DEBUG=%q\n' "${VKD3D_DEBUG:-warn}"
     echo "export DISABLE_VK_LAYER_VALVE_steam_fossilize=1"
     echo "export DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1"
@@ -316,6 +316,9 @@ fi
   LSFGVK_CONFIG="$CFG" \
   LSFGVK_APP_SOCK="$SOCK" \
   LSFGVK_MEASURE="${LSFGVK_MEASURE:-0}" \
+  LSFGVK_APP_DBG=1 \
+  LSFGVK_LAYER_DBG=1 \
+  PROTON_LOG=1 \
   LSFGVK_LAYER_SHELL=1 \
   LSFGVK_HUD=imgui \
   "${APP_ENV[@]}" \

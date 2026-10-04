@@ -349,6 +349,14 @@ namespace ls::ipc {
         return release;
     }
 
+    std::vector<std::byte> encodePayload(const Close&) { return {}; }
+
+    Close decodeClose(const std::span<const std::byte> payload) {
+        if (!payload.empty())
+            throw ls::error("malformed CLOSE payload: expected empty");
+        return {};
+    }
+
     Message decodeMessage(const MsgType type, const std::span<const std::byte> payload) {
         switch (type) {
             case MsgType::Hello: return decodeHello(payload);
@@ -358,6 +366,7 @@ namespace ls::ipc {
             case MsgType::Ready: return decodeReady(payload);
             case MsgType::Frame: return decodeFrame(payload);
             case MsgType::Release: return decodeRelease(payload);
+            case MsgType::Close: return decodeClose(payload);
         }
         throw ls::error("unknown ipc message type " + std::to_string(static_cast<int>(type)));
     }

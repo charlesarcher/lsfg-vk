@@ -1395,6 +1395,14 @@ namespace {
         if (it == instance_info->devices.end())
             return;
 
+        /* The game destroyed the swapchain behind this stream. Tell the app so
+           it retires THIS stream. This is the only correct retirement signal:
+           a second connection from the same device is not evidence the first
+           is dead, which is what the old retire-by-device rule assumed. Done
+           before the tombstone early-return below, which exists to protect the
+           isolated images, not the IPC stream. */
+        layer_info->root.notifySwapchainClose(swapchain);
+
         // vkd3d recreates inside present_callback: Destroy 1080 then
         // Create 1440 then Present 1440 on the same thread. Tearing down
         // isolated images / CaptureContext here is the 1080→1440 freeze.

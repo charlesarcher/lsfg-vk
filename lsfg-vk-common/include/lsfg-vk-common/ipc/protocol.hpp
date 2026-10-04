@@ -47,7 +47,12 @@ namespace ls::ipc {
         Staging = 4,
         Ready = 5,
         Frame = 6,
-        Release = 7
+        Release = 7,
+        /// C→A the game destroyed its swapchain; this stream is finished.
+        /// Retiring a stream on this message is the ONLY correct trigger:
+        /// a second connection from the same device is not evidence that the
+        /// first one is dead.
+        Close = 8
     };
 
     /// human-readable name of a message type, for error messages
@@ -60,6 +65,7 @@ namespace ls::ipc {
             case MsgType::Ready: return "READY";
             case MsgType::Frame: return "FRAME";
             case MsgType::Release: return "RELEASE";
+            case MsgType::Close: return "CLOSE";
         }
         return "<unknown>";
     }
@@ -137,9 +143,13 @@ namespace ls::ipc {
         uint32_t stagingIdx;
     };
 
+    /// C→A the game destroyed the swapchain behind this stream. The app retires
+    /// only the stream that receives it. Sent from vkDestroySwapchainKHR.
+    struct Close { };
+
     /// any protocol message; STAGING/FRAME additionally carry one fd each,
     /// managed by the Connection (see socket.hpp), never inside the payload
-    using Message = std::variant<Hello, Negotiated, ErrorMsg, Staging, Ready, Frame, Release>;
+    using Message = std::variant<Hello, Negotiated, ErrorMsg, Staging, Ready, Frame, Release, Close>;
 
     /// message type associated with a concrete message struct
     template<typename T>
@@ -151,6 +161,7 @@ namespace ls::ipc {
         else if constexpr (std::is_same_v<T, Ready>) return MsgType::Ready;
         else if constexpr (std::is_same_v<T, Frame>) return MsgType::Frame;
         else if constexpr (std::is_same_v<T, Release>) return MsgType::Release;
+        else if constexpr (std::is_same_v<T, Close>) return MsgType::Close;
         else static_assert(!sizeof(T), "not a protocol message type");
     }
 

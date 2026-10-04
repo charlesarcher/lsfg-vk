@@ -96,6 +96,9 @@ namespace lsfgvk::layer {
         /// remove swapchain context
         /// @param swapchain swapchain handle
         void removeSwapchainContext(VkSwapchainKHR swapchain);
+        /// tell the app the swapchain behind an external stream is gone, so it
+        /// retires exactly that stream. No-op for non-external swapchains.
+        void notifySwapchainClose(VkSwapchainKHR swapchain);
     private:
         ls::WatchedConfig config;
         std::optional<ls::GameConf> active_profile;

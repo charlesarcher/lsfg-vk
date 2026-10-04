@@ -60,6 +60,11 @@ namespace lsfgvk::layer {
         /// work before destroying semaphores/images
         ~CaptureContext();
 
+        /// Tell the app this stream's swapchain is gone, so it retires THIS
+        /// stream and no other. Sent from the layer's vkDestroySwapchainKHR.
+        /// Best effort: never throws, never blocks the destroy path.
+        void notifyClose();
+
         /// present hook for external mode: blit → export sync-fd → FRAME → forward present.
         /// @param vk vulkan wrapper for the game device
         /// @param queue presentation queue from vkQueuePresentKHR

@@ -2565,6 +2565,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 gotFrame = true;
                 const auto recvTs = Clock::now();
                 auto msg = conn.receive(std::nullopt);
+                /* CLOSE: the layer saw vkDestroySwapchainKHR for THIS
+                   stream's swapchain. This is the only correct retirement
+                   trigger. A second connection from the same device is not
+                   evidence the first is dead. */
+                if (std::get_if<ls::ipc::Close>(&msg)) {
+                    char tb[96];
+                    std::snprintf(tb, sizeof tb, "swapchain-destroyed=1");
+                    ls::hud::traceLine("recv-close", state.streamId, tb);
+                    break;
+                }
                 {
                     char tb[160];
                     std::snprintf(tb, sizeof tb,

@@ -1086,6 +1086,18 @@ CaptureContext& CaptureContext::operator=(CaptureContext&& o) noexcept {
     return *this;
 }
 
+void CaptureContext::notifyClose() {
+    if (!this->ipcConn.has_value())
+        return;
+    try {
+        this->ipcConn->send(ls::ipc::Close{});
+        std::fprintf(stderr, "lsfg-vk: sent CLOSE for this stream\n");
+        std::fflush(stderr);
+    } catch (const std::exception&) {
+        // the app is already gone; nothing to retire
+    }
+}
+
 CaptureContext::~CaptureContext() {
     if (this->ipcConn.has_value() && ::envFlagOn("LSFGVK_MEASURE")) {
         std::fprintf(stderr,

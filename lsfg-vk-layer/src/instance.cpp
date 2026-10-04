@@ -536,6 +536,22 @@ void Root::removeSwapchainContext(VkSwapchainKHR swapchain) {
     this->swapchains.erase(swapchain);
 }
 
+void Root::notifySwapchainClose(VkSwapchainKHR swapchain) {
+    ContextVariant* ctx = nullptr;
+    {
+        const std::shared_lock lock(this->mutex);
+        const auto it = this->swapchains.find(swapchain);
+        if (it == this->swapchains.end())
+            return;
+        ctx = const_cast<ContextVariant*>(&it->second);
+    }
+    std::visit([](auto& c) {
+        using T = std::decay_t<decltype(c)>;
+        if constexpr (std::is_same_v<T, CaptureContext>)
+            c.notifyClose();
+    }, *ctx);
+}
+
 VkResult Root::presentSwapchain(VkSwapchainKHR swapchain,
         const vk::Vulkan& vk, VkQueue queue,
         void* next_chain, uint32_t imageIdx,

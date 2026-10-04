@@ -443,20 +443,17 @@ int main(int argc, char** argv) {
            its runStream return and its thread erase the registry entry. */
         ls::ipc::setRetireOlderStream(
             [&streams, &streamsMtx](uint32_t newId, const std::string& dev) {
-                std::vector<int> doomed;
-                {
-                    std::lock_guard<std::mutex> lk(streamsMtx);
-                    for (const auto& [fd, st] : streams)
-                        if (st.streamId != 0 && st.streamId != newId
-                                && st.deviceName == dev)
-                            doomed.push_back(fd);
-                }
-                for (int fd : doomed) {
-                    char tb[128];
-                    std::snprintf(tb, sizeof tb, "doomed-fd=%d", fd);
-                    ls::hud::traceLine("stream-retire", newId, tb);
-                    ::shutdown(fd, SHUT_RDWR);
-                }
+                /* Retiring by device name was wrong: it matched the OLD
+                   stream's socket and shut it down the instant the new 1440
+                   stream opened. The old stream's runPresent then tore down the
+                   process-wide overlay WSI and deleted g_imguiHud, so the
+                   window that only a 1440 stream is allowed to create was
+                   destroyed before it existed. Nothing survived the switch.
+                   Retirement is now driven by the layer's close message. */
+                std::lock_guard<std::mutex> lk(streamsMtx);
+                for (const auto& [fd, st] : streams)
+                    if (st.streamId == newId)
+                        ls::hud::traceLine("stream-adopt", newId, "owner=1");
             });
 
         while (!g_stop.load()) {
