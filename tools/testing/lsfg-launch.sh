@@ -388,18 +388,25 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
   timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" || true
   echo "steam cli returned"
   GAME_PID=""
-  for _ in $(seq 1 60); do
-    GAME_PID="$(/usr/bin/ps -eo pid,comm | /usr/bin/awk -v c="$GAME_COMM" '$2==c {print $1; exit}')"
+  for _ in $(seq 1 120); do
+    while read -r cand; do
+      [[ -z "$cand" ]] && continue
+      if /usr/bin/awk '/liblsfg-vk-layer\.so/ {found=1; exit} END {exit !found}' \
+          "/proc/$cand/maps" 2>/dev/null; then
+        GAME_PID="$cand"
+        break
+      fi
+    done < <(/usr/bin/ps -eo pid,comm | /usr/bin/awk -v c="$GAME_COMM" '$2==c {print $1}')
     if [[ -n "$GAME_PID" ]]; then
       break
     fi
-    sleep 1
+    sleep 0.25
   done
   if [[ -z "$GAME_PID" ]]; then
-    echo "HASH CHECK FAIL: $GAME_COMM did not start"
+    echo "HASH CHECK FAIL: no $GAME_COMM with liblsfg-vk-layer.so mapped"
     exit 1
   fi
-  echo "game pid=$GAME_PID comm=$GAME_COMM"
+  echo "game pid=$GAME_PID comm=$GAME_COMM layer-mapped"
   if [[ "$LAYER_ON" == "1" ]]; then
     check_layer_mapped "$GAME_PID"
   else
