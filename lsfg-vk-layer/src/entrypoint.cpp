@@ -526,16 +526,24 @@ static void lsfdgInstallAbortHandlers() {
         auto func = getProcAddr(name);
         const bool submit2Name = std::strcmp(name, "vkQueueSubmit2") == 0
             || std::strcmp(name, "vkQueueSubmit2KHR") == 0;
-        if (::envFlagOn("LSFGVK_MEASURE") && submit2Name) {
-            PFN_vkVoidFunction down = nullptr;
-            if (instance_info && instance_info->funcs.GetDeviceProcAddr)
-                down = instance_info->funcs.GetDeviceProcAddr(device, name);
-            std::fprintf(stderr,
-                "lsfg-vk-measure: GetDeviceProcAddr site=myvkGetDeviceProcAddr device=%p name=%s hook=%p down=%p\n",
-                static_cast<void*>(device), name,
-                reinterpret_cast<void*>(func), reinterpret_cast<void*>(down));
-            std::fflush(stderr);
-            return func ? func : down;
+        // our submit2 hook needs a down-chain submit2 to call. If the driver has
+        // neither name for this device, do not hand out the hook: a game that
+        // calls the KHR name would get our hook with nothing behind it.
+        if (func && submit2Name && instance_info && instance_info->funcs.GetDeviceProcAddr) {
+            PFN_vkVoidFunction down = instance_info->funcs.GetDeviceProcAddr(
+                device, "vkQueueSubmit2");
+            if (!down || down == func)
+                down = instance_info->funcs.GetDeviceProcAddr(device, "vkQueueSubmit2KHR");
+            if (::envFlagOn("LSFGVK_MEASURE")) {
+                std::fprintf(stderr,
+                    "lsfg-vk-measure: GetDeviceProcAddr site=myvkGetDeviceProcAddr device=%p name=%s hook=%p down=%p expose=%d\n",
+                    static_cast<void*>(device), name,
+                    reinterpret_cast<void*>(func), reinterpret_cast<void*>(down),
+                    (down && down != func) ? 1 : 0);
+                std::fflush(stderr);
+            }
+            if (!down || down == func)
+                return nullptr;
         }
         if (func) return func;
 
@@ -1068,6 +1076,10 @@ namespace {
         if (!next || next == myvkQueueSubmit2) {
             next = reinterpret_cast<PFN_vkQueueSubmit2>(
                 instance_info->funcs.GetDeviceProcAddr(dev, "vkQueueSubmit2"));
+        }
+        if (!next || next == myvkQueueSubmit2) {
+            next = reinterpret_cast<PFN_vkQueueSubmit2>(
+                instance_info->funcs.GetDeviceProcAddr(dev, "vkQueueSubmit2KHR"));
         }
         if (!next || next == myvkQueueSubmit2) {
             if (::envFlagOn("LSFGVK_MEASURE")) {
