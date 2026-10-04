@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -468,14 +469,59 @@ namespace {
     thread_local std::vector<PendingPresentWork> t_pendingPresentWork;
     std::atomic<int> g_seen1440Submit2{0};
 
+    static void measureCreateLog(uint64_t seq, const char* step, int result, const char* note) {
+        if (!::envFlagOn("LSFGVK_MEASURE"))
+            return;
+        std::fprintf(stderr,
+            "lsfg-vk-measure: create seq=%llu tid=%ld step=%s result=%d %s\n",
+            static_cast<unsigned long long>(seq),
+            static_cast<long>(::gettid()),
+            step, result, note ? note : "");
+        std::fflush(stderr);
+    }
+
+    static void measureCreateCaller(uint64_t seq) {
+        if (!::envFlagOn("LSFGVK_MEASURE") || seq > 3)
+            return;
+        void* frames[12];
+        const int n = ::backtrace(frames, 12);
+        char** syms = ::backtrace_symbols(frames, n);
+        if (!syms)
+            return;
+        for (int i = 0; i < n; ++i) {
+            std::fprintf(stderr,
+                "lsfg-vk-measure: create seq=%llu tid=%ld frame=%d %s\n",
+                static_cast<unsigned long long>(seq),
+                static_cast<long>(::gettid()), i, syms[i]);
+        }
+        std::free(syms);
+        std::fflush(stderr);
+    }
+
     VkResult myvkCreateSwapchainKHR(
             VkDevice device,
             const VkSwapchainCreateInfoKHR* info,
             const VkAllocationCallbacks* alloc,
             VkSwapchainKHR* swapchain) {
+        static std::atomic<uint64_t> seqN{0};
+        const bool measure = ::envFlagOn("LSFGVK_MEASURE");
+        const uint64_t seq = measure ? seqN.fetch_add(1) + 1 : 0;
+        if (measure) {
+            char note[160];
+            std::snprintf(note, sizeof note,
+                "extent=%ux%u format=%d presentMode=%d minImageCount=%u",
+                info->imageExtent.width, info->imageExtent.height,
+                static_cast<int>(info->imageFormat),
+                static_cast<int>(info->presentMode),
+                info->minImageCount);
+            measureCreateLog(seq, "entry", 0, note);
+            measureCreateCaller(seq);
+        }
         const auto& it = instance_info->devices.find(device);
-        if (it == instance_info->devices.end())
+        if (it == instance_info->devices.end()) {
+            measureCreateLog(seq, "final", static_cast<int>(VK_ERROR_INITIALIZATION_FAILED), "no-device");
             return VK_ERROR_INITIALIZATION_FAILED;
+        }
 
         try {
             // retire old swapchain
@@ -505,7 +551,15 @@ namespace {
 
             VkSwapchainCreateInfoKHR newInfo = *info;
             if (isolated) {
-                IsolatedSwapchain iso = createIsolated(it->second, newInfo);
+                measureCreateLog(seq, "downchain", 0, "skipped-isolated");
+                IsolatedSwapchain iso;
+                try {
+                    iso = createIsolated(it->second, newInfo);
+                    measureCreateLog(seq, "image-memory", 0, "createIsolated");
+                } catch (const std::exception& e) {
+                    measureCreateLog(seq, "image-memory", -1, e.what());
+                    throw;
+                }
                 const VkSwapchainKHR handle = allocIsolatedHandle();
                 std::vector<VkImage> handles = iso.handles;
                 storeIsolated(handle, std::move(iso));
@@ -518,9 +572,16 @@ namespace {
                         .presentMode = newInfo.presentMode,
                         .fake = true
                     }).first->second;
-                    layer_info->root.createSwapchainContext(it->second, handle, sinfo);
+                    try {
+                        layer_info->root.createSwapchainContext(it->second, handle, sinfo);
+                        measureCreateLog(seq, "handshake", 0, "createSwapchainContext");
+                    } catch (const std::exception& e) {
+                        measureCreateLog(seq, "handshake", -1, e.what());
+                        throw;
+                    }
                     instance_info->swapchains.emplace(handle, ls::R<vk::Vulkan>(it->second));
                     *swapchain = handle;
+                    measureCreateLog(seq, "final", 0, "VK_SUCCESS");
                     return VK_SUCCESS;
                 } catch (...) {
                     instance_info->swapchains.erase(handle);
@@ -537,6 +598,7 @@ namespace {
                 [=, newInfo = &newInfo]() {
                     auto res = it->second.df().CreateSwapchainKHR(
                         device, newInfo, alloc, swapchain);
+                    measureCreateLog(seq, "downchain", static_cast<int>(res), "CreateSwapchainKHR");
                     if (res != VK_SUCCESS)
                         throw ls::vulkan_error(res, "vkCreateSwapchainKHR() failed");
                 }
@@ -555,6 +617,8 @@ namespace {
             if (res != VK_SUCCESS)
                 throw ls::vulkan_error(res, "vkGetSwapchainImagesKHR() failed");
 
+            measureCreateLog(seq, "image-memory", static_cast<int>(res), "GetSwapchainImagesKHR");
+
             auto& info = instance_info->swapchainInfos.emplace(*swapchain, SwapchainInfo {
                 .images = std::move(swapchainImages),
                 .format = newInfo.imageFormat,
@@ -569,17 +633,26 @@ namespace {
             }).first->second;
 
             // create lsfg-vk swapchain
-            layer_info->root.createSwapchainContext(it->second, *swapchain, info);
+            try {
+                layer_info->root.createSwapchainContext(it->second, *swapchain, info);
+                measureCreateLog(seq, "handshake", 0, "createSwapchainContext");
+            } catch (const std::exception& e) {
+                measureCreateLog(seq, "handshake", -1, e.what());
+                throw;
+            }
 
             instance_info->swapchains.emplace(*swapchain,
                 ls::R<vk::Vulkan>(it->second));
 
+            measureCreateLog(seq, "final", static_cast<int>(res), "return");
             return res;
         } catch (const ls::vulkan_error& e) {
+            measureCreateLog(seq, "final", static_cast<int>(e.error()), e.what());
             std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain creation:\n";
             std::cerr << "- " << e.what() << '\n';
             return e.error();
         } catch (const std::exception& e) {
+            measureCreateLog(seq, "final", static_cast<int>(VK_ERROR_INITIALIZATION_FAILED), e.what());
             std::cerr << "lsfg-vk: something went wrong during lsfg-vk swapchain creation:\n";
             std::cerr << "- " << e.what() << '\n';
             return VK_ERROR_INITIALIZATION_FAILED;

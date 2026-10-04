@@ -46,11 +46,12 @@ if [[ -z "${LSFG_LAUNCH_ISOLATED:-}" ]]; then
     WAYLAND_DISPLAY="$WAYLAND" \
     DISPLAY=":0" \
     XAUTHORITY="$XAUTH" \
-    /bin/bash "$0" "$PROFILE"
+    /bin/bash "$0" "$PROFILE" "${@:2}"
 fi
 
 # shellcheck disable=SC1090
 source "$ENVFILE"
+GAME_ARGS=("${@:2}")
 
 GAME_KIND="${GAME_KIND:-furmark}"
 LAYER_ON="${LAYER_ON:-1}"
@@ -119,6 +120,30 @@ if /usr/bin/pgrep -x lsfg-vk-app >/dev/null \
 fi
 echo "stop: clear"
 rm -f "$SOCK"
+
+# No game command: Steam's box is launch_re2.sh, which calls this profile
+# with %command%. Do not start a doubler here. The nested call stops any
+# old one and starts a new one. steam:// does not return; do not wait on it.
+if [[ "$GAME_KIND" == "steam" && ${#GAME_ARGS[@]} -eq 0 ]]; then
+  echo "steam trigger: /usr/bin/steam steam://rungameid/${STEAM_APPID}"
+  echo "Steam calls $REPO/tools/games/launch_re2.sh, which calls this profile"
+  START_S="$(date +%s)"
+  timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" || true
+  echo "steam cli returned; waiting for the nested profile run"
+  for _ in $(seq 1 360); do
+    newest="$(ls -td /tmp/lsfg-runs/${PROFILE}/*/launch.log 2>/dev/null | head -1 || true)"
+    if [[ -n "$newest" ]]; then
+      mt="$(stat -c %Y "$newest")"
+      if [[ "$mt" -ge "$START_S" ]] && grep -q '^done$' "$newest"; then
+        echo "nested log=$newest"
+        exit 0
+      fi
+    fi
+    sleep 1
+  done
+  echo "REFUSING: nested profile run did not finish"
+  exit 1
+fi
 
 echo "--- verify_build ---"
 DIRTY_PATHS="$(git -C "$REPO" status --porcelain --untracked-files=no -- . ':!thirdparty')"
@@ -257,6 +282,11 @@ echo "--- app command ---"
 printf '%q ' "${APP_CMD[@]}"; echo
 
 rm -f "$SOCK"
+if /usr/bin/pgrep -x lsfg-vk-app >/dev/null; then
+  echo "REFUSING: doubler still alive, will not reuse"
+  /usr/bin/pgrep -a -x lsfg-vk-app || true
+  exit 1
+fi
 /usr/bin/env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH \
   -u LSFGVK_POSIX_SHM -u LSFGVK_WAIT_COPY -u LSFGVK_COPY_ON_GFX \
   -u LSFGVK_CAPTURE_PRIO -u LSFGVK_CO_EXPERIMENT \
@@ -330,33 +360,38 @@ if [[ "$GAME_KIND" == "furmark" ]]; then
   echo "furmark exit=$?"
   set -e
 elif [[ "$GAME_KIND" == "steam" ]]; then
-  if [[ ! -x "$REPO/tools/games/launch_re2.sh" ]]; then
-    echo "REFUSING: $REPO/tools/games/launch_re2.sh is not executable"
+  if [[ ${#GAME_ARGS[@]} -eq 0 ]]; then
+    echo "REFUSING: steam profile has no game command and was not the trigger path"
     exit 1
   fi
-  write_steam_env
-  echo "Steam launch option is $REPO/tools/games/launch_re2.sh"
-  echo "game start: /usr/bin/steam steam://rungameid/${STEAM_APPID}"
+  echo "--- game command ---"
+  printf '%q ' /usr/bin/mangohud --dlsym "${GAME_ARGS[@]}"; echo
   CONSOLE="$HOME/.local/share/Steam/logs/console-linux.txt"
   CONSOLE_MARK=0
   if [[ -f "$CONSOLE" ]]; then
     CONSOLE_MARK="$(/usr/bin/wc -l < "$CONSOLE")"
   fi
   echo "console_mark=$CONSOLE_MARK"
-  /usr/bin/steam "steam://rungameid/${STEAM_APPID}"
-  echo "steam url sent; Steam calls $REPO/tools/games/launch_re2.sh"
-  for _ in $(seq 1 60); do
-    GAME_PID="$(/usr/bin/ps -eo pid,comm | /usr/bin/awk -v c="$GAME_COMM" '$2==c {print $1; exit}')"
-    if [[ -n "$GAME_PID" ]]; then
-      break
-    fi
-    sleep 1
-  done
-  if [[ -z "$GAME_PID" ]]; then
-    echo "HASH CHECK FAIL: $GAME_COMM did not start"
-    exit 1
-  fi
-  echo "game pid=$GAME_PID comm=$GAME_COMM"
+  /usr/bin/env -u LD_LIBRARY_PATH \
+    -u ENABLE_VK_LAYER_VALVE_steam_fossilize_1 \
+    -u ENABLE_VK_LAYER_VALVE_steam_overlay_1 \
+    VK_LAYER_PATH="$LAYER" \
+    VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation \
+    LSFGVK_MEASURE="${LSFGVK_MEASURE:-0}" \
+    LSFGVK_CONFIG="$CFG" \
+    LSFGVK_APP_SOCK="$SOCK" \
+    LSFGVK_PROFILE="${LSFGVK_PROFILE:-re2-oneway}" \
+    MESA_VK_DEVICE_SELECT="${MESA_VK_DEVICE_SELECT:-1002:7550}" \
+    DXVK_LOG_LEVEL="${DXVK_LOG_LEVEL:-info}" \
+    VKD3D_DEBUG="${VKD3D_DEBUG:-warn}" \
+    LSFGVK_LAYER_DBG="${LSFGVK_LAYER_DBG:-0}" \
+    DISABLE_VK_LAYER_VALVE_steam_fossilize=1 \
+    DISABLE_VK_LAYER_VALVE_steam_fossilize_1=1 \
+    DISABLE_VK_LAYER_VALVE_steam_overlay=1 \
+    DISABLE_VK_LAYER_VALVE_steam_overlay_1=1 \
+    /usr/bin/mangohud --dlsym "${GAME_ARGS[@]}" >"$OUT/game.log" 2>&1 &
+  GAME_PID=$!
+  echo "game pid=$GAME_PID"
   if [[ "$LAYER_ON" == "1" ]]; then
     check_layer_mapped "$GAME_PID"
   else
@@ -366,18 +401,10 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
   if [[ -n "${LSFG_MAX_TIME:-}" ]]; then
     sleep "$LSFG_MAX_TIME"
   fi
-  if [[ -n "$CONSOLE_MARK" && -f "$CONSOLE" ]]; then
-    /usr/bin/awk -v n="$CONSOLE_MARK" 'NR>n' "$CONSOLE" \
-      | /usr/bin/grep -E 'lsfg-vk-measure:|DXVK:|vkd3d|Game: re2' \
+  if [[ -f "$OUT/game.log" ]]; then
+    /usr/bin/grep -E 'lsfg-vk-measure:|DXVK:|vkd3d|Game: re2' "$OUT/game.log" \
       > "$OUT/game-console.txt" || true
     echo "game-console lines=$(/usr/bin/wc -l < "$OUT/game-console.txt")"
-  fi
-  id="$(DISPLAY=:0 /usr/bin/xdotool search --name 'RESIDENT EVIL 2' 2>/dev/null | /usr/bin/head -1 || true)"
-  if [[ -n "$id" ]]; then
-    echo "window id=$id"
-    DISPLAY=:0 /usr/bin/xdotool getwindowgeometry "$id" || true
-  else
-    echo "window: not found"
   fi
   if kill -0 "$GAME_PID" 2>/dev/null; then
     /bin/kill -TERM "$GAME_PID" 2>/dev/null || true
