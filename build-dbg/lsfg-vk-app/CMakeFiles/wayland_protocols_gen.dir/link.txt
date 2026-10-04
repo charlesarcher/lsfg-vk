@@ -1,0 +1,2 @@
+/usr/bin/ar qc libwayland_protocols_gen.a "CMakeFiles/wayland_protocols_gen.dir/protocols/presentation-time-protocol.c.o" "CMakeFiles/wayland_protocols_gen.dir/protocols/xdg-shell-protocol.c.o" "CMakeFiles/wayland_protocols_gen.dir/protocols/xdg-output-unstable-v1-protocol.c.o" "CMakeFiles/wayland_protocols_gen.dir/protocols/wlr-layer-shell-unstable-v1-protocol.c.o"
+/usr/bin/ranlib libwayland_protocols_gen.a

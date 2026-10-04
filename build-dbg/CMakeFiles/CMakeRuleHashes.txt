@@ -1,0 +1,6 @@
+# Hashes of file build rules.
+16a5cf2c3d1757174b2e9d6422566074 lsfg-vk-app/CMakeFiles/wayland_protocols
+ee0721a07c715c8c384916018368834c lsfg-vk-app/protocols/presentation-time-client-protocol.h
+4695e0b99e83716fc4707508ff2a9f89 lsfg-vk-app/protocols/wlr-layer-shell-unstable-v1-client-protocol.h
+c15685d4fc28da63c71c9685e1fa11da lsfg-vk-app/protocols/xdg-output-unstable-v1-client-protocol.h
+3e7e3088a09d47cd8ce8c52b58290be3 lsfg-vk-app/protocols/xdg-shell-client-protocol.h

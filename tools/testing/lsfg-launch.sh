@@ -78,6 +78,7 @@ if [[ -z "${LSFG_LAUNCH_ISOLATED:-}" || -n "${LD_PRELOAD:-}${LD_LIBRARY_PATH:-}"
     LSFG_LAUNCH_ISOLATED=1 \
     LSFG_PROFILE="$PROFILE" \
     ${LSFG_APP:+LSFG_APP="$LSFG_APP"} \
+    ${LSFG_LAYER:+LSFG_LAYER="$LSFG_LAYER"} \
     ${ASAN_OPTIONS:+ASAN_OPTIONS="$ASAN_OPTIONS"} \
     HOME="$HOME" \
     USER="${USER:-archerc}" \
@@ -111,7 +112,9 @@ STEAM_ENV="$HOME/.local/state/lsfg-vk/steam-game.env"
 # LSFG_APP lets a profile run a different doubler build (e.g. the ASan tree in
 # build-asan) without editing this script. Unset = the release binary.
 APP="${LSFG_APP:-$REPO/build/lsfg-vk-app/lsfg-vk-app}"
-LAYER="$REPO/build/lsfg-vk-layer"
+# LSFG_LAYER does the same for the layer. Overriding only LSFG_APP would mix a
+# new doubler with an old layer, so a baseline/bisect run must set both.
+LAYER="${LSFG_LAYER:-$REPO/build/lsfg-vk-layer}"
 LAYER_SO="$LAYER/liblsfg-vk-layer.so"
 CFG="$REPO/tools/testing/profiles/$LSFG_CONFIG_NAME"
 HUD="$REPO/tools/testing/profiles/MangoHud.conf"

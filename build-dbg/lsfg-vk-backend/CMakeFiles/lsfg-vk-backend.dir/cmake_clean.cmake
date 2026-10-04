@@ -1,0 +1,41 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/lsfg-vk-backend.dir/src/extraction/dll_reader.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/extraction/dll_reader.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/extraction/shader_registry.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/extraction/shader_registry.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/helpers/limits.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/helpers/limits.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/helpers/managed_shader.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/helpers/managed_shader.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/helpers/utils.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/helpers/utils.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/lsfgvk.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/lsfgvk.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/alpha0.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/alpha0.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/alpha1.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/alpha1.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/beta0.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/beta0.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/beta1.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/beta1.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/delta0.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/delta0.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/delta1.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/delta1.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/gamma0.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/gamma0.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/gamma1.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/gamma1.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/generate.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/generate.cpp.o.d"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/mipmaps.cpp.o"
+  "CMakeFiles/lsfg-vk-backend.dir/src/shaderchains/mipmaps.cpp.o.d"
+  "liblsfg-vk-backend.a"
+  "liblsfg-vk-backend.pdb"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/lsfg-vk-backend.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()
