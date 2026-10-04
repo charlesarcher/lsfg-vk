@@ -77,6 +77,8 @@ if [[ -z "${LSFG_LAUNCH_ISOLATED:-}" || -n "${LD_PRELOAD:-}${LD_LIBRARY_PATH:-}"
   exec /usr/bin/env -i \
     LSFG_LAUNCH_ISOLATED=1 \
     LSFG_PROFILE="$PROFILE" \
+    ${LSFG_APP:+LSFG_APP="$LSFG_APP"} \
+    ${ASAN_OPTIONS:+ASAN_OPTIONS="$ASAN_OPTIONS"} \
     HOME="$HOME" \
     USER="${USER:-archerc}" \
     LOGNAME="${USER:-archerc}" \
