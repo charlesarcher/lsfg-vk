@@ -1069,6 +1069,12 @@ namespace {
         VkDevice dev = qit != instance_info->queues.end() ? qit->second
             : (instance_info->devices.size() == 1 ? instance_info->devices.begin()->first
                                                   : VK_NULL_HANDLE);
+        if (qit == instance_info->queues.end())
+            std::fprintf(stderr,
+                "lsfg-vk-layer: WARNING unknown queue %p not seen in vkGetDeviceQueue"
+                " / vkGetDeviceQueue2; devices=%zu%s\n",
+                static_cast<void*>(queue), instance_info->devices.size(),
+                dev != VK_NULL_HANDLE ? ", falling back to the only device" : "");
         const auto dit = dev != VK_NULL_HANDLE ? instance_info->devices.find(dev)
                                                : instance_info->devices.end();
         const bool queueDeviceKnown = dit != instance_info->devices.end();
