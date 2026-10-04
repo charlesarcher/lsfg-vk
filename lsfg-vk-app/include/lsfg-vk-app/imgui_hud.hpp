@@ -13,8 +13,17 @@
 #include <string_view>
 #include <memory>
 #include <array>
+#include <atomic>
 
 namespace ls::hud {
+
+    /// one line of the multi-stream trace, written to stderr unbuffered so a
+    /// crash cannot lose it. @p what names the event (stream-open,
+    /// stream-close, swapchain-create, tick-enter, tick-exit), @p streamId is
+    /// the StreamState::streamId (0 when not stream-scoped), @p detail is
+    /// pre-formatted key=value text. One atomic flag per what-kind keeps the
+    /// tick lines from flooding a 132/s present loop.
+    void traceLine(const char* what, uint32_t streamId, const std::string& detail);
 
     /// dear imgui overlay for the doubler window (S40+ Phase A).
     /// renders an interactive OFFSCREEN tooltip-card (imgui) into a small
@@ -69,6 +78,10 @@ namespace ls::hud {
         static void toggle();
         /// query whether the overlay is (still) drawing — false stops blits
         [[nodiscard]] static bool drawing();
+
+        /// stream id stamped onto the tick trace lines; set by the caller
+        /// before tick so concurrent ticks from different streams are visible
+        std::atomic<uint32_t> traceStreamId{0};
 
         /// render one frame (call at ~15 Hz from the OUTPUT thread):
         /// NewFrame -> widgets -> submit RT upload. cheap when hidden.

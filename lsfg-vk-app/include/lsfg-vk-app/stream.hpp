@@ -92,6 +92,9 @@ namespace ls::ipc {
         lsfgvk::backend::Instance* backend{nullptr};
 
         // --- handshake parameters kept for the presentation tasks (7/8) ------
+        /// monotonic id assigned when the stream opens, so the trace lines for
+        /// swapchain create / tick / close can be attributed to one stream
+        uint32_t streamId{0};
         /// game device UUID carried over from HELLO (exporterDeviceUUID)
         std::array<uint8_t, 16> gameUuid{};
         /// negotiated drm modifier of the exchange layout

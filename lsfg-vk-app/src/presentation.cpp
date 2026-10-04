@@ -1731,8 +1731,11 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             st.presentIdx = presentedFrames.load(std::memory_order_relaxed);
             try {
                 ls::hud::ImGuiHud::publish(st);
-                if (g_imguiHud)
+                if (g_imguiHud) {
+                    g_imguiHud->traceStreamId.store(state.streamId,
+                        std::memory_order_relaxed);
                     g_imguiHud->tick(static_cast<float>(hdt));
+                }
             } catch (const std::exception& e) {
                 std::cerr << "lsfg-vk-app: imgui hud tick failed: " << e.what() << "\n";
             }

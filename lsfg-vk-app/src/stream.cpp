@@ -3,6 +3,7 @@
 #include "lsfg-vk-app/stream.hpp"
 #include "lsfg-vk-common/frame_dbg.hpp"
 #include "lsfg-vk-app/presentation.hpp"
+#include "lsfg-vk-app/imgui_hud.hpp"
 
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/helpers/env_flag.hpp"
@@ -43,6 +44,9 @@
 using namespace ls::ipc;
 
 StreamState::~StreamState() {
+    ls::hud::traceLine("stream-close", this->streamId,
+        "tid=" + std::to_string(static_cast<long>(::gettid()))
+        + " extent=" + std::to_string(this->width) + "x" + std::to_string(this->height));
     // RADV FreeMemory on HOST_ALLOCATION_BIT frees the posix_memalign
     // pointer and aborts the overlay on FurMark swapchain recreate.
     if (this->shmBytes == 0)
@@ -174,6 +178,14 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     std::cerr << "lsfg-vk-app: stream from '" << helloDeviceName(*hello) << "' "
               << hello->width << "x" << hello->height << " "
               << formatName(hello->vkFormat) << "\n";
+    static std::atomic<uint32_t> s_nextStreamId{1};
+    state.streamId = s_nextStreamId.fetch_add(1, std::memory_order_relaxed);
+    ls::hud::traceLine("stream-open", state.streamId,
+        "pid=" + std::to_string(static_cast<long>(::getpid()))
+        + " tid=" + std::to_string(static_cast<long>(::gettid()))
+        + " dev='" + helloDeviceName(*hello) + "'"
+        + " extent=" + std::to_string(hello->width) + "x" + std::to_string(hello->height)
+        + " fmt=" + formatName(hello->vkFormat));
     ls::resolveUnsetTransport(conf, helloDeviceName(*hello), conf.gpu.value_or(""));
 
     // 2. NEGOTIATED: the staging images (created below, step 3) are ALWAYS

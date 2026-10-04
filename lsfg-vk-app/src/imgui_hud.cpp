@@ -8,6 +8,9 @@
  * on an unrefreshed slot parks forever. */
 
 #include "lsfg-vk-app/imgui_hud.hpp"
+
+#include <sys/syscall.h>
+#include <unistd.h>
 #include "imgui_hud_pm_spv.hpp"
 #include "imgui_hud_co_spv.hpp"
 #include <algorithm>
@@ -61,6 +64,22 @@ namespace ls::hud {
         inline T devPfn(const vk::Vulkan& vk, const char* name) {
             return reinterpret_cast<T>(::vkGetInstanceProcAddr(vk.inst(), name));
         }
+    }
+
+    void traceLine(const char* what, uint32_t streamId, const std::string& detail) {
+        static std::mutex mtx;
+        const auto now = std::chrono::system_clock::now();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+            now.time_since_epoch()) % 1000000;
+        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch());
+        std::lock_guard<std::mutex> lk(mtx);
+        std::fprintf(stderr,
+            "TRACE %lld.%06lld what=%s stream=%u tid=%ld %s\n",
+            static_cast<long long>(secs.count()),
+            static_cast<unsigned long long>(us.count()),
+            what, streamId, static_cast<long>(::gettid()), detail.c_str());
+        std::fflush(stderr);
     }
 
     void ImGuiHud::pushLatencyMs(float ms) {
@@ -1012,6 +1031,19 @@ void ImGuiHud::setupThemeAndFont() {
     void ImGuiHud::tick(float dt) {
         this->ensureFade(dt);
         if (this->fadeLock <= 0.02f) return;          // zero-cost hidden path
+        /* multi-stream trace: the card is ONE process-wide object but tick is
+           called from each stream's output thread, so log entry/exit with the
+           stream id to show whether two threads are ever inside at once. */
+        static std::atomic<int> s_tickSeq{0};
+        const int seq = s_tickSeq.fetch_add(1, std::memory_order_relaxed);
+        ls::hud::traceLine("tick-enter", this->traceStreamId,
+            "seq=" + std::to_string(seq) + " dt=" + std::to_string(dt));
+        struct TickExit {
+            uint32_t stream; int seq;
+            ~TickExit() {
+                ls::hud::traceLine("tick-exit", stream, "seq=" + std::to_string(seq));
+            }
+        } tickExit{ this->traceStreamId, seq };
         /* S42f-v2: cadence-only gate (no content hash — the hash-gate
            variant starved ALL paints in the field: RE2 15:11 grab +
            present-dump X6/X7 = solid-black card over live stream,

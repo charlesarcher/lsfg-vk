@@ -611,6 +611,23 @@ namespace {
             measureCreateLog(seq, "entry", 0, note);
             measureCreateCaller(seq);
         }
+        {   /* unconditional swapchain-create trace: the measure lines are
+               gated on LSFGVK_MEASURE, and the multi-stream question needs
+               every create with its extent regardless. */
+            const auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::system_clock::now().time_since_epoch()) % 1000000;
+            std::fprintf(stderr,
+                "TRACE what=swapchain-create stream=0 tid=%ld seq=%llu device=%p"
+                " extent=%ux%u format=%d oldSwapchain=%p\n",
+                static_cast<long>(::gettid()),
+                static_cast<unsigned long long>(seq),
+                static_cast<void*>(device),
+                info->imageExtent.width, info->imageExtent.height,
+                static_cast<int>(info->imageFormat),
+                static_cast<void*>(info->oldSwapchain));
+            (void)us;
+            std::fflush(stderr);
+        }
         const auto& it = instance_info->devices.find(device);
         if (it == instance_info->devices.end()) {
             measureCreateLog(seq, "final", static_cast<int>(VK_ERROR_INITIALIZATION_FAILED), "no-device");
