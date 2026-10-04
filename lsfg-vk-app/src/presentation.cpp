@@ -1748,10 +1748,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             st.presentIdx = presentedFrames.load(std::memory_order_relaxed);
             try {
                 ls::hud::ImGuiHud::publish(st);
+                /* Ownership is taken ONCE, when the stream opens - not here.
+                   Calling adoptStream per tick let a retired stream take the
+                   card back: stream 2 adopted at .636152, then stream 1's
+                   dying output thread adopted again at .649843 and tick()
+                   faulted in the driver (core 178001). */
                 if (g_imguiHud) {
                     g_imguiHud->traceStreamId.store(state.streamId,
                         std::memory_order_relaxed);
-                    g_imguiHud->adoptStream(state.streamId);
                     g_imguiHud->tick(static_cast<float>(hdt));
                 }
             } catch (const std::exception& e) {
@@ -2132,6 +2136,13 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                     g_imguiHud = new ls::hud::ImGuiHud{ vk,
                                         extent, static_cast<VkFormat>(
                                             g_overlay.imageFormat) };
+                                    /* The stream that creates the card owns
+                                       it. Later streams take ownership only
+                                       when the previous owner is gone, never
+                                       by re-adopting per tick. */
+                                    g_imguiHud->adoptStream(state.streamId);
+                                    g_imguiHud->traceStreamId.store(state.streamId,
+                                        std::memory_order_relaxed);
                                     g_imguiBuiltW.store(extent.width,
                                         std::memory_order_relaxed);
                                     g_imguiBuiltH.store(extent.height,
