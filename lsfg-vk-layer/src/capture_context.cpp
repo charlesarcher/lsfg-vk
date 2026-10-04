@@ -1259,6 +1259,11 @@ void CaptureContext::frameThreadMain() {
         pfd.events = POLLIN;
         const int pr = ::poll(&pfd, 1, 5000);
         const bool ready = pr > 0 && (pfd.revents & POLLIN);
+        std::fprintf(stderr,
+            "lsfg-vk: FRAME-send id=%llu slot=%d fd=%d poll=%d revents=0x%x ready=%d\n",
+            (unsigned long long)job.id, job.slot, job.fd, pr,
+            (unsigned)(pfd.revents), ready ? 1 : 0);
+        std::fflush(stderr);
         if (!ready) {
             std::fprintf(stderr,
                 "lsfg-vk: sync fd not signaled before FRAME id=%llu pr=%d\n",
@@ -1278,6 +1283,11 @@ void CaptureContext::frameThreadMain() {
             job.fd = -1;
             this->ipcConn->send(ls::ipc::Frame{
                 job.slot, capTs, static_cast<uint32_t>(this->info.format) });
+            std::fprintf(stderr,
+                "lsfg-vk: FRAME-sent id=%llu slot=%d capTs=%llu conn=%d\n",
+                (unsigned long long)job.id, job.slot,
+                (unsigned long long)capTs, (int)this->ipcConn->fd());
+            std::fflush(stderr);
             this->ledger.publish(capTs, job.slot);
         } catch (const std::exception& e) {
             if (job.fd >= 0)

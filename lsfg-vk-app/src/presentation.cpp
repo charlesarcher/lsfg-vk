@@ -2565,6 +2565,15 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 gotFrame = true;
                 const auto recvTs = Clock::now();
                 auto msg = conn.receive(std::nullopt);
+                {
+                    char tb[160];
+                    std::snprintf(tb, sizeof tb,
+                        "fidx=%llu msgIsFrame=%d pollReady=%d revents=0x%x",
+                        (unsigned long long)fidx,
+                        std::get_if<ls::ipc::Frame>(&msg) ? 1 : 0,
+                        pr, (unsigned)(pfd.revents));
+                    ls::hud::traceLine("recv", state.streamId, tb);
+                }
                 const auto* frame = std::get_if<ls::ipc::Frame>(&msg);
                 if (!frame)
                     continue;

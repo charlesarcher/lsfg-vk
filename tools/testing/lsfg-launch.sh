@@ -379,6 +379,11 @@ if [[ "$GAME_KIND" == "furmark" ]]; then
   set +e
   wait "$GAME_PID"
   echo "furmark exit=$?"
+  # The layer prints one LSFGVK-BENCH line at teardown. Surface it here so a
+  # benchmark run always reports presents/s, gen and real counts, and the
+  # longest gap without parsing logs by hand (added 2026-10-04).
+  echo "--- bench summary ---"
+  grep -h 'LSFGVK-BENCH' "$OUT"/furmark.log "$OUT"/app.log 2>/dev/null || true
   set -e
 elif [[ "$GAME_KIND" == "steam" ]]; then
   write_steam_env

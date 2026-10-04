@@ -418,6 +418,8 @@ static void lsfdgInstallAbortHandlers() {
     }
 
     // destroy device
+    static void benchReport(const char* tag);
+
     void myvkDestroyDevice(VkDevice device, const VkAllocationCallbacks* alloc) {
         // drop queue entries owned by this device
         if (instance_info)
@@ -453,6 +455,7 @@ static void lsfdgInstallAbortHandlers() {
         }
 
         // destroy device
+        benchReport("teardown");
         auto vkDestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(
             instance_info->funcs.GetDeviceProcAddr(device, "vkDestroyDevice"));
         if (!vkDestroyDevice) {
@@ -858,6 +861,32 @@ namespace {
         return res;
     }
 
+    /* BENCH COUNTERS: the layer's own present accounting, printed once at
+   teardown so every benchmark run reports presents/s, gen and real counts,
+   and the longest gap without anyone parsing logs by hand. */
+    static std::mutex g_benchMu;
+    static uint64_t g_benchGen{ 0 };
+    static uint64_t g_benchReal{ 0 };
+    static int64_t g_benchLongestGapUs{ 0 };
+    static std::chrono::steady_clock::time_point g_benchFirst{};
+    static std::chrono::steady_clock::time_point g_benchLast{};
+
+    static void benchReport(const char* tag) {
+        std::lock_guard<std::mutex> lk(g_benchMu);
+        const double secs = g_benchFirst == std::chrono::steady_clock::time_point{}
+            ? 0.0
+            : std::chrono::duration<double>(g_benchLast - g_benchFirst).count();
+        const double pps = secs > 0.0 ? static_cast<double>(g_benchGen) / secs : 0.0;
+        std::fprintf(stderr,
+            "LSFGVK-BENCH tag=%s presents/s=%.2f gen=%llu real=%llu "
+            "longest_gap_ms=%.3f elapsed_s=%.3f\n",
+            tag, pps,
+            static_cast<unsigned long long>(g_benchGen),
+            static_cast<unsigned long long>(g_benchReal),
+            static_cast<double>(g_benchLongestGapUs) / 1000.0, secs);
+        std::fflush(stderr);
+    }
+
     VkResult myvkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* info) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wunknown-warning-option"
@@ -1005,6 +1034,27 @@ namespace {
                     }
                     const auto d = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - t0).count();
+                    /* BENCH COUNTERS: every present the layer actually issues.
+                       gen = presents the layer generated, real = presents that
+                       reached a real scanout (result == VK_SUCCESS), plus the
+                       longest gap between consecutive presents so a stall shows
+                       up as one number instead of a missing frame. */
+                    {
+                        std::lock_guard<std::mutex> lk(g_benchMu);
+                        ++g_benchGen;
+                        if (result == VK_SUCCESS)
+                            ++g_benchReal;
+                        const auto now = std::chrono::steady_clock::now();
+                        if (g_benchLast != std::chrono::steady_clock::time_point{}) {
+                            const auto gap = std::chrono::duration_cast<
+                                std::chrono::microseconds>(now - g_benchLast).count();
+                            if (gap > g_benchLongestGapUs)
+                                g_benchLongestGapUs = gap;
+                        }
+                        if (g_benchFirst == std::chrono::steady_clock::time_point{})
+                            g_benchFirst = now;
+                        g_benchLast = now;
+                    }
                     if (dbgPres) {
                         const auto now = std::chrono::steady_clock::now();
                         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
