@@ -2500,6 +2500,16 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             if (!outputError)
                 outputError = std::current_exception();
             failed.store(true, std::memory_order_relaxed);
+            /* Do NOT fall out of this catch. cur and the cb/fence vectors are
+               declared inside the lambda body, so leaving the try destroys
+               them while the loop below still reads them:
+                 ERROR: AddressSanitizer: heap-buffer-overflow
+                   #0 std::vector<int>::clear()  presentation.cpp:2233
+                   0 bytes after 120-byte region
+                 freed by thread T17 here: presentation.cpp:2504
+               Leave immediately so nothing is touched after unwinding.
+               The lambda returns bool, so return false, not bare return. */
+            return false;
         }
     };
 
