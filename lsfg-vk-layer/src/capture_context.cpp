@@ -712,11 +712,25 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                The copy still reads the game's swapchain images, which belong to
                the game's device, so this device exists to own the ring BOs and
                the copy queue - not to be a second scanout. */
+            /* isGraphical MUST stay true. This card reports no non-graphics
+               transfer family, and a non-graphical device with no transfer
+               family ends up with no usable queue at all:
+
+                 lsfg-vk: WARNING no non-graphics transfer queue family; image
+                   copies will not run as DMA. Refusing to fall back to the
+                   graphics qu[eue]
+                 lsfg-vk: transfer selection over 1 families: 0:0x1f -> NONE
+
+               which left the copy device with nothing to submit on, so it lost
+               the device on the first frame. isGraphical=false only works on
+               the doubler card, whose device does have a transfer family.
+               DISABLE_VK_LAYER_LSFGVK_frame_generation is kept so our own layer
+               does not nest inside the copy device. */
             ::setenv("DISABLE_VK_LAYER_LSFGVK_frame_generation", "1", 1);
             this->copyVk = std::make_unique<vk::Vulkan>(
                 "lsfg-ring-copy", vk::version{2, 0, 0},
                 "lsfg-ring-copy", vk::version{2, 0, 0},
-                selectSameCard, false, std::nullopt, std::nullopt, true, true);
+                selectSameCard, true, std::nullopt, std::nullopt, true, false);
             ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
             std::fprintf(stderr,
                 "lsfg-vk: copy-only device for the ring on the render card\n");
