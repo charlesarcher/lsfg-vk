@@ -699,10 +699,25 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 throw ls::error("ring: render card '" + want
                     + "' not found among physical devices");
             };
+            /* Two changes here, both forced by VK_ERROR_DEVICE_LOST after three
+               frames:
+                 - isGraphical=false + enableTransferQueue=true. A graphics
+                   device on the same card needs a graphics queue, and this
+                   card has no non-graphics transfer family, so the copy was
+                   running on a second full graphics queue. The app's proven
+                   dma-in device uses exactly these flags.
+                 - DISABLE_VK_LAYER_LSFGVK_frame_generation around the
+                   construction, so our own layer does not nest inside the copy
+                   device and try to capture it.
+               The copy still reads the game's swapchain images, which belong to
+               the game's device, so this device exists to own the ring BOs and
+               the copy queue - not to be a second scanout. */
+            ::setenv("DISABLE_VK_LAYER_LSFGVK_frame_generation", "1", 1);
             this->copyVk = std::make_unique<vk::Vulkan>(
-                "lsfg-ring-copy", vk::version{1, 3, 0},
-                "lsfg-ring-copy", vk::version{1, 3, 0},
-                selectSameCard, true, std::nullopt, std::nullopt, true, false);
+                "lsfg-ring-copy", vk::version{2, 0, 0},
+                "lsfg-ring-copy", vk::version{2, 0, 0},
+                selectSameCard, false, std::nullopt, std::nullopt, true, true);
+            ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
             std::fprintf(stderr,
                 "lsfg-vk: copy-only device for the ring on the render card\n");
             std::fflush(stderr);
