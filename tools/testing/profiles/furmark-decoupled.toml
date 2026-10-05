@@ -9,7 +9,11 @@ name = "app-oneway"
 gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
 presentation = "external"
 multiplier = 2
-# transport omitted: cross-GPU default is decoupled. Do not set udmabuf.
+# udmabuf ring: K kernel udmabufs owned by the render side, imported as
+# dma-bufs on each card, GPU DMA only, no CPU frame copy, no cross-process
+# wait. K=3 from ring_slots.
+transport = "udmabuf_ring"
+ring_slots = 3
 output = "DP-7"
 hud = true
 
@@ -19,6 +23,10 @@ active_in = "furmark"
 gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
 presentation = "external"
 multiplier = 2
-# transport omitted: cross-GPU default is decoupled. Do not set udmabuf.
+# udmabuf ring: K kernel udmabufs owned by the render side, imported as
+# dma-bufs on each card, GPU DMA only, no CPU frame copy, no cross-process
+# wait. K=3 from ring_slots.
+transport = "udmabuf_ring"
+ring_slots = 3
 output = "DP-7"
 hud = true

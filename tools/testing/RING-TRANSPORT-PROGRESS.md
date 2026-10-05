@@ -12,3 +12,4 @@ Rule: no CPU frame copies, no malloc/posix_memalign/external_memory_host, GPU DM
   src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c:820-822. Intel iGPU accepts the same
   memfd mapping. => dma-buf import only.
 - Tooling: tools/testing/udmabuf_hostptr_probe.cpp (untracked, diagnostic).aa47c7a+ | ring setup/lifecycle | no GPU path yet | n/a
+2f2bee0+ring37 | furmark-decoupled-bench | FAIL: transport=udmabuf_ring rejected by parser | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T203520

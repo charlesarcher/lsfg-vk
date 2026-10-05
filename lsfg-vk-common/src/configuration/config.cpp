@@ -148,8 +148,10 @@ namespace {
             return Transport::Udmabuf;
         if (str == "decoupled" || str == "decoupled_dma")
             return Transport::DecoupledDma;
+        if (str == "udmabuf_ring" || str == "ring" || str == "udmabuf-ring")
+            return Transport::UdmabufRing;
         throw ls::error("unknown transport mode: " + str
-            + " (allowed values: 'shm', 'dmabuf', 'decoupled', 'udmabuf')");
+            + " (allowed values: 'shm', 'dmabuf', 'decoupled', 'udmabuf', 'udmabuf_ring')");
     }
     /// parse the global configuration
     GlobalConf parseGlobalConf(const toml::table& tbl) {
