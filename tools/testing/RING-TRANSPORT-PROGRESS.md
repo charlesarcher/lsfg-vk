@@ -21,3 +21,5 @@ f5e5e95 | furmark-decoupled-bench | FAIL: app 'lazy: value already present' -> l
 63e8bf9 | furmark-decoupled-bench | still 0 published: capture gated on staging slotFree which the ring never fills | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T205341
 eb03799 | furmark-decoupled-bench | FAIL: copy-device selector queried the game's VkPhysicalDevice across instances -> loader ERROR, no ring setup | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T205947
 fe4339d | furmark-decoupled-bench | FAIL: move ctor dropped ring/copyVk -> present sees ring=0 | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T210223
+c09da53 | furmark-decoupled-bench | 0 published: stray forward-present block short-circuited the ring copy after 'copy begin' | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211320
+32915fe | furmark-decoupled-bench | FIRST end-to-end frame (claim/fence/publish/app-claim/release) but only 1 present reaches the layer; game stops presenting after frame 1, cause unknown | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211419
