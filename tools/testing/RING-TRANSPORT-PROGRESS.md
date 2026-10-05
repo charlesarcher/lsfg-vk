@@ -24,3 +24,4 @@ fe4339d | furmark-decoupled-bench | FAIL: move ctor dropped ring/copyVk -> prese
 c09da53 | furmark-decoupled-bench | 0 published: stray forward-present block short-circuited the ring copy after 'copy begin' | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211320
 32915fe | furmark-decoupled-bench | FIRST end-to-end frame (claim/fence/publish/app-claim/release) but only 1 present reaches the layer; game stops presenting after frame 1, cause unknown | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211419
 ecb2130 | furmark-decoupled-bench | FAIL: game SIGSEGV in radv via forward-present on the scanout-less isolated swapchain (exit 139) | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211638
+24f46b2 | furmark-decoupled-bench | PROGRESS: 3 frames published+claimed (all K slots cycled), then game abort 134: capture submit failed vkQueueSubmit error -4 (device lost); app also SIGSEGV | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T212032
