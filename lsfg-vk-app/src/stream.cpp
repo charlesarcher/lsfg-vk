@@ -700,8 +700,16 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             slotLayout.mode = vk::ImageMode::Linear;
             slotLayout.rowPitch = 0;
             slotLayout.drmModifier = 0;
-            state.ringSlotImages.resize(k);
+            // resize() only when the vector is empty or the wrong size: a
+            // re-created ring would otherwise resize over live std::optional
+            // members and the next emplace throws "value already present".
+            if (state.ringSlotImages.size() != k) {
+                state.ringSlotImages.clear();
+                state.ringSlotImages.resize(k);
+            }
             for (std::uint32_t i = 0; i < k; ++i) {
+                if (state.ringSlotImages.at(i).has_value())
+                    continue;
                 state.ringSlotImages.at(i).emplace(vk,
                     VkExtent2D{ static_cast<std::uint32_t>(w), h },
                     fmt,
