@@ -106,7 +106,10 @@ if ! declare -p APP_ENV >/dev/null 2>&1; then APP_ENV=(); fi
 if ! declare -p FM_ENV >/dev/null 2>&1; then FM_ENV=(); fi
 
 RUN_ID="$(date +%Y%m%dT%H%M%S)"
-OUT="${LSFG_RUN_DIR:-/tmp/lsfg-runs/${PROFILE}/${RUN_ID}}"
+# LSFG_RUN_ROOT moves the run tree off /tmp. /tmp is tmpfs on this box, so a
+# 300 s 240 fps capture plus its rawvideo decode is gigabytes of RAM, not disk.
+# Unset, behaviour is unchanged.
+OUT="${LSFG_RUN_DIR:-${LSFG_RUN_ROOT:-/tmp/lsfg-runs}/${PROFILE}/${RUN_ID}}"
 mkdir -p "$OUT"
 LOG="$OUT/launch.log"
 STEAM_ENV="$HOME/.local/state/lsfg-vk/steam-game.env"

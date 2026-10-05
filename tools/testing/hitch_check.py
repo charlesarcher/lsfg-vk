@@ -24,6 +24,11 @@
 #   ffmpeg -y -i <clip> -vf "fps=<FPS>,format=gray,scale=640:-1" \
 #          -f rawvideo <out.raw>
 #
+# NOTE ON DISK: /tmp is tmpfs on this box, so a rawvideo decode there is RAM.
+# A 300 s 240fps clip decodes to roughly 4 GB at 640x360 and about 100 GB at
+# full resolution. Put the clip, the decode output and the frames under
+# ~/lsfg-work (disk), never under /tmp.
+#
 # Usage: hitch_check.py <frames.raw> <fps> [w] [h] [start_s] [end_s]
 import sys
 
