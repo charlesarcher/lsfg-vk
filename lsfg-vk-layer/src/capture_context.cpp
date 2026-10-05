@@ -1865,7 +1865,10 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 .pSwapchains = &swapchain,
                 .pImageIndices = &imageIdx,
             };
-            if (exportIsolatedOn()) {
+            /* Test the REAL isolated predicate, not LSFGVK_EXPORT_ISOLATED:
+               that env var is not set by any profile, so testing it made this
+               guard permanently false and the faulting scanout still ran. */
+            if (isIsolated(swapchain)) {
                 /* The isolated swapchain has no scanout: presenting to it
                    faults inside radv. Its images are only a staging point for
                    our copy, so there is nothing to scan out and nothing to wait

@@ -23,3 +23,4 @@ eb03799 | furmark-decoupled-bench | FAIL: copy-device selector queried the game'
 fe4339d | furmark-decoupled-bench | FAIL: move ctor dropped ring/copyVk -> present sees ring=0 | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T210223
 c09da53 | furmark-decoupled-bench | 0 published: stray forward-present block short-circuited the ring copy after 'copy begin' | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211320
 32915fe | furmark-decoupled-bench | FIRST end-to-end frame (claim/fence/publish/app-claim/release) but only 1 present reaches the layer; game stops presenting after frame 1, cause unknown | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211419
+ecb2130 | furmark-decoupled-bench | FAIL: game SIGSEGV in radv via forward-present on the scanout-less isolated swapchain (exit 139) | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T211638
