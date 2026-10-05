@@ -158,6 +158,19 @@ namespace lsfgvk::layer {
         /// Null in every other transport, so udmabuf_ring is a new path that
         /// leaves DecoupledDma and Udmabuf untouched.
         std::unique_ptr<ls::ipc::UdmabufRing> ring;
+        /// COPY-ONLY VkDevice on the render card (Transport::UdmabufRing).
+        /// The ring slots are imported HERE, not on the game's device, so they
+        /// never enter the game device's global BO list
+        /// (radv_amdgpu_bo.c:1224 -> radv_amdgpu_cs.c:902) and the game's
+        /// submits stop carrying them. That list is per VkDevice
+        /// (radv_CreateDevice -> radv_create_winsys), so a private device on
+        /// the same card has an empty one.
+        std::unique_ptr<vk::Vulkan> copyVk;
+        std::vector<vk::Image> copySlotImages;
+        std::vector<ls::lazy<vk::CommandBuffer>> copyCbs;
+        std::vector<ls::lazy<vk::Fence>> copyFences;
+        /// monotonically increasing frame sequence published to the ring
+        std::atomic<std::uint64_t> ringSeq{0};
 
         // slot ring state
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> slotFree{};

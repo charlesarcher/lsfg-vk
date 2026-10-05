@@ -671,9 +671,59 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 this->ipcConn->attachFd(this->ring->releaseControlFd());
                 this->ipcConn->send(ls::ipc::RingCtrl{});
             }
+            // Import the slots on a COPY-ONLY VkDevice on the render card, not
+            // on the game's device. radv's global BO list is per VkDevice, so
+            // the game's submits no longer carry these buffers at all - that
+            // is what removes the ~30 ms implicit-sync stall.
+            // Select the SAME physical device as the game, by deviceID, so the
+            // copy runs on the render card rather than drifting to device 0.
+            auto selectSameCard = [&vk](const vk::VulkanInstanceFuncs& fi,
+                    const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
+                VkPhysicalDeviceProperties2 gp{
+                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+                };
+                fi.GetPhysicalDeviceProperties2(vk.physdev(), &gp);
+                for (auto pd : devs) {
+                    VkPhysicalDeviceProperties2 p{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+                    };
+                    fi.GetPhysicalDeviceProperties2(pd, &p);
+                    if (p.properties.deviceID == gp.properties.deviceID
+                        && std::string(p.properties.deviceName)
+                            == gp.properties.deviceName)
+                        return pd;
+                }
+                throw ls::error("ring: render card not found among physical devices");
+            };
+            this->copyVk = std::make_unique<vk::Vulkan>(
+                "lsfg-ring-copy", vk::version{1, 3, 0},
+                "lsfg-ring-copy", vk::version{1, 3, 0},
+                selectSameCard, true, std::nullopt, std::nullopt, true, false);
             std::fprintf(stderr,
-                "lsfg-vk: ring setup K=%u slotBytes=%zu ext=%ux%u fds=%u+ctrl sent\n",
-                k, slotBytes, this->info.extent.width, this->info.extent.height, k);
+                "lsfg-vk: copy-only device for the ring on the render card\n");
+            std::fflush(stderr);
+
+            vk::ImageLayout slotLayout{};
+            slotLayout.mode = vk::ImageMode::Linear;
+            slotLayout.rowPitch = 0;
+            slotLayout.drmModifier = 0;
+            const VkImageUsageFlags slotUsage =
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            this->copySlotImages.reserve(k);
+            this->copyCbs.reserve(k);
+            this->copyFences.reserve(k);
+            for (std::uint32_t i = 0; i < k; ++i) {
+                this->copySlotImages.emplace_back(*this->copyVk,
+                    this->info.extent, this->info.format, slotUsage,
+                    ::dup(this->ring->slots()[i].udmabuf), std::nullopt,
+                    slotLayout);
+                this->copyCbs.emplace_back().emplace(*this->copyVk);
+                this->copyFences.emplace_back().emplace(*this->copyVk, true);
+            }
+
+            std::fprintf(stderr,
+                "lsfg-vk: ring setup K=%u slotBytes=%zu ext=%ux%u fds=%u+ctrl sent, %u slots imported on copy device\n",
+                k, slotBytes, this->info.extent.width, this->info.extent.height, k, k);
             std::fflush(stderr);
         } catch (const std::exception& e) {
             std::cerr << "lsfg-vk: external stream error: ring setup failed: "
@@ -1616,6 +1666,109 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             "a-swapchain", this->fidx,
             "n/a", "n/a (game swapchain, not a dma-buf export)");
+    }
+
+    // --- udmabuf ring: copy on the PRIVATE device, publish, never wait -----
+    // One free slot or nothing: if the doubler is behind, this frame is
+    // skipped rather than queued behind it. The layer never waits on the
+    // doubler, and never waits on anything but its own copy fence.
+    if (this->profile.transport == ls::Transport::UdmabufRing && this->ring) {
+        const std::uint64_t seq = this->ringSeq.fetch_add(1,
+            std::memory_order_relaxed) + 1;
+        const int slot = this->ring->control().claimForWrite(seq, 0);
+        if (slot < 0) {
+            if (std::getenv("LSFGVK_RING_DBG")) {
+                static std::uint32_t nSkip = 0;
+                if (nSkip < 8) {
+                    ++nSkip;
+                    std::fprintf(stderr,
+                        "lsfg-vk: ring no free slot, skipping frame seq=%llu\n",
+                        (unsigned long long)seq);
+                    std::fflush(stderr);
+                }
+            }
+            const VkPresentInfoKHR fwd{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = next_chain,
+            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &imageIdx,
+        };
+        const auto r = vk.df().QueuePresentKHR(queue, &fwd);
+        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
+            throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
+        return r;
+        }
+        const auto idx = static_cast<std::uint32_t>(slot);
+        vk::Vulkan& cvk = *this->copyVk;
+        auto& fence = *this->copyFences.at(idx);
+        // Our OWN fence: the only wait in this path. Timeout 0 means "already
+        // signalled", so this never blocks on the doubler or on the GPU.
+        if (!fence.wait(*this->copyVk, 0)) {
+            this->ring->control().release(idx);
+            if (std::getenv("LSFGVK_RING_DBG")) {
+                std::fprintf(stderr,
+                    "lsfg-vk: ring slot %u still busy, skipping frame seq=%llu\n",
+                    idx, (unsigned long long)seq);
+                std::fflush(stderr);
+            }
+            const VkPresentInfoKHR fwd{
+            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+            .pNext = next_chain,
+            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+            .swapchainCount = 1,
+            .pSwapchains = &swapchain,
+            .pImageIndices = &imageIdx,
+        };
+        const auto r = vk.df().QueuePresentKHR(queue, &fwd);
+        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
+            throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
+        return r;
+        }
+        fence.reset(*this->copyVk);
+        auto& cb = *this->copyCbs.at(idx);
+        cb.begin(cvk);
+        const uint32_t w = this->info.extent.width;
+        const uint32_t h = this->info.extent.height;
+        const vk::Image& dst = this->copySlotImages.at(idx);
+        VkImageMemoryBarrier toDst = barrierHelper(dst.handle(),
+            VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        cvk.df().CmdPipelineBarrier(cb.raw(),
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toDst);
+        const VkImageCopy region{
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .extent = { w, h, 1 }
+        };
+        cvk.df().CmdCopyImage(cb.raw(),
+            srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            dst.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        VkImageMemoryBarrier done = barrierHelper(dst.handle(),
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        cvk.df().CmdPipelineBarrier(cb.raw(),
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &done);
+        cb.end(cvk);
+        cb.submit(cvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
+            fence.handle());
+        // Publish to the control block with release ordering; the doubler sees
+        // the metadata before Complete.
+        this->ring->control().publishComplete(idx, seq, 0,
+            this->info.extent.width, this->info.extent.height,
+            static_cast<std::uint32_t>(this->info.format));
+        if (std::getenv("LSFGVK_RING_DBG")) {
+            std::fprintf(stderr,
+                "lsfg-vk: ring published seq=%llu slot=%u (no CPU copy, no wait on the doubler)\n",
+                (unsigned long long)seq, idx);
+            std::fflush(stderr);
+        }
     }
 
     // record blit info.images[imageIdx] -> staging[slot] waiting on game's
