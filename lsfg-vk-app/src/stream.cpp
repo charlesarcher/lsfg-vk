@@ -337,6 +337,11 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             // No app-owned staging in this transport. sourceImages are filled
             // in when the ring fds arrive (presentation.cpp).
             for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+                // Skip when already present: this handshake runs again on
+                // every resize and on Close, and emplace over a live
+                // std::optional throws "lazy: value already present".
+                if (state.sourceImages.at(i).has_value())
+                    continue;
                 state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },
                     state.captureFormat, imgUsage,
                     std::nullopt, std::nullopt, layout,
