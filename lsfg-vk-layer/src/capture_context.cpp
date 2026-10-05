@@ -1592,9 +1592,34 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
        transport the staging slotFree mask is never maintained, so
        trySelectFreeSlot() always returns nullopt and the whole capture block
        was being skipped. */
+    std::uint32_t ringSlotIdx = UINT32_MAX;
+    std::uint64_t ringSeqNow = 0;
     const bool ringPath = this->profile.transport == ls::Transport::UdmabufRing
         && this->ring != nullptr;
-    if (!ringPath) {
+    if (ringPath) {
+        /* The ring's own slot bookkeeping lives in the control block, so the
+           staging-slot machinery below is not just unnecessary here, it is
+           wrong: slotFree is never maintained in this transport and the gate
+           below would skip every frame. */
+        const std::uint64_t seq = this->ringSeq.fetch_add(1,
+            std::memory_order_relaxed) + 1;
+        const int claimed = this->ring->control().claimForWrite(seq, 0);
+        if (claimed < 0) {
+            if (std::getenv("LSFGVK_RING_DBG")) {
+                static std::uint32_t nSkip = 0;
+                if (nSkip < 8) {
+                    ++nSkip;
+                    std::fprintf(stderr,
+                        "lsfg-vk: ring no free slot, skipping frame seq=%llu\n",
+                        (unsigned long long)seq);
+                    std::fflush(stderr);
+                }
+            }
+        } else {
+            ringSlotIdx = static_cast<std::uint32_t>(claimed);
+            ringSeqNow = seq;
+        }
+    } else
     if (const auto picked = skipAll ? std::nullopt : this->trySelectFreeSlot()) {
         slot = *picked;
     } else {
@@ -1707,21 +1732,10 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // One free slot or nothing: if the doubler is behind, this frame is
     // skipped rather than queued behind it. The layer never waits on the
     // doubler, and never waits on anything but its own copy fence.
-    if (ringPath) {
-        const std::uint64_t seq = this->ringSeq.fetch_add(1,
-            std::memory_order_relaxed) + 1;
-        const int slot = this->ring->control().claimForWrite(seq, 0);
-        if (slot < 0) {
-            if (std::getenv("LSFGVK_RING_DBG")) {
-                static std::uint32_t nSkip = 0;
-                if (nSkip < 8) {
-                    ++nSkip;
-                    std::fprintf(stderr,
-                        "lsfg-vk: ring no free slot, skipping frame seq=%llu\n",
-                        (unsigned long long)seq);
-                    std::fflush(stderr);
-                }
-            }
+    if (ringPath && ringSlotIdx != UINT32_MAX) {
+        const std::uint64_t seq = ringSeqNow;
+        const int slot = static_cast<int>(ringSlotIdx);
+        {
             const VkPresentInfoKHR fwd{
             .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
             .pNext = next_chain,
@@ -2283,5 +2297,5 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     phaseLog("forwarded present returned (TOTAL)");
 
     return res;
-    }   // end !ringPath (staging-slot capture path)
+
 }

@@ -20,3 +20,4 @@ f5e5e95 | furmark-decoupled-bench | FAIL: app 'lazy: value already present' -> l
 780e9d8 | furmark-decoupled-bench | 0 published: 1440 skip-IPC debug gate hid first 16 presents from the ring | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T205226
 63e8bf9 | furmark-decoupled-bench | still 0 published: capture gated on staging slotFree which the ring never fills | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T205341
 eb03799 | furmark-decoupled-bench | FAIL: copy-device selector queried the game's VkPhysicalDevice across instances -> loader ERROR, no ring setup | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T205947
+fe4339d | furmark-decoupled-bench | FAIL: move ctor dropped ring/copyVk -> present sees ring=0 | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T210223
