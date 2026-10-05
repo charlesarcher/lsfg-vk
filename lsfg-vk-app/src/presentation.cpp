@@ -2573,6 +2573,49 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         bool gotFrame{ false };
         try {
             for (;;) {
+            // --- udmabuf ring: consume newest-complete, never wait --------------
+            // The render side publishes slots and never blocks. We take the newest
+            // Complete slot with a CAS; if none is new we fall through to the normal
+            // FRAME-driven path (there is no FRAME in this transport, so the loop
+            // simply keeps its last image). Nothing here waits on the render side.
+            if (ringTransport) {
+                uint64_t seq = 0;
+                int slot = state.ring->claimNewestComplete(&seq);
+                if (slot < 0) {
+                    if (std::getenv("LSFGVK_RING_DBG")) {
+                        static uint32_t nIdle = 0;
+                        if (nIdle < 8) {
+                            ++nIdle;
+                            std::fprintf(stderr,
+                                "lsfg-vk-app: ring idle (no new complete slot), keeping last image\n");
+                            std::fflush(stderr);
+                        }
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    continue;
+                }
+                const auto idx = static_cast<std::uint32_t>(slot);
+                if (std::getenv("LSFGVK_RING_DBG")) {
+                    std::fprintf(stderr,
+                        "lsfg-vk-app: ring claimed seq=%llu slot=%u\n",
+                        (unsigned long long)seq, idx);
+                    std::fflush(stderr);
+                }
+                // Hand the slot to the present path as if it were an imported
+                // source image: snapshot from ringSlotImages[idx] into genSources,
+                // then present, then release the slot.
+                inbox.push(PendingFrame{
+                    .doneFds = {},
+                    .snapFd = -1,
+                    .stagingIdx = idx,
+                    .captureTsNs = seq,
+                    .recvTsNs = 0,
+                    .schedDoneNs = 0,
+                    .srcFidx = UINT64_MAX,
+                });
+                continue;
+            }
+
                 if (stop.load(std::memory_order_relaxed)
                         || failed.load(std::memory_order_relaxed))
                     break;
@@ -3365,13 +3408,26 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         decoupledFilled = true;
                     }
                 }
+                // udmabuf ring: the slot image IS the source. It was imported
+                // on our own card, so the snapshot copy below is a plain
+                // image->image DMA with no CPU involvement and no cross-device
+                // import at all.
+                const bool ringSrc = ringTransport
+                    && sidx < state.ringSlotImages.size()
+                    && state.ringSlotImages.at(sidx).has_value();
                 const bool bounceSrc = state.udmaBufs.at(sidx).has_value()
-                    || decoupledFilled;
-                auto& srcLazy = bounceSrc
-                    ? state.genSources.at(sidx)
-                    : (state.aImports.at(sidx).has_value()
-                        ? state.aImports.at(sidx)
-                        : state.sourceImages.at(sidx));
+                    || decoupledFilled || ringSrc;
+                // Pointer, not a ternary of value types: vk::Image has no
+                // default ctor and the other branch is a lazy<Image>.
+                const vk::Image* ringSrcImg = ringSrc
+                    ? &*state.ringSlotImages.at(sidx) : nullptr;
+                const vk::Image* srcImagePtr = ringSrcImg != nullptr
+                    ? ringSrcImg
+                    : (bounceSrc
+                        ? &*state.genSources.at(sidx)
+                        : (state.aImports.at(sidx).has_value()
+                            ? &*state.aImports.at(sidx)
+                            : &*state.sourceImages.at(sidx)));
                 auto& snapLazy = state.genSources.at(sidx);
                 const bool fromA = state.aImports.at(sidx).has_value() && !bounceSrc;
                 const bool swizzleBlit = fromA
@@ -3433,7 +3489,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     }
                     cb.copyImage(vk,
                         {
-                            makeBlitBarrier(srcLazy.mut().handle(),
+                            makeBlitBarrier((*srcImagePtr).handle(),
                                 VK_ACCESS_NONE, srcOld,
                                 VK_ACCESS_TRANSFER_READ_BIT, srcNew,
                                 srcQ, dstQ),
@@ -3441,7 +3497,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                                 VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
                                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
                         },
-                        { srcLazy.mut().handle(), mid.handle() },
+                        { (*srcImagePtr).handle(), mid.handle() },
                         imgExtent,
                         {
                             makeBlitBarrier(mid.handle(),
@@ -3496,7 +3552,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 cb.begin(vk);
                 cb.copyImage(vk,
                     {
-                        makeBlitBarrier(srcLazy.mut().handle(),
+                        makeBlitBarrier((*srcImagePtr).handle(),
                             VK_ACCESS_NONE, srcOld,
                             VK_ACCESS_TRANSFER_READ_BIT, srcNew,
                             srcQ, dstQ),
@@ -3504,7 +3560,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
                             VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
                     },
-                    { srcLazy.mut().handle(), snapLazy.mut().handle() },
+                    { (*srcImagePtr).handle(), snapLazy.mut().handle() },
                     imgExtent,
                     {
                         makeBlitBarrier(snapLazy.mut().handle(),
@@ -3549,6 +3605,23 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // by presentReal(), so the layer is unaffected by skipping it.
                 if (!bounceSrc) {
                     snapFd = snapshotSem.exportFd(vk);
+                }
+                /* Ring: hand the slot back to the producer.
+                   We do NOT block on our own fence here, unlike the bounceSrc
+                   path above whose blocking wait is the ~36.6 ms park the goal
+                   forbids. The ordering is instead carried by the control
+                   block: the render side claims slots with a CAS and skips the
+                   frame when a slot is not Free, and its copy fence gates the
+                   reuse. Neither process ever waits for the other, which is
+                   what lets us release the slot as soon as the copy is queued. */
+                if (ringTransport) {
+                    state.ring->release(sidx);
+                    if (std::getenv("LSFGVK_RING_DBG")) {
+                        std::fprintf(stderr,
+                            "lsfg-vk-app: ring slot %u released after copy queued (no host wait)\n",
+                            sidx);
+                        std::fflush(stderr);
+                    }
                 }
                 LSFG_FRAME_DBG("input: snapshot submitted xferQ=%d sameAsGfx=%d (fidx %llu)",
                     vk.transferQueueHandle() != VK_NULL_HANDLE,
