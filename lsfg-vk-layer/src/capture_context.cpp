@@ -1836,14 +1836,24 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 (unsigned long long)seq, idx);
             std::fflush(stderr);
         }
-        // Forward the game's present so the render side keeps running. The
-        // ring has no scanout of its own; the copy above is side-band.
+        /* Forward the game's present so the render side keeps running, and do
+           it the way the working staging tail does: pNext null and ZERO wait
+           semaphores.
+
+           Passing next_chain through hands the caller's
+           VkSwapchainPresentFenceInfoKHR to this present, so the present fences
+           are consumed here and the caller's isolated deferred work never gets
+           to signal them. The game then waits on a recycle fence that is never
+           signalled and stops presenting after exactly one frame - which is
+           what we measured. With pNext null the fences stay untouched and the
+           caller handles them, and the semaphores were already consumed by the
+           copy submit above. */
         {
             const VkPresentInfoKHR ringFwd{
                 .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                .pNext = next_chain,
-                .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
-                .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+                .pNext = nullptr,
+                .waitSemaphoreCount = 0,
+                .pWaitSemaphores = nullptr,
                 .swapchainCount = 1,
                 .pSwapchains = &swapchain,
                 .pImageIndices = &imageIdx,
