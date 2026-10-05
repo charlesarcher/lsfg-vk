@@ -351,6 +351,48 @@ namespace ls::ipc {
 
     std::vector<std::byte> encodePayload(const Close&) { return {}; }
 
+    std::vector<std::byte> encodePayload(const RingSetup& r) {
+        std::vector<std::byte> out{};
+        out.reserve(12);
+        putU32(out, r.slotCount);
+        putU64(out, r.slotBytes);
+        return out;
+    }
+
+    RingSetup decodeRingSetup(const std::span<const std::byte> payload) {
+        if (payload.size() != 12)
+            throw ls::error("malformed RING_SETUP payload: wrong size");
+        std::span<const std::byte> cur = payload;
+        RingSetup r{};
+        r.slotCount = getU32(cur);
+        r.slotBytes = getU64(cur);
+        return r;
+    }
+
+    std::vector<std::byte> encodePayload(const RingSlotFd& r) {
+        std::vector<std::byte> out{};
+        out.reserve(4);
+        putU32(out, r.slotIdx);
+        return out;
+    }
+
+    RingSlotFd decodeRingSlotFd(const std::span<const std::byte> payload) {
+        if (payload.size() != 4)
+            throw ls::error("malformed RING_SLOT payload: wrong size");
+        std::span<const std::byte> cur = payload;
+        RingSlotFd r{};
+        r.slotIdx = getU32(cur);
+        return r;
+    }
+
+    std::vector<std::byte> encodePayload(const RingCtrl&) { return {}; }
+
+    RingCtrl decodeRingCtrl(const std::span<const std::byte> payload) {
+        if (!payload.empty())
+            throw ls::error("malformed RING_CTRL payload: expected empty");
+        return RingCtrl{};
+    }
+
     Close decodeClose(const std::span<const std::byte> payload) {
         if (!payload.empty())
             throw ls::error("malformed CLOSE payload: expected empty");
@@ -366,6 +408,9 @@ namespace ls::ipc {
             case MsgType::Ready: return decodeReady(payload);
             case MsgType::Frame: return decodeFrame(payload);
             case MsgType::Release: return decodeRelease(payload);
+            case MsgType::RingSetup: return decodeRingSetup(payload);
+            case MsgType::RingSlotFd: return decodeRingSlotFd(payload);
+            case MsgType::RingCtrl: return decodeRingCtrl(payload);
             case MsgType::Close: return decodeClose(payload);
         }
         throw ls::error("unknown ipc message type " + std::to_string(static_cast<int>(type)));

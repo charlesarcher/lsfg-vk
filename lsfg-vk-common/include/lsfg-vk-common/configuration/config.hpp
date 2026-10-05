@@ -68,7 +68,14 @@ namespace ls {
         /// with compatibleHandleTypes==0 on this driver, and a buffer has no
         /// modifier or pitch for the two GPUs to disagree about. DmaBuf
         /// (p2p) is unchanged and still selected by transport="dmabuf".
-        Udmabuf
+        Udmabuf,
+        /// Ring of K kernel udmabufs, created by the RENDER side, imported as
+        /// dma-bufs on each card. Only GPU DMA copies move pixels: no malloc,
+        /// no posix_memalign, no VK_EXT_external_memory_host, no CPU frame
+        /// copy. The hand-off is a shared control block (sequence + state per
+        /// slot) rather than a cross-process wait, so neither side ever blocks
+        /// on the other. K comes from `ringSlots`, default 3.
+        UdmabufRing
     };
 
     /// game profile configuration

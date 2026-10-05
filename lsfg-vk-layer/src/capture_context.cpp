@@ -640,6 +640,48 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         throw;
     }
 
+    // --- udmabuf ring: WE create it, we own it, we hand the fds over ------
+    // The frame data lands on THIS side, so the render process owns every
+    // buffer. The doubler imports the fds we send and never creates one.
+    // K slots + one control block, all kernel udmabufs; slot payload moves by
+    // GPU DMA only and the hand-off is the control block's CAS words, so
+    // neither process ever waits on the other.
+    if (this->profile.transport == ls::Transport::UdmabufRing) {
+        try {
+            const std::size_t slotBytes = static_cast<std::size_t>(this->info.extent.width)
+                * 4 * static_cast<std::size_t>(this->info.extent.height);
+            const std::uint32_t k = this->profile.ringSlots == 0
+                ? 3u : this->profile.ringSlots;
+
+            this->ring = std::make_unique<ls::ipc::UdmabufRing>(k, slotBytes,
+                this->info.extent.width, this->info.extent.height,
+                static_cast<std::uint32_t>(this->info.format));
+
+            // RING_SETUP carries no fd; it tells the app how many slots follow.
+            // RING_SLOT carries one udmabuf fd each, in slot order. RING_CTRL
+            // carries the control-block fd last, so the app holds every slot fd
+            // before it can map the block and start consuming.
+            {
+                std::lock_guard<std::mutex> lk(this->ipcMu);
+                this->ipcConn->send(ls::ipc::RingSetup{ k, slotBytes });
+                for (std::uint32_t i = 0; i < k; ++i) {
+                    this->ipcConn->attachFd(::dup(this->ring->slots()[i].udmabuf));
+                    this->ipcConn->send(ls::ipc::RingSlotFd{ i });
+                }
+                this->ipcConn->attachFd(this->ring->releaseControlFd());
+                this->ipcConn->send(ls::ipc::RingCtrl{});
+            }
+            std::fprintf(stderr,
+                "lsfg-vk: ring setup K=%u slotBytes=%zu ext=%ux%u fds=%u+ctrl sent\n",
+                k, slotBytes, this->info.extent.width, this->info.extent.height, k);
+            std::fflush(stderr);
+        } catch (const std::exception& e) {
+            std::cerr << "lsfg-vk: external stream error: ring setup failed: "
+                << e.what() << "\n";
+            throw ls::error(std::string("lsfg-vk: external stream error: ") + e.what());
+        }
+    } else {
+
     // --- receive 2 staging-image handoffs from the app ----------------------
     // the app owns the staging images (created in its OWN local VRAM on the
     // processing device, exported as dma-buf). importing them TRANSFER_DST-only
@@ -753,6 +795,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         throw ls::error(std::string("lsfg-vk: external stream error: ") + e.what(), e);
     }
 
+    }
     // --- capture command buffer + per-slot sync-fd semaphores ---------------
     try {
         // Session 13.17: capture ring - render thread never blocks on the

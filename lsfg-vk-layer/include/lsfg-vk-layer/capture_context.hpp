@@ -6,6 +6,7 @@
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/ipc/latency_ledger.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
+#include "lsfg-vk-common/ipc/udmabuf_ring.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
@@ -153,6 +154,10 @@ namespace lsfgvk::layer {
 
         // IPC stream (STAGING_RING_DEPTH slots, maps to the backend's sources)
         std::optional<ls::ipc::Connection> ipcConn;
+        /// udmabuf ring, owned by the RENDER side (Transport::UdmabufRing).
+        /// Null in every other transport, so udmabuf_ring is a new path that
+        /// leaves DecoupledDma and Udmabuf untouched.
+        std::unique_ptr<ls::ipc::UdmabufRing> ring;
 
         // slot ring state
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> slotFree{};
