@@ -1505,7 +1505,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     if (std::getenv("LSFGVK_RING_DBG")) {
         static std::uint64_t nPresent = 0;
         if (++nPresent <= 4
-                || (nPresent % 500) == 0) {
+                || (nPresent % 25) == 0) {
             std::fprintf(stderr,
                 "lsfg-vk: CaptureContext::present #%llu ring=%d fidx=%llu\n",
                 (unsigned long long)nPresent,
@@ -1618,6 +1618,13 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         const std::uint64_t seq = this->ringSeq.fetch_add(1,
             std::memory_order_relaxed) + 1;
         const int claimed = this->ring->control().claimForWrite(seq, 0);
+        if (std::getenv("LSFGVK_RING_DBG")) {
+            std::fprintf(stderr,
+                "lsfg-vk: ring claim seq=%llu slot=%d K=%u\n",
+                (unsigned long long)seq, claimed,
+                this->ring->control().count());
+            std::fflush(stderr);
+        }
         if (claimed < 0) {
             if (std::getenv("LSFGVK_RING_DBG")) {
                 static std::uint32_t nSkip = 0;
@@ -1749,27 +1756,24 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     if (ringPath && ringSlotIdx != UINT32_MAX) {
         const std::uint64_t seq = ringSeqNow;
         const int slot = static_cast<int>(ringSlotIdx);
-        {
-            const VkPresentInfoKHR fwd{
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = next_chain,
-            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
-            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
-            .swapchainCount = 1,
-            .pSwapchains = &swapchain,
-            .pImageIndices = &imageIdx,
-        };
-        const auto r = vk.df().QueuePresentKHR(queue, &fwd);
-        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
-            throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
-        return r;
+        if (std::getenv("LSFGVK_RING_DBG")) {
+            std::fprintf(stderr,
+                "lsfg-vk: ring copy begin seq=%llu slot=%d\n",
+                (unsigned long long)seq, slot);
+            std::fflush(stderr);
         }
         const auto idx = static_cast<std::uint32_t>(slot);
         vk::Vulkan& cvk = *this->copyVk;
         auto& fence = *this->copyFences.at(idx);
         // Our OWN fence: the only wait in this path. Timeout 0 means "already
         // signalled", so this never blocks on the doubler or on the GPU.
-        if (!fence.wait(*this->copyVk, 0)) {
+        const bool fenceFree = fence.wait(*this->copyVk, 0);
+        if (std::getenv("LSFGVK_RING_DBG")) {
+            std::fprintf(stderr,
+                "lsfg-vk: ring slot %u fenceFree=%d\n", slot, fenceFree ? 1 : 0);
+            std::fflush(stderr);
+        }
+        if (!fenceFree) {
             this->ring->control().release(idx);
             if (std::getenv("LSFGVK_RING_DBG")) {
                 std::fprintf(stderr,
@@ -1831,6 +1835,23 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 "lsfg-vk: ring published seq=%llu slot=%u (no CPU copy, no wait on the doubler)\n",
                 (unsigned long long)seq, idx);
             std::fflush(stderr);
+        }
+        // Forward the game's present so the render side keeps running. The
+        // ring has no scanout of its own; the copy above is side-band.
+        {
+            const VkPresentInfoKHR ringFwd{
+                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
+                .pNext = next_chain,
+                .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
+                .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
+                .swapchainCount = 1,
+                .pSwapchains = &swapchain,
+                .pImageIndices = &imageIdx,
+            };
+            const auto r = vk.df().QueuePresentKHR(queue, &ringFwd);
+            if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
+                throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
+            return r;
         }
     }
 
