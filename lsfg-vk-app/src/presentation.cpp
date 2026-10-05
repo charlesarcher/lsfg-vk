@@ -3614,6 +3614,21 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                    frame when a slot is not Free, and its copy fence gates the
                    reuse. Neither process ever waits for the other, which is
                    what lets us release the slot as soon as the copy is queued. */
+
+                LSFG_FRAME_DBG("input: snapshot submitted xferQ=%d sameAsGfx=%d (fidx %llu)",
+                    vk.transferQueueHandle() != VK_NULL_HANDLE,
+                    vk.transferQueueHandle() == vk.queue() ? 1 : 0,
+                    (unsigned long long)fidx);
+                if (dmaHop) {
+                    /* Release was already sent immediately after hopShareToOffload */
+                    pendingDmaRelease = -1;
+                }
+                /* Ring: hand the slot back to the producer.
+                   This must sit AFTER the if/else that submits the copy. The
+                   ring takes the `if` branch (it submits its own copy on the
+                   doubler queue), so a release placed inside the else branch
+                   never ran: the ring filled after K frames and the producer
+                   skipped forever, which is what we measured. */
                 if (ringTransport) {
                     state.ring->release(sidx);
                     if (std::getenv("LSFGVK_RING_DBG")) {
@@ -3622,14 +3637,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                             sidx);
                         std::fflush(stderr);
                     }
-                }
-                LSFG_FRAME_DBG("input: snapshot submitted xferQ=%d sameAsGfx=%d (fidx %llu)",
-                    vk.transferQueueHandle() != VK_NULL_HANDLE,
-                    vk.transferQueueHandle() == vk.queue() ? 1 : 0,
-                    (unsigned long long)fidx);
-                if (dmaHop) {
-                    /* Release was already sent immediately after hopShareToOffload */
-                    pendingDmaRelease = -1;
                 }
                 if (fidx >= 20 && fidx - lastDumpFidx >= 40
                         && state.genSources.at(sidx).has_value()
