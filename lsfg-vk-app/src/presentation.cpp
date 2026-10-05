@@ -2471,8 +2471,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
             }
 
-            // drain frames left in the inbox / cur so no fd leaks at teardown.
-            while (auto pf = inbox.takeNewest()) {
+            /* Drain frames left in the inbox / cur so no fd leaks at teardown.
+               The optional must be DECLARED OUTSIDE the condition. In
+               `while (auto pf = ...)`, pf is a prvalue temporary that is
+               destroyed at the end of the condition expression, so the body
+               dereferenced an already-destroyed object:
+                 AddressSanitizer: stack-use-after-scope
+                   presentation.cpp:2193   <- the body of the other pf
+                   [5792, 5864) 'pf' (line 2475)
+               Same shape at the second drain loop below. */
+            for (auto pf = inbox.takeNewest(); pf.has_value();
+                    pf = inbox.takeNewest()) {
                 for (int d : pf->doneFds)
                     if (d >= 0)
                         ::close(d);
@@ -3826,7 +3835,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
 
     // close any fds still in the inbox (the input may have pushed after the
     // output's drain) and idle the device before the RAII guard destroys WSI.
-    while (auto pf = inbox.takeNewest())
+    for (auto pf = inbox.takeNewest(); pf.has_value();
+            pf = inbox.takeNewest())
         for (int d : pf->doneFds)
             if (d >= 0)
                 ::close(d);
