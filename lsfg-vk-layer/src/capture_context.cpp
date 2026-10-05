@@ -703,9 +703,11 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 "lsfg-vk: copy-only device for the ring on the render card\n");
             std::fflush(stderr);
 
+            // Same tight pitch the doubler imports with (width*4): the slot
+            // payload is width*4 per row, so neither side has to negotiate.
             vk::ImageLayout slotLayout{};
             slotLayout.mode = vk::ImageMode::Linear;
-            slotLayout.rowPitch = 0;
+            slotLayout.rowPitch = static_cast<std::size_t>(this->info.extent.width) * 4;
             slotLayout.drmModifier = 0;
             const VkImageUsageFlags slotUsage =
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;

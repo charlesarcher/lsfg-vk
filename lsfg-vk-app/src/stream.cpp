@@ -701,9 +701,13 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             // tools/testing/udmabuf_hostptr_probe.cpp), and the source
             // swapchain image needs image semantics, so the slot is imported
             // as an image rather than a buffer.
+            // rowPitch must be explicit for a dma-buf exchange image; the
+            // renderer publishes its pitch in the control block header and the
+            // slot payload is width*4 tightly packed, so width*4 is the value
+            // both sides agree on and no per-resize negotiation is needed.
             vk::ImageLayout slotLayout{};
             slotLayout.mode = vk::ImageMode::Linear;
-            slotLayout.rowPitch = 0;
+            slotLayout.rowPitch = static_cast<std::size_t>(w) * 4;
             slotLayout.drmModifier = 0;
             // resize() only when the vector is empty or the wrong size: a
             // re-created ring would otherwise resize over live std::optional
