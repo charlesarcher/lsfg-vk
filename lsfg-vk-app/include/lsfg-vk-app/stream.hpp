@@ -79,6 +79,10 @@ namespace ls::ipc {
         // a vector; K comes from the profile, not from the compile-time depth.
         std::vector<int> ringSlotFds;
         std::unique_ptr<ls::ipc::ControlBlock> ring;
+        /// each slot's udmabuf imported on OUR card as a dma-buf image, so the
+        /// pixels move by GPU DMA (vkCmdCopyImageToImage) and never touch the
+        /// CPU. Indexed by slot, so sized by K.
+        std::vector<std::optional<vk::Image>> ringSlotImages;
         void* ringCtrlMap{nullptr};
         size_t ringCtrlBytes{0};
         int ringCtrlFd{-1};

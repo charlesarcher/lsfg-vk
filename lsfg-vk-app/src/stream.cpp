@@ -689,8 +689,30 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             state.ringSlotFds = slotFds;
             state.ringSlotCount = k;
 
+            // Import each slot's udmabuf as a dma-buf image on OUR card. This
+            // is the only GPU->GPU move available here: a host-pointer import
+            // is rejected by radv (VK_ERROR_INVALID_EXTERNAL_HANDLE, proven by
+            // tools/testing/udmabuf_hostptr_probe.cpp), and the source
+            // swapchain image needs image semantics, so the slot is imported
+            // as an image rather than a buffer.
+            vk::ImageLayout slotLayout{};
+            slotLayout.mode = vk::ImageMode::Linear;
+            slotLayout.rowPitch = 0;
+            slotLayout.drmModifier = 0;
+            state.ringSlotImages.resize(k);
+            for (std::uint32_t i = 0; i < k; ++i) {
+                state.ringSlotImages.at(i).emplace(vk,
+                    VkExtent2D{ static_cast<std::uint32_t>(w), h },
+                    fmt,
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                        | VK_IMAGE_USAGE_SAMPLED_BIT,
+                    slotFds.at(i), std::nullopt, slotLayout,
+                    sourceSharing, concurrentFamilies);
+            }
+
             std::fprintf(stderr,
-                "lsfg-vk-app: ring received K=%u ctrl=%zu bytes, importing %u slots on '%s'\n",
+                "lsfg-vk-app: ring received K=%u ctrl=%zu bytes, imported %u slots as dma-buf images on '%s'\n",
                 k, ctrlBytes, k, "(this device)");
             std::fflush(stderr);
         } catch (const std::exception& e) {
