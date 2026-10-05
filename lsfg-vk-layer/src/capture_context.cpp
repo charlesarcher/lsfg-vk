@@ -1562,6 +1562,14 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     size_t slot = 0;
     static const bool skipAll = std::getenv("LSFGVK_SKIP_ALL")
         && std::getenv("LSFGVK_SKIP_ALL")[0] == '1';
+    /* The ring has its OWN slot bookkeeping in the control block. It must be
+       consulted INSTEAD of the staging-slot gate below, because in this
+       transport the staging slotFree mask is never maintained, so
+       trySelectFreeSlot() always returns nullopt and the whole capture block
+       was being skipped. */
+    const bool ringPath = this->profile.transport == ls::Transport::UdmabufRing
+        && this->ring != nullptr;
+    if (!ringPath) {
     if (const auto picked = skipAll ? std::nullopt : this->trySelectFreeSlot()) {
         slot = *picked;
     } else {
@@ -1674,7 +1682,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     // One free slot or nothing: if the doubler is behind, this frame is
     // skipped rather than queued behind it. The layer never waits on the
     // doubler, and never waits on anything but its own copy fence.
-    if (this->profile.transport == ls::Transport::UdmabufRing && this->ring) {
+    if (ringPath) {
         const std::uint64_t seq = this->ringSeq.fetch_add(1,
             std::memory_order_relaxed) + 1;
         const int slot = this->ring->control().claimForWrite(seq, 0);
@@ -2250,4 +2258,5 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     phaseLog("forwarded present returned (TOTAL)");
 
     return res;
+    }   // end !ringPath (staging-slot capture path)
 }
