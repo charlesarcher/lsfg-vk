@@ -1468,6 +1468,13 @@ int CaptureContext::drainReleases() {
         } else if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
             std::cerr << "lsfg-vk: external stream error: peer error: " << err->message << "\n";
             throw ls::error("lsfg-vk: external stream error: peer error: " + err->message);
+        } else if (std::get_if<ls::ipc::Ready>(&msg) != nullptr
+                && this->profile.transport == ls::Transport::UdmabufRing) {
+            /* The ring transport does not run the READY handshake, but the app
+               still sends READY once the ring fds are imported. It is a
+               no-op here, not a stream error: the ring's own control block is
+               the hand-off. */
+            continue;
         } else {
             // unexpected message in steady state - treat as stream error
             const auto got = ls::ipc::typeOf(msg);
