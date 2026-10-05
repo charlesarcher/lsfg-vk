@@ -688,6 +688,7 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             state.ring = std::make_unique<ls::ipc::ControlBlock>(map, ctrlBytes, false);
             state.ringSlotFds = slotFds;
             state.ringSlotCount = k;
+            state.transport = ls::Transport::UdmabufRing;
 
             // Import each slot's udmabuf as a dma-buf image on OUR card. This
             // is the only GPU->GPU move available here: a host-pointer import

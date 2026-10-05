@@ -1505,6 +1505,29 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     };
 
     // --- OUTPUT thread: the whole swapchain present path ----------------------
+    // --- udmabuf ring consume path ----------------------------------------
+    // The render side publishes slots into the control block and never waits.
+    // The doubler takes the NEWEST complete slot with a CAS; if nothing new is
+    // ready it returns -1 and this thread re-presents its last image rather
+    // than waiting. So the two processes never block each other in either
+    // direction.
+    std::vector<std::optional<vk::CommandBuffer>> ringCbs;
+    std::vector<std::optional<vk::Fence>> ringFences;
+    const bool ringTransport =
+        state.transport == ls::Transport::UdmabufRing && state.ring != nullptr;
+    if (ringTransport) {
+        ringCbs.resize(state.ringSlotImages.size());
+        ringFences.resize(state.ringSlotImages.size());
+        for (size_t i = 0; i < ringCbs.size(); ++i) {
+            ringCbs.at(i).emplace(vk);
+            ringFences.at(i).emplace(vk, true);   // signaled: first wait passes
+        }
+        std::fprintf(stderr,
+            "lsfg-vk-app: ring consume ready K=%zu on '%s'\n",
+            ringCbs.size(), "(doubler)");
+        std::fflush(stderr);
+    }
+
     auto outputLoop = [&] {
         // command buffer ring: one per in-flight present (destCount + 1)
         // each has its own fence to know when the GPU is done with it

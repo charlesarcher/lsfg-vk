@@ -129,6 +129,9 @@ namespace ls::ipc {
         VkFormat sourceFormat{VK_FORMAT_R8G8B8A8_UNORM};
         /// game swapchain format (HELLO). 9070 dma-buf import must match this.
         VkFormat captureFormat{VK_FORMAT_R8G8B8A8_UNORM};
+        /// the negotiated transport for this stream, so the consume path knows
+        /// which ring (if any) to consume without re-reading the config
+        ls::Transport transport{ls::Transport::PosixShm};
         /// motion-flow factor handed to openContext (1/flow_scale)
         float flow{1.0F};
         /// performance-mode flag handed to openContext
