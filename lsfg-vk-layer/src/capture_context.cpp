@@ -760,6 +760,11 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     }
     this->exchangeLayout = layout;
 
+    /* The ring has no app-owned staging: the render side owns the buffers and
+       sends RING_* instead. Skipping the whole STAGING/READY exchange here is
+       what lets the ring reach its first frame; running it blocked on a message
+       that never came and then failed on the READY the app does send. */
+    if (this->profile.transport != ls::Transport::UdmabufRing) {
     try {
         for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
             auto msg = this->ipcConn->receive(std::chrono::milliseconds(10000));
@@ -852,6 +857,8 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     }
 
     }
+    }   // end !UdmabufRing: staging + READY exchange
+
     // --- capture command buffer + per-slot sync-fd semaphores ---------------
     try {
         // Session 13.17: capture ring - render thread never blocks on the
