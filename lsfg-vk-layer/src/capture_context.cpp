@@ -1514,6 +1514,13 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             std::fflush(stderr);
         }
     }
+    if (std::getenv("LSFGVK_RING_DBG")) {
+        static std::uint64_t nEnter = 0;
+        ++nEnter;
+        std::fprintf(stderr, "lsfg-vk: present-ENTER #%llu\n",
+            (unsigned long long)nEnter);
+        std::fflush(stderr);
+    }
     // Session 40 dbl-ledger: lazily arm the (capTs -> slot) sink, env-gated.
     this->ledger.init();
 // RELEASE handling frees slots draining non-blocking
@@ -1858,6 +1865,17 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 .pSwapchains = &swapchain,
                 .pImageIndices = &imageIdx,
             };
+            if (exportIsolatedOn()) {
+                /* The isolated swapchain has no scanout: presenting to it
+                   faults inside radv. Its images are only a staging point for
+                   our copy, so there is nothing to scan out and nothing to wait
+                   on. Report success so the game's present fences do not latch,
+                   and let the caller's deferred work own the recycle fences.
+                     core: #0 libvulkan_radeon.so
+                            #1 CaptureContext::present
+                            #2 myvkQueuePresentKHR                     */
+                return VK_SUCCESS;
+            }
             const auto r = vk.df().QueuePresentKHR(queue, &ringFwd);
             if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
                 throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
