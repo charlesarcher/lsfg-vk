@@ -955,7 +955,13 @@ namespace {
                     }
                     bool skipIpc = false;
                     try {
-                        if (isIsolated(swapchain)) {
+                        /* The udmabuf ring owns the data path, so it must see
+                           EVERY present: skipping the first 16 at >=1440 would
+                           leave the ring unfed for its first 16 frames. Other
+                           transports keep the existing debug skip. */
+                        const bool ringPath = layer_info->root.activeTransport()
+                            == ls::Transport::UdmabufRing;
+                        if (isIsolated(swapchain) && !ringPath) {
                             auto& iso = isolatedAt(swapchain);
                             if (iso.extent.height >= 1440 && iso.presentCount < 16) {
                                 skipIpc = true;
