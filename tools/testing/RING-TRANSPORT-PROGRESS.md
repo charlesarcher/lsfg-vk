@@ -15,3 +15,5 @@ Rule: no CPU frame copies, no malloc/posix_memalign/external_memory_host, GPU DM
 2f2bee0+ring37 | furmark-decoupled-bench | FAIL: transport=udmabuf_ring rejected by parser | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T203520
 7a2710d | furmark-decoupled-bench | FAIL: stream ended 'lazy: value already present' (ring slot images re-emplaced on re-created ring) | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T203636
 f5e5e95 | furmark-decoupled-bench | FAIL: app 'lazy: value already present' -> layer broken pipe | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T204145
+4d16b23 | furmark-decoupled-bench | FAIL: import needs explicit row pitch (error -3); copy-only device + K+1 fds OK | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T204739
+4d16b23 | furmark-decoupled-bench | ring hand-off WORKS (K=3 imported, consume ready) but 0 frames published; LSFGVK_RING_DBG stripped by env -i so no layer trace | /tmp/lsfg-runs/furmark-decoupled-bench/20261004T204912
