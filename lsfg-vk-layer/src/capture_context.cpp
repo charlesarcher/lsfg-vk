@@ -677,23 +677,27 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             // is what removes the ~30 ms implicit-sync stall.
             // Select the SAME physical device as the game, by deviceID, so the
             // copy runs on the render card rather than drifting to device 0.
-            auto selectSameCard = [&vk](const vk::VulkanInstanceFuncs& fi,
+            const std::string gameName = this->gameDeviceName;
+            auto selectSameCard = [&vk, gameName](const vk::VulkanInstanceFuncs& fi,
                     const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
                 VkPhysicalDeviceProperties2 gp{
                     .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
                 };
-                fi.GetPhysicalDeviceProperties2(vk.physdev(), &gp);
+                // Match by NAME, not by handle. The game device belongs to a
+                // different VkInstance, so querying it here is invalid:
+                //   vkGetPhysicalDeviceProperties2: Invalid physicalDevice
+                // The game device name is already known as a string.
+                const std::string want = gameName;
                 for (auto pd : devs) {
                     VkPhysicalDeviceProperties2 p{
                         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
                     };
                     fi.GetPhysicalDeviceProperties2(pd, &p);
-                    if (p.properties.deviceID == gp.properties.deviceID
-                        && std::string(p.properties.deviceName)
-                            == gp.properties.deviceName)
+                    if (want == p.properties.deviceName)
                         return pd;
                 }
-                throw ls::error("ring: render card not found among physical devices");
+                throw ls::error("ring: render card '" + want
+                    + "' not found among physical devices");
             };
             this->copyVk = std::make_unique<vk::Vulkan>(
                 "lsfg-ring-copy", vk::version{1, 3, 0},
@@ -1475,6 +1479,18 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         VkQueue queue, VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
+    if (std::getenv("LSFGVK_RING_DBG")) {
+        static std::uint64_t nPresent = 0;
+        if (++nPresent <= 4
+                || (nPresent % 500) == 0) {
+            std::fprintf(stderr,
+                "lsfg-vk: CaptureContext::present #%llu ring=%d fidx=%llu\n",
+                (unsigned long long)nPresent,
+                this->ring != nullptr ? 1 : 0,
+                (unsigned long long)this->fidx);
+            std::fflush(stderr);
+        }
+    }
     // Session 40 dbl-ledger: lazily arm the (capTs -> slot) sink, env-gated.
     this->ledger.init();
 // RELEASE handling frees slots draining non-blocking
