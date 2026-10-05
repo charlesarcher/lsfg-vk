@@ -11,4 +11,4 @@ Rule: no CPU frame copies, no malloc/posix_memalign/external_memory_host, GPU DM
   VkResult=-1000072003 (VK_ERROR_INVALID_EXTERNAL_HANDLE) at
   src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c:820-822. Intel iGPU accepts the same
   memfd mapping. => dma-buf import only.
-- Tooling: tools/testing/udmabuf_hostptr_probe.cpp (untracked, diagnostic).
+- Tooling: tools/testing/udmabuf_hostptr_probe.cpp (untracked, diagnostic).aa47c7a+ | ring setup/lifecycle | no GPU path yet | n/a

@@ -638,6 +638,66 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         throw ls::error("failed to open backend context", e);
     }
 
+    // 5b. udmabuf ring: receive K slot fds + the control-block fd from the
+    // render side, map the control block, and import each slot as a dma-buf
+    // image on OUR card. The app waits for these because it cannot present
+    // without them; the render side never waits for anything here.
+    if (conf.transport == ls::Transport::UdmabufRing) {
+        try {
+            auto msg = conn.receive(std::chrono::milliseconds(10000));
+            auto* setup = std::get_if<ls::ipc::RingSetup>(&msg);
+            if (setup == nullptr) {
+                const auto got = ls::ipc::typeOf(msg);
+                throw ls::error(std::string("expected RING_SETUP, got ")
+                    + ls::ipc::nameOf(got));
+            }
+            const std::uint32_t k = setup->slotCount;
+            if (k == 0 || k > 64)
+                throw ls::error("ring slot count out of range");
+
+            std::vector<int> slotFds(k, -1);
+            for (std::uint32_t i = 0; i < k; ++i) {
+                auto m2 = conn.receive(std::chrono::milliseconds(10000));
+                auto* sf = std::get_if<ls::ipc::RingSlotFd>(&m2);
+                if (sf == nullptr || sf->slotIdx >= k)
+                    throw ls::error("expected RING_SLOT in slot order");
+                const int fd = conn.takeReceivedFd();
+                if (fd < 0)
+                    throw ls::error("RING_SLOT arrived without its fd");
+                slotFds.at(sf->slotIdx) = fd;
+            }
+            auto m3 = conn.receive(std::chrono::milliseconds(10000));
+            if (!std::holds_alternative<ls::ipc::RingCtrl>(m3))
+                throw ls::error("expected RING_CTRL");
+            const int ctrlFd = conn.takeReceivedFd();
+            if (ctrlFd < 0)
+                throw ls::error("RING_CTRL arrived without its fd");
+
+            const std::size_t ctrlBytes = sizeof(ls::ipc::RingHeader)
+                + sizeof(ls::ipc::RingSlot) * k;
+            void* map = ::mmap(nullptr, ctrlBytes, PROT_READ | PROT_WRITE,
+                MAP_SHARED, ctrlFd, 0);
+            if (map == MAP_FAILED) {
+                ::close(ctrlFd);
+                for (int fd : slotFds) if (fd >= 0) ::close(fd);
+                throw ls::error("ring: control block mmap failed");
+            }
+            state.ringCtrlMap = map;
+            state.ringCtrlBytes = ctrlBytes;
+            state.ringCtrlFd = ctrlFd;
+            state.ring = std::make_unique<ls::ipc::ControlBlock>(map, ctrlBytes, false);
+            state.ringSlotFds = slotFds;
+            state.ringSlotCount = k;
+
+            std::fprintf(stderr,
+                "lsfg-vk-app: ring received K=%u ctrl=%zu bytes, importing %u slots on '%s'\n",
+                k, ctrlBytes, k, "(this device)");
+            std::fflush(stderr);
+        } catch (const std::exception& e) {
+            throw ls::error(std::string("ring handshake failed: ") + e.what());
+        }
+    }
+
     // 6. READY: stream is live.
     conn.send(ls::ipc::Ready{});
 

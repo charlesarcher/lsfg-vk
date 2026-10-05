@@ -5,6 +5,7 @@
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
+#include "lsfg-vk-common/ipc/control_block.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
@@ -72,6 +73,17 @@ namespace ls::ipc {
         std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> hostImages{};
         std::array<void*, STAGING_RING_DEPTH> dmaMaps{};
         std::array<int, STAGING_RING_DEPTH> dmaFds{};
+        // --- udmabuf ring (Transport::UdmabufRing) ---
+        // The RENDER side owns every buffer; these are what it handed us.
+        // ringSlots may be larger than STAGING_RING_DEPTH, so the fds live in
+        // a vector; K comes from the profile, not from the compile-time depth.
+        std::vector<int> ringSlotFds;
+        std::unique_ptr<ls::ipc::ControlBlock> ring;
+        void* ringCtrlMap{nullptr};
+        size_t ringCtrlBytes{0};
+        int ringCtrlFd{-1};
+        uint32_t ringSlotCount{0};
+
         std::array<uint32_t*, STAGING_RING_DEPTH> shmSeq{};
         std::array<uint32_t, STAGING_RING_DEPTH> shmSeen{};
         size_t shmBytes{0};
