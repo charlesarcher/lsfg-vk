@@ -1103,6 +1103,15 @@ CaptureContext::CaptureContext(CaptureContext&& o) noexcept :
     info(std::move(o.info)),
     profile(std::move(o.profile)),
     ipcConn(std::move(o.ipcConn)),
+    // The ring, its copy-only device and the per-slot images must travel with
+    // the context. Without them the moved-to context reports ring=0 and skips
+    // every capture, which is what happened on the first working handshake.
+    ring(std::move(o.ring)),
+    copyVk(std::move(o.copyVk)),
+    copySlotImages(std::move(o.copySlotImages)),
+    copyCbs(std::move(o.copyCbs)),
+    copyFences(std::move(o.copyFences)),
+    ringSeq(o.ringSeq.load(std::memory_order_relaxed)),
     gameDeviceName(std::move(o.gameDeviceName)),
     fake(o.fake),
     lastImageGateFence(o.lastImageGateFence),
