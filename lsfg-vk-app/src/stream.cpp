@@ -326,10 +326,25 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             // and never writes them. The app imports the layer's 9060
             // dma-buf from FRAME instead.
             && conf.transport == ls::Transport::Udmabuf;
-        const bool posixShm = hostBounce
+        // UdmabufRing: the RENDER side owns every buffer. The app creates
+        // nothing, sends no STAGING, and imports the fds it is handed.
+        const bool ringTransport = conf.transport == ls::Transport::UdmabufRing;
+        const bool posixShm = !ringTransport && (hostBounce
             || (conf.presentation == ls::Presentation::External
                 && (envFlagOn("LSFGVK_POSIX_SHM")
-                    || conf.transport == ls::Transport::PosixShm));
+                    || conf.transport == ls::Transport::PosixShm)));
+        if (ringTransport) {
+            // No app-owned staging in this transport. sourceImages are filled
+            // in when the ring fds arrive (presentation.cpp).
+            for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
+                state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },
+                    state.captureFormat, imgUsage,
+                    std::nullopt, std::nullopt, layout,
+                    sourceSharing, concurrentFamilies);
+            }
+            LSFG_FRAME_DBG("ring transport: app creates no staging, waiting for K udmabuf fds");
+            continue;
+        }
         if (posixShm) {
         const uint64_t mapBytes = bytes + 4096ull;
         // udmabuf REQUIRES the backing memfd to be sealable and sealed
