@@ -5,6 +5,7 @@ set(COMMON_SOURCES
     "src/helpers/paths.cpp"
     "src/ipc/socket.cpp"
     "src/ipc/control_block.cpp"
+    "src/ipc/udmabuf_ring.cpp"
     "src/vulkan/buffer.cpp"
     "src/vulkan/command_buffer.cpp"
     "src/vulkan/descriptor_pool.cpp"

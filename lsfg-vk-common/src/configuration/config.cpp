@@ -180,6 +180,7 @@ namespace {
             .output = tbl["output"].value<std::string>(),
             .transport = transportFromString(transportExplicit
                 ? *tbl["transport"].value<std::string>() : "shm"),
+            .ringSlots = tbl["ring_slots"].value_or(3u),
             .transportExplicit = transportExplicit,
             .socket_path = tbl["socket"].value<std::string>(),
             .fake_swapchain = tbl["fake_swapchain"].value_or(false),

@@ -95,6 +95,8 @@ namespace ls {
         ls::Transport transport{ls::Transport::PosixShm};
         /// false when the profile did not set transport. Cross-GPU then
         /// selects decoupled. udmabuf is never the default.
+        /// number of slots in the udmabuf ring (Transport::UdmabufRing only)
+        std::uint32_t ringSlots{3};
         bool transportExplicit{false};
         /// custom IPC socket path override
         std::optional<std::string> socket_path;
