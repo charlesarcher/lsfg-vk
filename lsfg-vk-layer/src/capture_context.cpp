@@ -1868,8 +1868,16 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             0, 0, nullptr, 0, nullptr, 1, &done);
         cb.end(cvk);
-        cb.submit(cvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
-            fence.handle());
+        // Wait on the game's own present wait-semaphores: the copy must not
+        // start reading the swapchain image while the game is still rendering
+        // or mid-layout. vkd3d-proton hands us these in QueuePresentKHR and
+        // nothing else consumes them on this path.
+        cb.submit(cvk,
+            std::vector<VkSemaphore>(semaphores.begin(), semaphores.end()),
+            VK_NULL_HANDLE, 0,
+            {}, VK_NULL_HANDLE, 0,
+            fence.handle(),
+            cvk.transferQueueHandle());
         // Publish to the control block with release ordering; the doubler sees
         // the metadata before Complete.
         this->ring->control().publishComplete(idx, seq, 0,
