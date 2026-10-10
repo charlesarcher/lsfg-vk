@@ -17,7 +17,7 @@ multiplier = 2
 # The copy-only VkDevice cannot read the game swapchain images, which live in
 # the game device VRAM: a second device on the same card has no page-table
 # mapping for them. decoupled is the verified-good path (662 presents/s).
-transport = "decoupled"
+transport = "udmabuf_ring"
 ring_slots = 3
 output = "DP-7"
 hud = true
@@ -36,7 +36,7 @@ multiplier = 2
 # The copy-only VkDevice cannot read the game swapchain images, which live in
 # the game device VRAM: a second device on the same card has no page-table
 # mapping for them. decoupled is the verified-good path (662 presents/s).
-transport = "decoupled"
+transport = "udmabuf_ring"
 ring_slots = 3
 output = "DP-7"
 hud = true

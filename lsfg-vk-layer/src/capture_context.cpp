@@ -748,12 +748,19 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             this->copyCbs.reserve(k);
             this->copyFences.reserve(k);
             for (std::uint32_t i = 0; i < k; ++i) {
-                this->copySlotImages.emplace_back(*this->copyVk,
+                /* Import the slots and take the copy on the GAME's device.
+                   Only that device may touch its own VRAM, and it is the
+                   producer of every frame: its queue writes the swapchain
+                   image into the slot. copyVk exists only for bookkeeping
+                   parity with earlier builds and is no longer used for the
+                   copy path. This is the fix for the MAPPING_ERROR that took
+                   the 9070 off the bus. */
+                this->copySlotImages.emplace_back(vk,
                     this->info.extent, this->info.format, slotUsage,
                     ::dup(this->ring->slots()[i].udmabuf), std::nullopt,
                     slotLayout);
-                this->copyCbs.emplace_back().emplace(*this->copyVk);
-                this->copyFences.emplace_back().emplace(*this->copyVk, true);
+                this->copyCbs.emplace_back().emplace(vk);
+                this->copyFences.emplace_back().emplace(vk, true);
             }
 
             std::fprintf(stderr,
@@ -1794,12 +1801,14 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         const int slot = static_cast<int>(ringSlotIdx);
         if (std::getenv("LSFGVK_RING_DBG")) {
             std::fprintf(stderr,
-                "lsfg-vk: ring copy begin seq=%llu slot=%d\n",
+                "lsfg-vk: ring copy begin seq=%llu slot=%d device=game\n",
                 (unsigned long long)seq, slot);
             std::fflush(stderr);
         }
         const auto idx = static_cast<std::uint32_t>(slot);
-        vk::Vulkan& cvk = *this->copyVk;
+        // GAME device owns this copy. It is the producer, and only it may
+        // touch its own VRAM.
+        const vk::Vulkan& cvk = vk;
         auto& fence = *this->copyFences.at(idx);
         // Our OWN fence: the only wait in this path. Timeout 0 means "already
         // signalled", so this never blocks on the doubler or on the GPU.
