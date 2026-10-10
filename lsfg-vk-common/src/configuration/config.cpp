@@ -372,6 +372,20 @@ std::filesystem::path ls::findConfigurationFile() {
     if (envPath && *envPath != '\0')
         return{envPath};
 
+    // then LSFG_CONFIG_NAME as a file next to the launch script's profiles
+    const char* cfgName = std::getenv("LSFG_CONFIG_NAME");
+    if (cfgName && *cfgName != '\0') {
+        const char* profHome = std::getenv("LSFG_PROFILE_ROOT");
+        if (profHome && *profHome != '\0') {
+            std::filesystem::path p = std::filesystem::path(profHome) / cfgName;
+            if (std::filesystem::exists(p))
+                return p;
+            throw ls::error("LSFG_CONFIG_NAME='" + std::string(cfgName)
+                + "' not found under LSFG_PROFILE_ROOT='"
+                + std::string(profHome) + "'");
+        }
+    }
+
     // then check the XDG overriden location
     const char* xdgPath = std::getenv("XDG_CONFIG_HOME");
     if (xdgPath && *xdgPath != '\0')
