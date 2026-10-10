@@ -25,3 +25,6 @@ presentation = "external"
 multiplier = 2
 # ring: the layer sends the ring fds, the app imports them and maps the
 # control block, and no card imports via a dma-buf path beyond the ring.
+# MUST match app-oneway: a per-side mismatch kills every handshake.
+transport = "udmabuf_ring"
+ring_slots = 3
