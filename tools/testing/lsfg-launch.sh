@@ -484,6 +484,10 @@ wait "$APP_PID"
 echo "app wait=$?"
 set -e
 rm -f "$STEAM_ENV"
+# Remove the app socket as well. A stale socket file changes "nobody is serving"
+# into ECONNREFUSED, which the layer used to retry-and-log at full speed; an
+# absent socket is the honest state and is what the layer's rate limiter expects.
+rm -f "$SOCK"
 
 if ! cards_ok; then
   echo "CARD DROPPED during run — discard"

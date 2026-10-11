@@ -560,6 +560,28 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     try {
         this->ipcConn.emplace(ls::ipc::Connection::connect(sockPath));
     } catch (const std::exception& e) {
+        /* Rate-limit this message. With no doubler serving the socket the game
+           recreates its swapchain, which lands here again immediately - so an
+           unserved socket became a tight connect/fail/log loop: hundreds of
+           lines of console output and an apparent hang. Report the first
+           failure, then at most one every 5 s, and count what was suppressed. */
+        static std::atomic<std::uint64_t> lastLogMs{0};
+        static std::atomic<std::uint32_t> suppressed{0};
+        const std::uint64_t nowMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        std::uint64_t prev = lastLogMs.load(std::memory_order_relaxed);
+        if (nowMs - prev >= 5000 && lastLogMs.compare_exchange_strong(
+                prev, nowMs, std::memory_order_relaxed)) {
+            const std::uint32_t skipped = suppressed.exchange(0, std::memory_order_relaxed);
+            std::cerr << "lsfg-vk: failed to connect to app socket '"
+                << sockPath.string() << "' (no doubler serving it";
+            if (skipped)
+                std::cerr << "; " << skipped << " further attempts suppressed";
+            std::cerr << ")\n";
+        } else {
+            suppressed.fetch_add(1, std::memory_order_relaxed);
+        }
         throw ls::error("lsfg-vk: failed to connect to app socket '" + sockPath.string() + "'", e);
     }
 
