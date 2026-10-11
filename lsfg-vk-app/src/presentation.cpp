@@ -1516,8 +1516,14 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     const bool ringTransport =
         state.transport == ls::Transport::UdmabufRing && state.ring != nullptr;
     if (ringTransport) {
-        ringCbs.resize(state.ringSlotImages.size());
-        ringFences.resize(state.ringSlotImages.size());
+        // Size from the RING's slot count, not from ringSlotImages: slots are
+        // imported as BUFFERS (state.udmaBufs) now, so the images vector is
+        // empty and this collapsed to K=0, leaving the consume path with no
+        // command buffers at all.
+        const size_t ringK = std::max<size_t>(state.ringSlotCount,
+            state.udmaBufs.size());
+        ringCbs.resize(ringK);
+        ringFences.resize(ringK);
         for (size_t i = 0; i < ringCbs.size(); ++i) {
             ringCbs.at(i).emplace(vk);
             ringFences.at(i).emplace(vk, true);   // signaled: first wait passes
