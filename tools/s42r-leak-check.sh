@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # S42r leak-clean harness — ASan/LSan pair soak for lsfg-vk.
 # Usage: tools/s42r-leak-check.sh [stream-seconds]
-# Requires: build-asan/ (cmake -B build-asan with -fsanitize=address,leak)
+# Requires: an ASan-built app in the single build tree - reconfigure it first:
+#           cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_CXX_FLAGS="-fsanitize=address,leak -g"
+#           (override the location with ASAN_BUILD_DIR=/path/to/tree if you must)
 #           probe compiled as /tmp/probe_vk_asan (see journal S42r)
 set -euo pipefail
 # valgrind/memcheck on CachyOS aborts at startup when
@@ -10,12 +12,13 @@ set -euo pipefail
 export DEBUGINFOD_URLS="${DEBUGINFOD_URLS:-https://debuginfod.cachyos.org}"
 SECS=${1:-30}
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ASAN_BUILD_DIR="${ASAN_BUILD_DIR:-$ROOT/build}"
 rm -f ~/.local/state/lsfg-vk/app.sock /dev/shm/lsfg-dbl-* /tmp/s42r-lsan-*
 echo '== launch ASan app'
 env -u LSFGVK_APP_DBG LSFGVK_DUMP_PRESENT=0 \
     ASAN_OPTIONS="detect_leaks=1:log_path=/tmp/s42r-lsan-app:halt_on_error=0" \
     LSAN_OPTIONS="suppressions=$ROOT/tools/lsan-suppress.txt" \
-    "$ROOT/build-asan/lsfg-vk-app/lsfg-vk-app" \
+    "$ASAN_BUILD_DIR/lsfg-vk-app/lsfg-vk-app" \
     --profile app-oneway --session wayland 2>&1 | tee /tmp/s42r-app.log &
 APP=$!; APP=$(jobs -p | tail -1)
 sleep 9

@@ -3,9 +3,11 @@
 #
 # This exists because build-frameddb was once 36 minutes stale and served a
 # layer that did not contain the fix being tested, which cost a debugging
-# session. Every Vulkan object in the app, the layer and the backend comes
-# from a different build directory, so "I rebuilt" means nothing unless the
-# binary, the .so and the git hash are all shown together.
+# session. "I rebuilt" means nothing unless the binary, the .so and the git
+# hash are all shown together.
+#
+# There is ONE build tree: build/. Frame diagnostics are a configure switch in
+# that same tree (-DLSFGVK_FRAME_DEBUG=ON), not a second build directory.
 #
 #   ./tools/testing/verify_build.sh
 #
@@ -64,17 +66,15 @@ if [ -n "$DIRTY_PATHS" ]; then
     echo
 fi
 
-echo "builds:"
+echo "builds (single tree: build/):"
 build_one build         app      "build/lsfg-vk-app/lsfg-vk-app" || rc=1
-build_one build-framedbg app-dbg  "build-framedbg/lsfg-vk-app/lsfg-vk-app" || rc=1
 build_one build         layer    "build/lsfg-vk-layer/liblsfg-vk-layer.so" || rc=1
-build_one build-framedbg layer-dbg "build-framedbg/lsfg-vk-layer/liblsfg-vk-layer.so" || rc=1
 
 # The layer that VK_LAYER_PATH points at is the one that loads. If that is a
 # different tree from the one you just built, everything below it is moot.
 echo
 echo "layer the compositor will load:"
-LAYER_ENV="${VK_LAYER_PATH:-$ROOT/build-framedbg/lsfg-vk-layer}"
+LAYER_ENV="${VK_LAYER_PATH:-$ROOT/build/lsfg-vk-layer}"
 for so in "$LAYER_ENV"/*.so; do
     [ -e "$so" ] || continue
     printf "  %s  %s\n" "$(date -r "$so" '+%H:%M:%S')" "$so"
@@ -96,4 +96,5 @@ if [ $rc -ne 0 ]; then
     exit 1
 fi
 echo "RESULT: all trees built at $HASH$DIRTY"
-echo "run tests from build-framedbg/ for frame diagnostics; build/ is the clean tree."
+echo "one tree: build/. For frame diagnostics reconfigure it in place:"
+echo "  cmake -B build -DLSFGVK_FRAME_DEBUG=ON"

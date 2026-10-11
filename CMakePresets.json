@@ -28,8 +28,8 @@
     {
       "name": "debug",
       "displayName": "Debug",
-      "description": "Debug build with symbols and assertions",
-      "binaryDir": "${sourceDir}/build-debug",
+      "description": "Debug build with symbols and assertions (same tree as default)",
+      "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
@@ -41,8 +41,8 @@
     {
       "name": "relwithdebinfo",
       "displayName": "Release with Debug Info",
-      "description": "Optimized release build with debug symbols",
-      "binaryDir": "${sourceDir}/build-relwithdebinfo",
+      "description": "Optimized release build with debug symbols (same tree as default)",
+      "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",

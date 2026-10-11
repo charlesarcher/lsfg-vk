@@ -115,8 +115,8 @@ mkdir -p "$OUT"
 LOG="$OUT/launch.log"
 STEAM_ENV="$HOME/.local/state/lsfg-vk/steam-game.env"
 
-# LSFG_APP lets a profile run a different doubler build (e.g. the ASan tree in
-# build-asan) without editing this script. Unset = the release binary.
+# LSFG_APP lets a profile run a different doubler build (e.g. an ASan build of
+# the same tree) without editing this script. Unset = the release binary.
 APP="${LSFG_APP:-$REPO/build/lsfg-vk-app/lsfg-vk-app}"
 # LSFG_LAYER does the same for the layer. Overriding only LSFG_APP would mix a
 # new doubler with an old layer, so a baseline/bisect run must set both.
