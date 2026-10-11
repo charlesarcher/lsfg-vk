@@ -119,6 +119,20 @@ std::signal(SIGUSR1, [](int) { g_imguiToggleReq = 1; });
 #include <drm/amdgpu_drm.h>
 #include <vulkan/vulkan_core.h>
 
+/* LSFGVK_UAF_DBG: env-gated. Prints the identity of cur.doneFds at the
+   sites ASan flags, so the stale object is identified by measurement, not
+   by guess. Costs nothing when the variable is unset. */
+#define LSFG_UAF_DBG(tag)                                                      \
+    do {                                                                        \
+        if (std::getenv("LSFGVK_UAF_DBG")) {                                    \
+            std::fprintf(stderr,                                                \
+                "lsfg-vk-app: UAF %s cur=%p doneFds=%p size=%zu cap=%zu\n",    \
+                (tag), (void*)&cur, (void*)cur.doneFds.data(),                  \
+                cur.doneFds.size(), cur.doneFds.capacity());                    \
+            std::fflush(stderr);                                                \
+        }                                                                       \
+    } while (0)
+
 namespace ls::presentation {
 namespace {
     // LSFGVK_PRESENT_PACE=1 only. Timestamp is taken at the QueuePresentKHR
@@ -1534,31 +1548,55 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::fflush(stderr);
     }
 
+    /* Hoisted OUT of the output lambda on purpose. ASan showed the
+       lambda's own state being read after its scope ended -
+       signalSem at presentation.cpp:2349, freed by
+       std::vector<vk::Semaphore>::~vector() at the lambda's
+       closing brace (2537), same thread; and earlier cur.doneFds
+       at 2239. Declared here, this state is destroyed only after
+       BOTH threads are joined below, so no path can touch it
+       after it dies. */
+    // command buffer ring: one per in-flight present (destCount + 1)
+    // each has its own fence to know when the GPU is done with it
+    const size_t cbRingSize = destCount + 2;
+    std::vector<vk::CommandBuffer> cbs;
+    std::vector<vk::Fence> cbFences;
+    cbs.reserve(cbRingSize);
+    cbFences.reserve(cbRingSize);
+    for (size_t i = 0; i < cbRingSize; ++i) {
+        cbs.emplace_back(vk);
+        cbFences.emplace_back(vk, true);   // signaled: the first wait passes
+    }
+    size_t cbIdx = 0;
+    vk::Semaphore acquireSem{ vk };   // never signaled; reused for every acquire
+    std::vector<vk::Semaphore> doneWaitSem;   // destCount + 1 (extra for snapshot)
+    doneWaitSem.reserve(destCount + 1);
+    for (size_t i = 0; i < destCount + 1; ++i)
+        doneWaitSem.emplace_back(vk, std::nullopt,
+            VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
+    const size_t presentCount = destCount + 1;   // gen + real per frame
+    const size_t signalPool = std::max<size_t>(presentCount + 1, 4);
+    std::vector<vk::Semaphore> signalSem;        // rolling present pool
+    signalSem.reserve(signalPool);
+    for (size_t i = 0; i < signalPool; ++i)
+        signalSem.emplace_back(vk);
+
+    // the frame the output is currently realizing on the display.
+    struct Cur {
+        bool active{ false };
+        size_t nextDest{ 0 };      // 0..destCount: gen presents in flight
+        uint32_t stagingIdx{ 0 };
+        std::vector<int> doneFds;  // produced gen fds; -1 once imported
+        int snapFd{ -1 };          // snapshot sync_fd sem for REAL blit
+        uint64_t captureTsNs{ 0 };
+        uint64_t recvTsNs{ 0 };    // Session 40 ledger stamps (see PendingFrame)
+        uint64_t schedDoneNs{ 0 };
+        uint64_t srcFidx{ UINT64_MAX };
+    } cur;
+    int lastShownStagingIdx{ -1 }; // newest real frame actually shown (HOLD-LAST)
+    uint64_t presentIdx{ 0 };      // rolling index into the signal pool
+
     auto outputLoop = [&] {
-        // command buffer ring: one per in-flight present (destCount + 1)
-        // each has its own fence to know when the GPU is done with it
-        const size_t cbRingSize = destCount + 2;
-        std::vector<vk::CommandBuffer> cbs;
-        std::vector<vk::Fence> cbFences;
-        cbs.reserve(cbRingSize);
-        cbFences.reserve(cbRingSize);
-        for (size_t i = 0; i < cbRingSize; ++i) {
-            cbs.emplace_back(vk);
-            cbFences.emplace_back(vk, true);   // signaled: the first wait passes
-        }
-        size_t cbIdx = 0;
-        vk::Semaphore acquireSem{ vk };   // never signaled; reused for every acquire
-        std::vector<vk::Semaphore> doneWaitSem;   // destCount + 1 (extra for snapshot)
-        doneWaitSem.reserve(destCount + 1);
-        for (size_t i = 0; i < destCount + 1; ++i)
-            doneWaitSem.emplace_back(vk, std::nullopt,
-                VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT);
-        const size_t presentCount = destCount + 1;   // gen + real per frame
-        const size_t signalPool = std::max<size_t>(presentCount + 1, 4);
-        std::vector<vk::Semaphore> signalSem;        // rolling present pool
-        signalSem.reserve(signalPool);
-        for (size_t i = 0; i < signalPool; ++i)
-            signalSem.emplace_back(vk);
 
         // FIFO acquire paces the thread at one present per vblank.
         constexpr uint64_t acquireTimeoutNs = 200ULL * 1000 * 1000;   // 200 ms
@@ -1583,20 +1621,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
             }
         };
 
-        // the frame the output is currently realizing on the display.
-        struct Cur {
-            bool active{ false };
-            size_t nextDest{ 0 };      // 0..destCount: gen presents in flight
-            uint32_t stagingIdx{ 0 };
-            std::vector<int> doneFds;  // produced gen fds; -1 once imported
-            int snapFd{ -1 };          // snapshot sync_fd sem for REAL blit
-            uint64_t captureTsNs{ 0 };
-            uint64_t recvTsNs{ 0 };    // Session 40 ledger stamps (see PendingFrame)
-            uint64_t schedDoneNs{ 0 };
-            uint64_t srcFidx{ UINT64_MAX };
-        } cur;
-        int lastShownStagingIdx{ -1 }; // newest real frame actually shown (HOLD-LAST)
-        uint64_t presentIdx{ 0 };      // rolling index into the signal pool
 
         Clock::time_point statsLastTime = Clock::now();
         /* S43: lastReal/lastGen MUST be per-thread, exactly like
@@ -2198,6 +2222,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         cur.nextDest = 0;
                         cur.stagingIdx = pf->stagingIdx;
                         cur.doneFds = std::move(pf->doneFds);
+                        LSFG_UAF_DBG("after-move-in");
                         cur.snapFd = pf->snapFd;  // -1 if no snapshot fd
                         cur.captureTsNs = pf->captureTsNs;
                         cur.recvTsNs = pf->recvTsNs;
@@ -2231,6 +2256,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // 1080 boot: no exclusive overlay. Consume the frame so
                 // Release already sent by input; do not Acquire/Present.
                 if (cur.active && swapchain == VK_NULL_HANDLE) {
+                    LSFG_UAF_DBG("1080-boot-branch");
                     for (int d : cur.doneFds)
                         if (d >= 0)
                             ::close(d);
@@ -2494,6 +2520,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 if (pf->snapFd >= 0)
                     ::close(pf->snapFd);
             }
+            LSFG_UAF_DBG("teardown-drain");
             for (int d : cur.doneFds)
                 if (d >= 0)
                     ::close(d);
