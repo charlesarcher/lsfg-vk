@@ -189,6 +189,16 @@ namespace lsfgvk::layer {
         bool ringStop{false};
         VkQueue ringSubmitQ{VK_NULL_HANDLE};
         const vk::Vulkan* ringVk{nullptr};
+        /// One ordinary VRAM image per slot, between the game's swapchain
+        /// image and the udmabuf buffer. The swapchain image is an
+        /// explicit-sync VRAM dma-buf (AMDGPU_GEM_CREATE_EXPLICIT_SYNC,
+        /// isolated_swapchain.cpp:109); copying from it straight into an
+        /// imported dma-buf buffer is the operation that faults. Both halves
+        /// are proven separately - a transfer copy off that image works in
+        /// the decoupled path, and image->udmabuf-buffer works standalone
+        /// (tools/testing/render_image_to_udmabuf_probe.cpp) - so the copy
+        /// goes through a plain VRAM image to break the cross-BO case.
+        std::vector<vk::Image> ringIntermediate;
         std::vector<vk::Buffer> copySlotBufs;
         /// per-slot sequence number of a submitted-but-unpublished copy.
         /// 0 means nothing pending. A slot is published to the control block

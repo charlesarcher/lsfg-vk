@@ -760,13 +760,18 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 (void*)vk.queue());
             std::fflush(stderr);
             this->copySlotBufs.reserve(k);
+            this->ringIntermediate.reserve(k);
             this->ringPendingSeq.assign(k, 0);
+            const VkImageUsageFlags intermUsage =
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             this->copyCbs.reserve(k);
             this->copyFences.reserve(k);
             for (std::uint32_t i = 0; i < k; ++i) {
                 this->copySlotBufs.emplace_back(vk,
                     ::dup(this->ring->slots()[i].udmabuf),
                     this->ring->slotBytes(), slotUsage);
+                this->ringIntermediate.emplace_back(vk, this->info.extent,
+                    this->info.format, intermUsage);
                 this->copyCbs.emplace_back().emplace(vk);
                 this->copyFences.emplace_back().emplace(vk, true);
             }
@@ -1226,6 +1231,7 @@ CaptureContext::CaptureContext(CaptureContext&& o) noexcept :
     ring(std::move(o.ring)),
     copyVk(std::move(o.copyVk)),
     copySlotBufs(std::move(o.copySlotBufs)),
+    ringIntermediate(std::move(o.ringIntermediate)),
     ringPendingSeq(std::move(o.ringPendingSeq)),
     copyCbs(std::move(o.copyCbs)),
     copyFences(std::move(o.copyFences)),
@@ -1981,8 +1987,34 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             },
             .imageExtent = { w, h, 1 }
         };
-        cvk.df().CmdCopyImageToBuffer(cb.raw(),
+        /* Two steps, not one. Reading the game's explicit-sync VRAM dma-buf
+           image directly into an imported dma-buf buffer is the combination
+           that faults; each half alone is proven. So: image -> ordinary VRAM
+           image, then that image -> udmabuf buffer. */
+        const vk::Image& interm = this->ringIntermediate.at(idx);
+        VkImageMemoryBarrier intermToDst = barrierHelper(interm.handle(),
+            VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        cvk.df().CmdPipelineBarrier(cb.raw(),
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &intermToDst);
+        const VkImageCopy icopy{
+            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+            .extent = { w, h, 1 }
+        };
+        cvk.df().CmdCopyImage(cb.raw(),
             srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            interm.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &icopy);
+        VkImageMemoryBarrier intermToSrc = barrierHelper(interm.handle(),
+            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        cvk.df().CmdPipelineBarrier(cb.raw(),
+            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &intermToSrc);
+        cvk.df().CmdCopyImageToBuffer(cb.raw(),
+            interm.handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             dstBuf.handle(), 1, &region);
         VkImageMemoryBarrier back = barrierHelper(srcImage,
             VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
