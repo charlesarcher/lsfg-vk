@@ -64,6 +64,9 @@ namespace lsfgvk::layer {
         /// Submit any armed ring copy and publish any finished one. Called from
         /// the acquire hook, on the game's own thread.
         void flushRingCopy(const vk::Vulkan& vk);
+        /// Hand the isolated recycle fence in, so the ring copy submit can
+        /// signal it instead of a separate nested submit.
+        void setRingRecycleFence(VkFence f) { this->ringRecycleFence = f; }
 
         /// Tell the app this stream's swapchain is gone, so it retires THIS
         /// stream and no other. Sent from the layer's vkDestroySwapchainKHR.
@@ -193,6 +196,15 @@ namespace lsfgvk::layer {
         };
         RingPending ringPending;
         VkQueue ringSubmitQ{VK_NULL_HANDLE};
+        /// The isolated path's recycle fence for the image being presented.
+        /// Our copy submit signals THIS instead of the empty isolatedSignal
+        /// submit: that extra nested QueueSubmit is what faults (deferred =
+        /// deadlock, inline = 19 faults), and a submit can only signal one
+        /// fence, so the copy carries it. The game's acquire then waits on it,
+        /// which is exactly the semantic we want.
+        VkFence ringRecycleFence{VK_NULL_HANDLE};
+        VkFence ringInFlightFence{VK_NULL_HANDLE};
+
         bool ringInFlight{false};
         std::uint32_t ringInFlightIdx{0};
         std::uint64_t ringInFlightSeq{0};

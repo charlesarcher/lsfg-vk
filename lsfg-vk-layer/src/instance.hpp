@@ -111,6 +111,9 @@ namespace lsfgvk::layer {
         /// from vkAcquireNextImageKHR so the submit happens on the game's own
         /// thread, outside any nested QueueSubmit.
         void flushRingCopy(VkSwapchainKHR swapchain, const vk::Vulkan& vk);
+        /// Hand the isolated recycle fence to the ring context so its copy
+        /// submit can signal it, instead of a separate nested submit.
+        void setRingRecycleFence(VkSwapchainKHR swapchain, VkFence fence);
     private:
         ls::WatchedConfig config;
         std::optional<ls::GameConf> active_profile;

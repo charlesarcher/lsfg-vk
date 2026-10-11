@@ -1562,7 +1562,11 @@ void CaptureContext::flushRingCopy(const vk::Vulkan& vk) {
     if (this->ringInFlight) {
         const VkFence f = this->copyFences.at(this->ringInFlightIdx)->handle();
         (void)f;
-        if (this->copyFences.at(this->ringInFlightIdx)->wait(vk, 0)) {
+        const VkFence pollFence = this->ringInFlightFence != VK_NULL_HANDLE
+            ? this->ringInFlightFence
+            : this->copyFences.at(this->ringInFlightIdx)->handle();
+        if (vk.df().WaitForFences(vk.dev(), 1, &pollFence, VK_TRUE, 0)
+                == VK_SUCCESS) {
             this->ring->control().publishComplete(this->ringInFlightIdx,
                 this->ringInFlightSeq, 0, this->info.extent.width,
                 this->info.extent.height,
@@ -1931,10 +1935,14 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         // Our OWN fence: the only wait in this path. Timeout 0 means "already
         // signalled", so this never blocks on the doubler or on the GPU.
         const bool fenceFree = fence.wait(cvk, 0);
-        if (std::getenv("LSFGVK_RING_DBG")) {
-            std::fprintf(stderr,
-                "lsfg-vk: ring slot %u fenceFree=%d\n", slot, fenceFree ? 1 : 0);
-            std::fflush(stderr);
+        {
+            static std::atomic<std::uint32_t> nFF{0};
+            if (nFF.fetch_add(1) < 10) {
+                std::fprintf(stderr,
+                    "lsfg-vk: ring slot %u fenceFree=%d (reaching copy block)\n",
+                    slot, fenceFree ? 1 : 0);
+                std::fflush(stderr);
+            }
         }
         if (!fenceFree) {
             this->ring->control().release(idx);
@@ -2052,8 +2060,29 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         const VkCommandBuffer rawRingCb = cb.raw();
         rsi.commandBufferCount = 1;
         rsi.pCommandBuffers = &rawRingCb;
-        const VkResult ringSr = cvk.df().QueueSubmit(this->ringSubmitQ, 1, &rsi,
-            fence.handle());
+        {
+            static std::atomic<std::uint32_t> nPre{0};
+            if (nPre.fetch_add(1) < 10) {
+                std::fprintf(stderr,
+                    "lsfg-vk: ring PRE-submit seq=%llu slot=%u q=%p waits=%u\n",
+                    (unsigned long long)seq, idx, (void*)(this->captureQ != VK_NULL_HANDLE ? this->captureQ : queue),
+                    (unsigned)semaphores.size());
+                std::fflush(stderr);
+            }
+        }
+        /* Resolve the queue HERE, from the live present() arguments. Setting
+           it at ring-setup time gave a NULL queue: captureQ is not assigned
+           until later in the constructor, and vk.queue() was null there, so
+           every submit went to VK_NULL_HANDLE and silently did nothing
+           (measured: "ring PRE-submit ... q=(nil)"). This is the same
+           expression the working decoupled capture path uses. */
+        const VkQueue submitQ = this->captureQ != VK_NULL_HANDLE
+            ? this->captureQ : queue;
+        const VkFence submitFence = this->ringRecycleFence != VK_NULL_HANDLE
+            ? this->ringRecycleFence : fence.handle();
+        this->ringInFlightFence = submitFence;
+        const VkResult ringSr = cvk.df().QueueSubmit(submitQ, 1, &rsi,
+            submitFence);
         if (ringSr != VK_SUCCESS) {
             std::fprintf(stderr, "lsfg-vk: ring submit failed rc=%d slot=%u\n",
                 (int)ringSr, idx);

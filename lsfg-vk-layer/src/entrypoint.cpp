@@ -980,6 +980,18 @@ namespace {
                         if (skipIpc) {
                             result = VK_SUCCESS;
                         } else {
+                            /* Ring: give the context the recycle fence so its
+                               copy submit can signal it. */
+                            if (isIsolated(swapchain)
+                                    && layer_info->root.activeTransport()
+                                        == ls::Transport::UdmabufRing) {
+                                auto& isoF = isolatedAt(swapchain);
+                                const uint32_t fi = info->pImageIndices[i];
+                                if (fi < isoF.recycleFences.size())
+                                    layer_info->root.setRingRecycleFence(
+                                        swapchain,
+                                        isoF.recycleFences.at(fi).handle());
+                            }
                             result = layer_info->root.presentSwapchain(swapchain,
                                 it->second, queue,
                                 const_cast<void*>(info->pNext),
@@ -1019,10 +1031,17 @@ namespace {
                            vkd3d's present never completes, and the game stops
                            after one frame - which is what we measured
                            (one ring claim per stream, then silence). */
-                        const bool consumeWaits = skipIpc
-                            || layer_info->root.activeTransport()
-                                == ls::Transport::UdmabufRing;
-                        if (iso.extent.height >= 1440) {
+                        const bool isRing = layer_info->root.activeTransport()
+                            == ls::Transport::UdmabufRing;
+                        /* For the ring, signal the recycle fence INLINE and
+                           consume the present semaphores with a submit here.
+                           Deferring them deadlocks: the deferred work is
+                           flushed from vkQueueSubmit2, and the game is
+                           blocked in acquire waiting on that very fence, so
+                           it never reaches its next submit. The <1440 path
+                           already does it inline. */
+                        const bool consumeWaits = skipIpc || isRing;
+                        if (iso.extent.height >= 1440 && !isRing) {
                             // Nested QueueSubmit during QueuePresent races
                             // vkd3d's QueueSubmit2. Defer dedicated work.
                             if (consumeWaits)

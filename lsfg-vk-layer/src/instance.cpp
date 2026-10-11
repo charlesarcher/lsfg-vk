@@ -552,6 +552,22 @@ void Root::notifySwapchainClose(VkSwapchainKHR swapchain) {
     }, *ctx);
 }
 
+void Root::setRingRecycleFence(VkSwapchainKHR swapchain, VkFence fence) {
+    ContextVariant* ctx = nullptr;
+    {
+        const std::shared_lock lock(this->mutex);
+        const auto it = this->swapchains.find(swapchain);
+        if (it == this->swapchains.end())
+            return;
+        ctx = const_cast<ContextVariant*>(&it->second);
+    }
+    std::visit([&](auto& c) {
+        using T = std::decay_t<decltype(c)>;
+        if constexpr (std::is_same_v<T, CaptureContext>)
+            c.setRingRecycleFence(fence);
+    }, *ctx);
+}
+
 void Root::flushRingCopy(VkSwapchainKHR swapchain, const vk::Vulkan& vk) {
     ContextVariant* ctx = nullptr;
     {
