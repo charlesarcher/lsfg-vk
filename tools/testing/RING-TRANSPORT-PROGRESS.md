@@ -101,3 +101,54 @@ releases before handing the frame to the output thread.
 - To resume: reboot (the 9070 will not re-enumerate after resets; the 9060
   also wedged a compute queue). Then confirm the game lands on the 9070
   (`stream from 'AMD Radeon RX 9070 XT'`) before reading anything else.
+
+## 2026-10-10 later: back on the decoupled transport; ASan names the crash
+
+DECISION: the ring profile is abandoned as the active path. The profiles are
+back on transport = "udmabuf" (commit 2945819). The ring WIP is preserved in
+a commit, not deleted.
+
+Why: the decoupled transport renders and the ring does not.
+
+  run 20261010T215751 (decoupled, release):
+    game lands on the 9070: "stream from 'AMD Radeon RX 9070 XT (RADV GFX1201)'"
+    3 streams (2x 1920x1080, 1x 2560x1440)
+    faults 38 -> 38  (NO new GPU faults: the decoupled transport faults nothing)
+    but the app dies: "free(): double free detected in tcache 2"
+
+So the black screen is NOT the transport and NOT the GPU. The doubler process
+crashes. That crash is the goal's named "double free at teardown".
+
+ASan run (LSFG_APP=build-asan app + release layer; the ASan LAYER cannot run
+under Steam - "ASan runtime does not come first in initial library list" -
+but the app is a separate process so this combination works):
+
+  ==34642==ERROR: AddressSanitizer: heap-use-after-free
+  READ of size 8 in std::vector<int>::clear()
+    #0 std::vector<int>::clear()            stl_vector.h:1854
+    #1 operator()                           presentation.cpp:2239
+  freed by std::vector<vk::CommandBuffer>::~vector()
+    #8 operator()                           presentation.cpp:2520
+  0x...c068 is located 104 bytes inside of 120-byte region
+
+Reading: 2239 is cur.doneFds.clear() in the 1080-boot branch
+(cur.active && swapchain == VK_NULL_HANDLE). cur is declared at 1597, BEFORE
+the try at 2091, so its lifetime spans the lambda. The region was freed as a
+vector<vk::CommandBuffer> buffer - i.e. an INPUT-lambda vector (snapCbs /
+computeCbs, declared 2524-2526). So cur.doneFds is reading memory reclaimed
+from the other lambda's command-buffer vector: a cross-lambda lifetime bug.
+
+The file already documents this bug class at 2509-2517 and guards the
+EXCEPTION path ("Do NOT fall out of this catch ... return false"), with the
+earlier sighting at 2233/2504. The remaining instance is on the NORMAL path.
+
+ASan run also realized frames=81 (release managed 3 before dying), so with
+this fixed the decoupled path has a lot of headroom.
+
+NEXT: fix the lifetime so cur.doneFds cannot alias a freed command-buffer
+vector, then re-run release and confirm RE2 renders doubled on DP-7 with no
+crash and faults flat.
+
+PROCESS NOTE (Charles, this session): NEVER kill by pattern. The cleanup
+loops in my run commands matched re2.exe/lsfg-launch by name and killed
+Steam's own processes. Kill only a PID this session spawned. No pattern kills.
