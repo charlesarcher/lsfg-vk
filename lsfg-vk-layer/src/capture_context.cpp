@@ -776,74 +776,12 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                 this->copyFences.emplace_back().emplace(vk, true);
             }
 
-            /* Hand the copy to a worker thread: submitting from inside the
-               present hook races vkd3d's QueueSubmit2 and takes the device
-               down (entrypoint.cpp:1010, and measured on both the transfer
-               family and the graphics queue). */
-            this->ringVk = &vk;
+            /* The copy is submitted later, from the acquire hook, on the
+               game's own thread. */
             this->ringSubmitQ = this->captureQ != VK_NULL_HANDLE
                 ? this->captureQ : vk.queue();
-            this->ringWorker = std::thread([this] {
-                for (;;) {
-                    RingJob job{};
-                    {
-                        std::unique_lock<std::mutex> lk(this->ringMtx);
-                        this->ringCv.wait(lk, [this] {
-                            return !this->ringJobs.empty() || this->ringStop;
-                        });
-                        if (this->ringJobs.empty()) {
-                            if (this->ringStop)
-                                return;
-                            continue;
-                        }
-                        job = this->ringJobs.front();
-                        this->ringJobs.erase(this->ringJobs.begin());
-                    }
-                    const auto& vkw = *this->ringVk;
-                    std::vector<VkPipelineStageFlags> stages(
-                        job.waits.size(), VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
-                    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
-                    si.waitSemaphoreCount = (std::uint32_t)job.waits.size();
-                    si.pWaitSemaphores = job.waits.empty()
-                        ? nullptr : job.waits.data();
-                    si.pWaitDstStageMask = stages.empty() ? nullptr : stages.data();
-                    si.commandBufferCount = 1;
-                    si.pCommandBuffers = &job.cb;
-                    const VkResult sr = vkw.df().QueueSubmit(
-                        this->ringSubmitQ, 1, &si, VK_NULL_HANDLE);
-                    if (sr != VK_SUCCESS) {
-                        std::fprintf(stderr,
-                            "lsfg-vk: ring submit failed rc=%d slot=%u\n",
-                            (int)sr, job.idx);
-                        std::fflush(stderr);
-                        this->ring->control().release(job.idx);
-                        continue;
-                    }
-                    VkFence f = this->copyFences.at(job.idx)->handle();
-                    const VkResult wr = vkw.df().WaitForFences(
-                        vkw.dev(), 1, &f, VK_TRUE, UINT64_MAX);
-                    if (wr != VK_SUCCESS) {
-                        std::fprintf(stderr,
-                            "lsfg-vk: ring fence wait failed rc=%d slot=%u\n",
-                            (int)wr, job.idx);
-                        std::fflush(stderr);
-                        this->ring->control().release(job.idx);
-                        continue;
-                    }
-                    this->ring->control().publishComplete(job.idx, job.seq, 0,
-                        this->info.extent.width, this->info.extent.height,
-                        static_cast<std::uint32_t>(this->info.format));
-                    if (std::getenv("LSFGVK_RING_DBG")) {
-                        std::fprintf(stderr,
-                            "lsfg-vk: ring published seq=%llu slot=%u (deferred submit)\n",
-                            (unsigned long long)job.seq, job.idx);
-                        std::fflush(stderr);
-                    }
-                }
-            });
-
             std::fprintf(stderr,
-                "lsfg-vk: ring setup K=%u slotBytes=%zu ext=%ux%u fds=%u+ctrl sent, %u slots imported, deferred worker up\n",
+                "lsfg-vk: ring setup K=%u slotBytes=%zu ext=%ux%u fds=%u+ctrl sent, %u slots imported, acquire-driven submit\n",
                 k, slotBytes, this->info.extent.width, this->info.extent.height, k, k);
             std::fflush(stderr);
         } catch (const std::exception& e) {
@@ -1331,15 +1269,7 @@ void CaptureContext::notifyClose() {
 }
 
 CaptureContext::~CaptureContext() {
-    /* Stop the deferred copy worker FIRST: it touches the device, the fences
-       and the ring, all of which are destroyed below. */
-    {
-        std::lock_guard<std::mutex> lk(this->ringMtx);
-        this->ringStop = true;
-    }
-    this->ringCv.notify_all();
-    if (this->ringWorker.joinable())
-        this->ringWorker.join();
+
     if (this->ipcConn.has_value() && ::envFlagOn("LSFGVK_MEASURE")) {
         std::fprintf(stderr,
             "lsfg-vk-measure: socket close reason=CaptureContext-dtor fd=%d\n",
@@ -1610,6 +1540,56 @@ int CaptureContext::drainReleases() {
         }
     }
     return applied;
+}
+
+void CaptureContext::flushRingCopy(const vk::Vulkan& vk) {
+    /* Called from myvkAcquireNextImageKHR - the game's own thread, at the top
+       of a frame, outside any nested submit. Two jobs: publish a copy whose
+       fence has signalled, and submit the copy armed by the last present. */
+    if (this->ring == nullptr)
+        return;
+    if (this->ringInFlight) {
+        const VkFence f = this->copyFences.at(this->ringInFlightIdx)->handle();
+        (void)f;
+        if (this->copyFences.at(this->ringInFlightIdx)->wait(vk, 0)) {
+            this->ring->control().publishComplete(this->ringInFlightIdx,
+                this->ringInFlightSeq, 0, this->info.extent.width,
+                this->info.extent.height,
+                static_cast<std::uint32_t>(this->info.format));
+            if (std::getenv("LSFGVK_RING_DBG")) {
+                std::fprintf(stderr,
+                    "lsfg-vk: ring published seq=%llu slot=%u (acquire submit)\n",
+                    (unsigned long long)this->ringInFlightSeq,
+                    this->ringInFlightIdx);
+                std::fflush(stderr);
+            }
+            this->ringInFlight = false;
+        }
+    }
+    if (!this->ringPending.armed || this->ringInFlight)
+        return;
+    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &this->ringPending.cb;
+    const VkResult sr = vk.df().QueueSubmit(this->ringSubmitQ, 1, &si,
+        this->copyFences.at(this->ringPending.idx)->handle());
+    if (sr != VK_SUCCESS) {
+        std::fprintf(stderr, "lsfg-vk: ring submit failed rc=%d slot=%u\n",
+            (int)sr, this->ringPending.idx);
+        std::fflush(stderr);
+        this->ring->control().release(this->ringPending.idx);
+        this->ringPending.armed = false;
+        return;
+    }
+    this->ringInFlightIdx = this->ringPending.idx;
+    this->ringInFlightSeq = this->ringPending.seq;
+    this->ringInFlight = true;
+    this->ringPending.armed = false;
+    if (std::getenv("LSFGVK_RING_DBG")) {
+        std::fprintf(stderr, "lsfg-vk: ring submitted seq=%llu slot=%u (acquire)\n",
+            (unsigned long long)this->ringInFlightSeq, this->ringInFlightIdx);
+        std::fflush(stderr);
+    }
 }
 
 std::optional<size_t> CaptureContext::trySelectFreeSlot() {
@@ -2032,21 +2012,17 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
            which submits outside the hook and publishes the slot once its
            fence signals. The game's wait-semaphores travel with the job so
            the copy still waits for the frame to be rendered. */
-        {
-            std::lock_guard<std::mutex> lk(this->ringMtx);
-            this->ringJobs.push_back(RingJob{ idx, seq, cb.raw(),
-                std::vector<VkSemaphore>(semaphores.begin(), semaphores.end()) });
-        }
-        this->ringCv.notify_one();
-        {
-            static std::atomic<std::uint32_t> nQueued{0};
-            if (nQueued.fetch_add(1) < 12) {
-                std::fprintf(stderr,
-                    "lsfg-vk: ring job queued seq=%llu slot=%u waits=%zu\n",
-                    (unsigned long long)seq, idx, semaphores.size());
-                std::fflush(stderr);
-            }
-        }
+        /* Arm it. The CB is RECORDED here but SUBMITTED at the next acquire,
+           on the game's own thread: barriers are GPU commands, so recording
+           now is fine - the layout assumption only has to hold when the GPU
+           executes them, and by then this image is presented and released.
+           See the header for why neither the present hook nor a worker thread
+           works. */
+        this->ringPending.armed = true;
+        this->ringPending.idx = idx;
+        this->ringPending.seq = seq;
+        this->ringPending.cb = cb.raw();
+        this->ringPending.src = srcImage;
         if (std::getenv("LSFGVK_RING_DBG")) {
             std::fprintf(stderr,
                 "lsfg-vk: ring published seq=%llu slot=%u (no CPU copy, no wait on the doubler)\n",

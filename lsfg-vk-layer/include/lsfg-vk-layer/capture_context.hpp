@@ -61,6 +61,10 @@ namespace lsfgvk::layer {
         /// work before destroying semaphores/images
         ~CaptureContext();
 
+        /// Submit any armed ring copy and publish any finished one. Called from
+        /// the acquire hook, on the game's own thread.
+        void flushRingCopy(const vk::Vulkan& vk);
+
         /// Tell the app this stream's swapchain is gone, so it retires THIS
         /// stream and no other. Sent from the layer's vkDestroySwapchainKHR.
         /// Best effort: never throws, never blocks the destroy path.
@@ -166,38 +170,34 @@ namespace lsfgvk::layer {
         /// (radv_CreateDevice -> radv_create_winsys), so a private device on
         /// the same card has an empty one.
         std::unique_ptr<vk::Vulkan> copyVk;
-        /* The ring copy must NOT be submitted from inside the present hook.
-           entrypoint.cpp:1010 says it outright:
-             "Nested QueueSubmit during QueuePresent races vkd3d's
-              QueueSubmit2. Defer dedicated work."
-           present() records the command buffer and hands it to this worker,
-           which submits OUTSIDE the hook and publishes the slot only once the
-           copy fence has signalled. From inside the hook it faulted on both
-           the transfer family and the graphics queue. */
-        struct RingJob {
-            std::uint32_t idx;
-            std::uint64_t seq;
-            VkCommandBuffer cb;
-            /// the game's present wait-semaphores, carried so the deferred
-            /// submit still waits for the frame to be rendered.
-            std::vector<VkSemaphore> waits;
+        /* The ring copy is submitted from the game's OWN THREAD, at frame
+           acquire - not from inside the present hook, and not from a worker
+           thread.
+
+           Measured: submitting inside present() gave 21 faults (nested QueueSubmit
+           during QueuePresent races vkd3d's QueueSubmit2, entrypoint.cpp:1010),
+           and submitting from a worker thread gave exactly 3 faults for 3 jobs -
+           every submit faulted - because the game's VkDevice is shared and Vulkan
+           requires external synchronization we cannot get from vkd3d.
+
+           So the copy for the frame captured at present N is recorded and
+           submitted at acquire N+1: same thread as vkd3d's calls, outside any
+           nested submit, and by then that image has been presented and released.
+           Cost is one frame of latency. */
+        struct RingPending {
+            bool armed{false};
+            std::uint32_t idx{0};
+            std::uint64_t seq{0};
+            VkImage src{VK_NULL_HANDLE};
+            VkCommandBuffer cb{VK_NULL_HANDLE};
         };
-        std::thread ringWorker;
-        std::mutex ringMtx;
-        std::condition_variable ringCv;
-        std::vector<RingJob> ringJobs;
-        bool ringStop{false};
+        RingPending ringPending;
         VkQueue ringSubmitQ{VK_NULL_HANDLE};
-        const vk::Vulkan* ringVk{nullptr};
-        /// One ordinary VRAM image per slot, between the game's swapchain
-        /// image and the udmabuf buffer. The swapchain image is an
-        /// explicit-sync VRAM dma-buf (AMDGPU_GEM_CREATE_EXPLICIT_SYNC,
-        /// isolated_swapchain.cpp:109); copying from it straight into an
-        /// imported dma-buf buffer is the operation that faults. Both halves
-        /// are proven separately - a transfer copy off that image works in
-        /// the decoupled path, and image->udmabuf-buffer works standalone
-        /// (tools/testing/render_image_to_udmabuf_probe.cpp) - so the copy
-        /// goes through a plain VRAM image to break the cross-BO case.
+        bool ringInFlight{false};
+        std::uint32_t ringInFlightIdx{0};
+        std::uint64_t ringInFlightSeq{0};
+
+
         std::vector<vk::Image> ringIntermediate;
         std::vector<vk::Buffer> copySlotBufs;
         /// per-slot sequence number of a submitted-but-unpublished copy.

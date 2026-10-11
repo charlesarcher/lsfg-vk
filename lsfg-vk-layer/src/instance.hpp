@@ -107,6 +107,10 @@ namespace lsfgvk::layer {
         /// tell the app the swapchain behind an external stream is gone, so it
         /// retires exactly that stream. No-op for non-external swapchains.
         void notifySwapchainClose(VkSwapchainKHR swapchain);
+        /// Submit/publish the udmabuf ring copy for this swapchain. Called
+        /// from vkAcquireNextImageKHR so the submit happens on the game's own
+        /// thread, outside any nested QueueSubmit.
+        void flushRingCopy(VkSwapchainKHR swapchain, const vk::Vulkan& vk);
     private:
         ls::WatchedConfig config;
         std::optional<ls::GameConf> active_profile;

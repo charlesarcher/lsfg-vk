@@ -813,6 +813,11 @@ namespace {
         if (swIt == instance_info->swapchains.end())
             return VK_ERROR_INITIALIZATION_FAILED;
 
+        /* Drive the udmabuf ring copy from here: the game's own thread, top
+           of a frame, outside any nested submit. Submitting this copy from the
+           present hook or from a worker thread both faulted the device. */
+        layer_info->root.flushRingCopy(swapchain, swIt->second.get());
+
         static const bool dbgAcq = LSGV_FRAME_DBG_ENABLED;
         const auto t0 = std::chrono::steady_clock::now();
         VkResult res = VK_SUCCESS;
