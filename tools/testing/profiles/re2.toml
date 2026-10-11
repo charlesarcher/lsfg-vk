@@ -10,9 +10,9 @@ gpu = "AMD Radeon RX 9060 XT (RADV GFX1200)"
 presentation = "external"
 multiplier = 2
 # The working launch (wiki config/lsfg-vk-kennykiller.md, 2026-09-10 verified
-# RE2 662 presents/s) used transport = "udmabuf" here. The profile dropped it.
-transport = "udmabuf_ring"
-ring_slots = 3
+# Decoupled transport: the measured baseline that presents the game
+# doubled on DP-7 with zero GPU faults (runs 52606b0 / 2241f12).
+transport = "udmabuf"
 
 [[profile]]
 name = "re2-oneway"
@@ -26,5 +26,4 @@ multiplier = 2
 # ring: the layer sends the ring fds, the app imports them and maps the
 # control block, and no card imports via a dma-buf path beyond the ring.
 # MUST match app-oneway: a per-side mismatch kills every handshake.
-transport = "udmabuf_ring"
-ring_slots = 3
+transport = "udmabuf"
