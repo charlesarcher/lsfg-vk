@@ -1556,12 +1556,15 @@ void CaptureContext::flushRingCopy(const vk::Vulkan& vk) {
                 this->ringInFlightSeq, 0, this->info.extent.width,
                 this->info.extent.height,
                 static_cast<std::uint32_t>(this->info.format));
-            if (std::getenv("LSFGVK_RING_DBG")) {
-                std::fprintf(stderr,
-                    "lsfg-vk: ring published seq=%llu slot=%u (acquire submit)\n",
-                    (unsigned long long)this->ringInFlightSeq,
-                    this->ringInFlightIdx);
-                std::fflush(stderr);
+            {
+                static std::atomic<std::uint32_t> nPub{0};
+                if (nPub.fetch_add(1) < 12) {
+                    std::fprintf(stderr,
+                        "lsfg-vk: ring published seq=%llu slot=%u (acquire submit)\n",
+                        (unsigned long long)this->ringInFlightSeq,
+                        this->ringInFlightIdx);
+                    std::fflush(stderr);
+                }
             }
             this->ringInFlight = false;
         }
@@ -1585,10 +1588,13 @@ void CaptureContext::flushRingCopy(const vk::Vulkan& vk) {
     this->ringInFlightSeq = this->ringPending.seq;
     this->ringInFlight = true;
     this->ringPending.armed = false;
-    if (std::getenv("LSFGVK_RING_DBG")) {
-        std::fprintf(stderr, "lsfg-vk: ring submitted seq=%llu slot=%u (acquire)\n",
-            (unsigned long long)this->ringInFlightSeq, this->ringInFlightIdx);
-        std::fflush(stderr);
+    {
+        static std::atomic<std::uint32_t> nSub{0};
+        if (nSub.fetch_add(1) < 12) {
+            std::fprintf(stderr, "lsfg-vk: ring submitted seq=%llu slot=%u (acquire)\n",
+                (unsigned long long)this->ringInFlightSeq, this->ringInFlightIdx);
+            std::fflush(stderr);
+        }
     }
 }
 
