@@ -78,6 +78,12 @@ namespace ls::ipc {
         // ringSlots may be larger than STAGING_RING_DEPTH, so the fds live in
         // a vector; K comes from the profile, not from the compile-time depth.
         std::vector<int> ringSlotFds;
+        /// per-slot command buffers/fences for the ring's consume copy
+        /// (slot buffer -> genSources), done on the INPUT thread. The wire
+        /// path's copy/release lives after its receive block, which the ring
+        /// branches past, so the ring needs its own.
+        std::vector<std::optional<vk::CommandBuffer>> ringCopyCbs;
+        std::vector<std::optional<vk::Fence>> ringCopyFences;
         std::unique_ptr<ls::ipc::ControlBlock> ring;
         /// each slot's udmabuf imported on OUR card as a dma-buf image, so the
         /// pixels move by GPU DMA (vkCmdCopyImageToImage) and never touch the

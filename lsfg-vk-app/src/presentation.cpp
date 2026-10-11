@@ -2626,9 +2626,80 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         (unsigned long long)seq, idx);
                     std::fflush(stderr);
                 }
-                // Hand the slot to the present path as if it were an imported
-                // source image: snapshot from ringSlotImages[idx] into genSources,
-                // then present, then release the slot.
+                /* Do the consume copy HERE and release the slot.
+                   The wire path's buffer->image copy and its Release live
+                   after its receive block; the ring branches past all of that,
+                   so nothing copied the slot and nothing released it. The ring
+                   filled after K frames and the producer skipped forever. */
+                if (state.ringCopyCbs.empty()) {
+                    state.ringCopyCbs.resize(state.ringSlotCount);
+                    state.ringCopyFences.resize(state.ringSlotCount);
+                    for (size_t i = 0; i < state.ringCopyCbs.size(); ++i) {
+                        state.ringCopyCbs.at(i).emplace(vk);
+                        state.ringCopyFences.at(i).emplace(vk, true);
+                    }
+                }
+                if (idx < state.udmaBufs.size() && state.udmaBufs.at(idx).has_value()
+                        && idx < state.genSources.size()
+                        && state.genSources.at(idx).has_value()) {
+                    auto& copyFence = *state.ringCopyFences.at(idx);
+                    copyFence.wait(vk, UINT64_MAX);   // our own fence, never the peer
+                    copyFence.reset(vk);
+                    auto& copyCb = *state.ringCopyCbs.at(idx);
+                    const vk::Image& dstImg = *state.genSources.at(idx);
+                    const vk::Buffer& srcBuf = *state.udmaBufs.at(idx);
+                    copyCb.begin(vk);
+                    VkImageMemoryBarrier toDst{
+                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                    toDst.srcAccessMask = VK_ACCESS_NONE;
+                    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toDst.image = dstImg.handle();
+                    toDst.subresourceRange = {
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vk.df().CmdPipelineBarrier(copyCb.raw(),
+                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &toDst);
+                    const VkBufferImageCopy bic{
+                        .bufferOffset = 0,
+                        .bufferRowLength = state.width,
+                        .bufferImageHeight = state.height,
+                        .imageSubresource = {
+                            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                            .layerCount = 1
+                        },
+                        .imageExtent = { state.width, state.height, 1 }
+                    };
+                    vk.df().CmdCopyBufferToImage(copyCb.raw(), srcBuf.handle(),
+                        dstImg.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        1, &bic);
+                    VkImageMemoryBarrier toSrc{
+                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
+                    toSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    toSrc.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                    toSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toSrc.image = dstImg.handle();
+                    toSrc.subresourceRange = {
+                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
+                    vk.df().CmdPipelineBarrier(copyCb.raw(),
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &toSrc);
+                    copyCb.end(vk);
+                    copyCb.submit(vk, {}, VK_NULL_HANDLE, 0, {},
+                        VK_NULL_HANDLE, 0, copyFence.handle());
+                    copyFence.wait(vk, UINT64_MAX);
+                }
+                /* Hand the slot back NOW: the copy is done, so the producer may
+                   reuse it. Then let the output thread present it. */
+                state.ring->release(idx);
                 inbox.push(PendingFrame{
                     .doneFds = {},
                     .snapFd = -1,
