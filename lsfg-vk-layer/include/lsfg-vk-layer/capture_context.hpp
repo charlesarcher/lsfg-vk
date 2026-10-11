@@ -166,6 +166,29 @@ namespace lsfgvk::layer {
         /// (radv_CreateDevice -> radv_create_winsys), so a private device on
         /// the same card has an empty one.
         std::unique_ptr<vk::Vulkan> copyVk;
+        /* The ring copy must NOT be submitted from inside the present hook.
+           entrypoint.cpp:1010 says it outright:
+             "Nested QueueSubmit during QueuePresent races vkd3d's
+              QueueSubmit2. Defer dedicated work."
+           present() records the command buffer and hands it to this worker,
+           which submits OUTSIDE the hook and publishes the slot only once the
+           copy fence has signalled. From inside the hook it faulted on both
+           the transfer family and the graphics queue. */
+        struct RingJob {
+            std::uint32_t idx;
+            std::uint64_t seq;
+            VkCommandBuffer cb;
+            /// the game's present wait-semaphores, carried so the deferred
+            /// submit still waits for the frame to be rendered.
+            std::vector<VkSemaphore> waits;
+        };
+        std::thread ringWorker;
+        std::mutex ringMtx;
+        std::condition_variable ringCv;
+        std::vector<RingJob> ringJobs;
+        bool ringStop{false};
+        VkQueue ringSubmitQ{VK_NULL_HANDLE};
+        const vk::Vulkan* ringVk{nullptr};
         std::vector<vk::Buffer> copySlotBufs;
         /// per-slot sequence number of a submitted-but-unpublished copy.
         /// 0 means nothing pending. A slot is published to the control block
