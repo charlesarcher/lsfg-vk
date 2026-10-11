@@ -705,32 +705,24 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             // renderer publishes its pitch in the control block header and the
             // slot payload is width*4 tightly packed, so width*4 is the value
             // both sides agree on and no per-resize negotiation is needed.
-            vk::ImageLayout slotLayout{};
-            slotLayout.mode = vk::ImageMode::Linear;
-            slotLayout.rowPitch = static_cast<std::size_t>(w) * 4;
-            slotLayout.drmModifier = 0;
-            // resize() only when the vector is empty or the wrong size: a
-            // re-created ring would otherwise resize over live std::optional
-            // members and the next emplace throws "value already present".
-            if (state.ringSlotImages.size() != k) {
-                state.ringSlotImages.clear();
-                state.ringSlotImages.resize(k);
-            }
-            for (std::uint32_t i = 0; i < k; ++i) {
-                if (state.ringSlotImages.at(i).has_value())
+            /* Slots are imported as BUFFERS. RADV has no usable
+               linear+dma-buf IMAGE format on these cards, so an image import
+               is accepted at creation and then faults the GPU page tables on
+               first use. Buffers are the proven path and this is the same
+               import the working udmabuf transport uses, so the existing
+               buffer->image consume path handles the rest. */
+            const std::size_t slotBytes = static_cast<std::size_t>(w) * 4 * h;
+            for (std::uint32_t i = 0; i < k && i < state.udmaBufs.size(); ++i) {
+                if (state.udmaBufs.at(i).has_value())
                     continue;
-                state.ringSlotImages.at(i).emplace(vk,
-                    VkExtent2D{ static_cast<std::uint32_t>(w), h },
-                    fmt,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                        | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    slotFds.at(i), std::nullopt, slotLayout,
-                    sourceSharing, concurrentFamilies);
+                state.udmaBufs.at(i).emplace(vk, ::dup(slotFds.at(i)),
+                    slotBytes,
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                        | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             }
 
             std::fprintf(stderr,
-                "lsfg-vk-app: ring received K=%u ctrl=%zu bytes, imported %u slots as dma-buf images on '%s'\n",
+                "lsfg-vk-app: ring received K=%u ctrl=%zu bytes, imported %u slots as dma-buf buffers on '%s'\n",
                 k, ctrlBytes, k, "(this device)");
             std::fflush(stderr);
         } catch (const std::exception& e) {

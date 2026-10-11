@@ -2890,8 +2890,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 // mapping into genSources. Deliberately no CPU copy - the shm
                 // branch below owns the memcpy and is skipped on this transport
                 // because hostPtrs is null there.
-                if (state.shmBytes && sidx < state.dmaMaps.size()
-                        && state.dmaMaps.at(sidx) && sidx < snapCbs.size()) {
+                /* Ring mode has no app-side mmap (shmBytes/dmaMaps are 0): the
+                   slot arrives as a dma-buf BUFFER import and the control
+                   block carries the ordering, so the mmap guards do not apply.
+                   Without this the ring's buffer->image copy never ran and the
+                   doubler starved. */
+                const bool ringSlotReady = ringTransport
+                    && sidx < state.udmaBufs.size()
+                    && state.udmaBufs.at(sidx).has_value();
+                if ((state.shmBytes && sidx < state.dmaMaps.size()
+                        && state.dmaMaps.at(sidx) && sidx < snapCbs.size())
+                        || (ringSlotReady && sidx < snapCbs.size())) {
                     if (captureFd >= 0) {
                         // The render card's own sync_fd: signalled only once its
                         // capture blit into this slot has landed. A timeout

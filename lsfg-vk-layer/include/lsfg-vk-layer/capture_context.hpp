@@ -166,7 +166,12 @@ namespace lsfgvk::layer {
         /// (radv_CreateDevice -> radv_create_winsys), so a private device on
         /// the same card has an empty one.
         std::unique_ptr<vk::Vulkan> copyVk;
-        std::vector<vk::Image> copySlotImages;
+        std::vector<vk::Buffer> copySlotBufs;
+        /// per-slot sequence number of a submitted-but-unpublished copy.
+        /// 0 means nothing pending. A slot is published to the control block
+        /// only after its fence signals, so the doubler never reads a
+        /// half-written buffer.
+        std::vector<std::uint64_t> ringPendingSeq;
         std::vector<ls::lazy<vk::CommandBuffer>> copyCbs;
         std::vector<ls::lazy<vk::Fence>> copyFences;
         /// monotonically increasing frame sequence published to the ring

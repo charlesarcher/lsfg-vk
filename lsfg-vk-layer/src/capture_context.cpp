@@ -738,27 +738,25 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
 
             // Same tight pitch the doubler imports with (width*4): the slot
             // payload is width*4 per row, so neither side has to negotiate.
-            vk::ImageLayout slotLayout{};
-            slotLayout.mode = vk::ImageMode::Linear;
-            slotLayout.rowPitch = static_cast<std::size_t>(this->info.extent.width) * 4;
-            slotLayout.drmModifier = 0;
-            const VkImageUsageFlags slotUsage =
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            this->copySlotImages.reserve(k);
+            /* Slots are imported as BUFFERS, not images. RADV has no usable
+               linear+dma-buf IMAGE format on the render card - the probe
+               reports handles=0x0 for every candidate format
+               (tools/testing/udmabuf_ring_probe.cpp output). An image import
+               there is accepted at creation and then faults the GPU page
+               tables on first use, which is the MAPPING_ERROR / -4 cascade
+               that took the 9070 off the bus. A buffer import is the proven
+               path and has no modifier or pitch for the two cards to
+               disagree about. */
+            const VkBufferUsageFlags slotUsage =
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            this->copySlotBufs.reserve(k);
+            this->ringPendingSeq.assign(k, 0);
             this->copyCbs.reserve(k);
             this->copyFences.reserve(k);
             for (std::uint32_t i = 0; i < k; ++i) {
-                /* Import the slots and take the copy on the GAME's device.
-                   Only that device may touch its own VRAM, and it is the
-                   producer of every frame: its queue writes the swapchain
-                   image into the slot. copyVk exists only for bookkeeping
-                   parity with earlier builds and is no longer used for the
-                   copy path. This is the fix for the MAPPING_ERROR that took
-                   the 9070 off the bus. */
-                this->copySlotImages.emplace_back(vk,
-                    this->info.extent, this->info.format, slotUsage,
-                    ::dup(this->ring->slots()[i].udmabuf), std::nullopt,
-                    slotLayout);
+                this->copySlotBufs.emplace_back(vk,
+                    ::dup(this->ring->slots()[i].udmabuf),
+                    this->ring->slotBytes(), slotUsage);
                 this->copyCbs.emplace_back().emplace(vk);
                 this->copyFences.emplace_back().emplace(vk, true);
             }
@@ -1151,7 +1149,8 @@ CaptureContext::CaptureContext(CaptureContext&& o) noexcept :
     // every capture, which is what happened on the first working handshake.
     ring(std::move(o.ring)),
     copyVk(std::move(o.copyVk)),
-    copySlotImages(std::move(o.copySlotImages)),
+    copySlotBufs(std::move(o.copySlotBufs)),
+    ringPendingSeq(std::move(o.ringPendingSeq)),
     copyCbs(std::move(o.copyCbs)),
     copyFences(std::move(o.copyFences)),
     ringSeq(o.ringSeq.load(std::memory_order_relaxed)),
@@ -1654,6 +1653,26 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     const bool ringPath = this->profile.transport == ls::Transport::UdmabufRing
         && this->ring != nullptr;
     if (ringPath) {
+        /* Publish any slot whose copy has finished. This is the only place a
+           slot becomes Complete, and it happens strictly after our own fence
+           signals, so the doubler cannot observe a partial frame. */
+        for (std::uint32_t i = 0; i < this->copyFences.size(); ++i) {
+            const std::uint64_t pend = this->ringPendingSeq.at(i);
+            if (pend == 0)
+                continue;
+            if (!this->copyFences.at(i)->wait(vk, 0))
+                continue;
+            this->ring->control().publishComplete(i, pend, 0,
+                this->info.extent.width, this->info.extent.height,
+                static_cast<std::uint32_t>(this->info.format));
+            this->ringPendingSeq.at(i) = 0;
+            if (std::getenv("LSFGVK_RING_DBG")) {
+                std::fprintf(stderr,
+                    "lsfg-vk: ring published seq=%llu slot=%u (fence signalled)\n",
+                    (unsigned long long)pend, i);
+                std::fflush(stderr);
+            }
+        }
         /* The ring's own slot bookkeeping lives in the control block, so the
            staging-slot machinery below is not just unnecessary here, it is
            wrong: slotFree is never maintained in this transport and the gate
@@ -1809,10 +1828,11 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         // GAME device owns this copy. It is the producer, and only it may
         // touch its own VRAM.
         const vk::Vulkan& cvk = vk;
+        const vk::Buffer& dstBuf = this->copySlotBufs.at(idx);
         auto& fence = *this->copyFences.at(idx);
         // Our OWN fence: the only wait in this path. Timeout 0 means "already
         // signalled", so this never blocks on the doubler or on the GPU.
-        const bool fenceFree = fence.wait(*this->copyVk, 0);
+        const bool fenceFree = fence.wait(cvk, 0);
         if (std::getenv("LSFGVK_RING_DBG")) {
             std::fprintf(stderr,
                 "lsfg-vk: ring slot %u fenceFree=%d\n", slot, fenceFree ? 1 : 0);
@@ -1840,33 +1860,43 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
         return r;
         }
-        fence.reset(*this->copyVk);
+        fence.reset(cvk);
         auto& cb = *this->copyCbs.at(idx);
         cb.begin(cvk);
         const uint32_t w = this->info.extent.width;
         const uint32_t h = this->info.extent.height;
-        const vk::Image& dst = this->copySlotImages.at(idx);
-        VkImageMemoryBarrier toDst = barrierHelper(dst.handle(),
-            VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        cvk.df().CmdPipelineBarrier(cb.raw(),
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toDst);
-        const VkImageCopy region{
-            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .extent = { w, h, 1 }
-        };
-        cvk.df().CmdCopyImage(cb.raw(),
-            srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            dst.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-        VkImageMemoryBarrier done = barrierHelper(dst.handle(),
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        // Image -> BUFFER on the game device. srcImage is the game's own
+        // swapchain image (only this device may touch it); dstBuf is the ring
+        // slot, imported as a buffer because RADV has no usable linear+dma-buf
+        // IMAGE format here.
+        VkImageMemoryBarrier toSrc = barrierHelper(srcImage,
+            VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+            dummySrc ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
         cvk.df().CmdPipelineBarrier(cb.raw(),
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0, 0, nullptr, 0, nullptr, 1, &toSrc);
+        const VkBufferImageCopy region{
+            .bufferOffset = 0,
+            .bufferRowLength = w,
+            .bufferImageHeight = h,
+            .imageSubresource = {
+                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                .layerCount = 1
+            },
+            .imageExtent = { w, h, 1 }
+        };
+        cvk.df().CmdCopyImageToBuffer(cb.raw(),
+            srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            dstBuf.handle(), 1, &region);
+        VkImageMemoryBarrier back = barrierHelper(srcImage,
+            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
+            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            dummySrc ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+                     : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+        cvk.df().CmdPipelineBarrier(cb.raw(),
             VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &done);
+            0, 0, nullptr, 0, nullptr, 1, &back);
         cb.end(cvk);
         // Wait on the game's own present wait-semaphores: the copy must not
         // start reading the swapchain image while the game is still rendering
@@ -1878,11 +1908,11 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             {}, VK_NULL_HANDLE, 0,
             fence.handle(),
             cvk.transferQueueHandle());
-        // Publish to the control block with release ordering; the doubler sees
-        // the metadata before Complete.
-        this->ring->control().publishComplete(idx, seq, 0,
-            this->info.extent.width, this->info.extent.height,
-            static_cast<std::uint32_t>(this->info.format));
+        /* Mark the slot pending; it is published only once OUR fence signals,
+           so the doubler can never read a half-written buffer. Publishing here
+           would race the copy. */
+        this->ringPendingSeq.at(idx) = seq;
+        (void)idx;
         if (std::getenv("LSFGVK_RING_DBG")) {
             std::fprintf(stderr,
                 "lsfg-vk: ring published seq=%llu slot=%u (no CPU copy, no wait on the doubler)\n",
