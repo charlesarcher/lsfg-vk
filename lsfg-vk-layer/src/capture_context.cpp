@@ -1567,6 +1567,20 @@ void CaptureContext::flushRingCopy(const vk::Vulkan& vk) {
             : this->copyFences.at(this->ringInFlightIdx)->handle();
         if (vk.df().WaitForFences(vk.dev(), 1, &pollFence, VK_TRUE, 0)
                 == VK_SUCCESS) {
+            {
+                static std::atomic<std::uint32_t> nPubDiag{0};
+                if (nPubDiag.fetch_add(1) < 4) {
+                    std::fprintf(stderr,
+                        "lsfg-vk: ring DIAG publish ctrl=%p hdr=%p slot0=%p count=%u slot=%u seq=%llu\n",
+                        (void*)this->ring->control().header(),
+                        (void*)this->ring->control().header(),
+                        (void*)this->ring->control().slot(0),
+                        this->ring->control().count(),
+                        this->ringInFlightIdx,
+                        (unsigned long long)this->ringInFlightSeq);
+                    std::fflush(stderr);
+                }
+            }
             this->ring->control().publishComplete(this->ringInFlightIdx,
                 this->ringInFlightSeq, 0, this->info.extent.width,
                 this->info.extent.height,
@@ -2054,6 +2068,11 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::vector<VkPipelineStageFlags> stages(semaphores.size(),
             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
         VkSubmitInfo rsi{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        /* Wait on the game's present semaphores here, and ONLY here. The
+           isolated path's deferred work used to wait on the same binary
+           semaphores, and the first waiter consumes the signal - so this copy
+           parked forever and the slot stayed in Writing. The deferred path no
+           longer takes them for the ring. */
         rsi.waitSemaphoreCount = (std::uint32_t)semaphores.size();
         rsi.pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data();
         rsi.pWaitDstStageMask = stages.empty() ? nullptr : stages.data();
@@ -2078,8 +2097,15 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
            expression the working decoupled capture path uses. */
         const VkQueue submitQ = this->captureQ != VK_NULL_HANDLE
             ? this->captureQ : queue;
-        const VkFence submitFence = this->ringRecycleFence != VK_NULL_HANDLE
-            ? this->ringRecycleFence : fence.handle();
+        /* Use OUR OWN fence, not the isolated recycle fence. Folding the
+           recycle fence in looked tidy but the isolated ACQUIRE resets it,
+           which wipes our pending signal: the fence then never signals, the
+           slot stays in Writing forever (measured: stream=1 slot 1 state=1),
+           and ringInFlight blocks every later copy. The recycle fence is
+           signalled by the isolated path's deferred work instead, which now
+           runs because our in-present submit consumes the present
+           semaphores. */
+        const VkFence submitFence = fence.handle();
         this->ringInFlightFence = submitFence;
         const VkResult ringSr = cvk.df().QueueSubmit(submitQ, 1, &rsi,
             submitFence);

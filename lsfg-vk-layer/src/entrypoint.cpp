@@ -1040,8 +1040,21 @@ namespace {
                            blocked in acquire waiting on that very fence, so
                            it never reaches its next submit. The <1440 path
                            already does it inline. */
-                        const bool consumeWaits = skipIpc || isRing;
-                        if (iso.extent.height >= 1440 && !isRing) {
+                        /* ONLY the deferred path, or ONLY the ring copy -
+                           never both. These are binary semaphores: the first
+                           waiter consumes the signal, so a second waiter parks
+                           forever. Having both wait is what left the ring slot
+                           stuck in Writing with the copy never executing.
+                           The ring's copy waits on them, so the deferred work
+                           must not. */
+                        const bool consumeWaits = skipIpc && !isRing;
+                        /* The ring goes through the DEFERRED path too: our copy
+                           submit now consumes the present semaphores, so the
+                           game is not deadlocked and will reach the next
+                           vkQueueSubmit2, where this work is flushed and the
+                           recycle fence is signalled. Signalling it inline
+                           instead was a second nested submit (19 faults). */
+                        if (iso.extent.height >= 1440) {
                             // Nested QueueSubmit during QueuePresent races
                             // vkd3d's QueueSubmit2. Defer dedicated work.
                             if (consumeWaits)

@@ -2607,6 +2607,33 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 uint64_t seq = 0;
                 int slot = state.ring->claimNewestComplete(&seq);
                 if (slot < 0) {
+                    /* Print the block's address and every slot's state: if the
+                       layer says it published and we see no Complete slot, the
+                       two sides are not looking at the same mapping. */
+                    {
+                        static std::atomic<std::uint32_t> nIdleDump{0};
+                        /* Dump LATE, not on the first few idles: an early dump
+                           predates the layer's first publish and shows all
+                           slots Free, which says nothing. */
+                        const std::uint32_t idleN = nIdleDump.fetch_add(1);
+                        if (std::getenv("LSFGVK_RING_DBG")
+                                && (idleN % 2000) == 0 && idleN < 20001) {
+                            std::fprintf(stderr,
+                                "lsfg-vk-app: ring DIAG stream=%u idle=%u ctrl=%p count=%u slots=%p\n",
+                                state.streamId, idleN,
+                                (void*)state.ringCtrlMap,
+                                state.ring->count(),
+                                (void*)state.ring->header(),
+                                (void*)state.ring->slot(0));
+                            for (std::uint32_t si = 0; si < state.ring->count(); ++si)
+                                std::fprintf(stderr,
+                                    "lsfg-vk-app: ring DIAG slot %u state=%u seq=%llu\n",
+                                    si,
+                                    state.ring->slot(si)->state.load(),
+                                    (unsigned long long)state.ring->slot(si)->seq.load());
+                            std::fflush(stderr);
+                        }
+                    }
                     if (std::getenv("LSFGVK_RING_DBG")) {
                         static uint32_t nIdle = 0;
                         if (nIdle < 8) {
@@ -2639,6 +2666,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         state.ringCopyFences.at(i).emplace(vk, true);
                     }
                 }
+                try {
                 if (idx < state.udmaBufs.size() && state.udmaBufs.at(idx).has_value()
                         && idx < state.genSources.size()
                         && state.genSources.at(idx).has_value()) {
@@ -2696,6 +2724,17 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     copyCb.submit(vk, {}, VK_NULL_HANDLE, 0, {},
                         VK_NULL_HANDLE, 0, copyFence.handle());
                     copyFence.wait(vk, UINT64_MAX);
+                }
+                } catch (const std::exception& e) {
+                    /* A failure here was killing the whole stream: the
+                       exception propagated out of the input thread, set
+                       `failed`, and runPresent unwound - which is why the
+                       doubler realized exactly one frame and then stopped.
+                       Report it, drop the frame, and keep the stream alive. */
+                    std::fprintf(stderr,
+                        "lsfg-vk-app: ring consume copy failed slot=%u: %s\n",
+                        idx, e.what());
+                    std::fflush(stderr);
                 }
                 /* Hand the slot back NOW: the copy is done, so the producer may
                    reuse it. Then let the output thread present it. */
