@@ -1765,6 +1765,16 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         const std::uint64_t seq = this->ringSeq.fetch_add(1,
             std::memory_order_relaxed) + 1;
         const int claimed = this->ring->control().claimForWrite(seq, 0);
+        {
+            static std::atomic<std::uint32_t> nClaimLog{0};
+            if (nClaimLog.fetch_add(1) < 12) {
+                std::fprintf(stderr,
+                    "lsfg-vk: ring claim seq=%llu -> slot %d (K=%u)\n",
+                    (unsigned long long)seq, claimed,
+                    this->ring->control().count());
+                std::fflush(stderr);
+            }
+        }
         if (std::getenv("LSFGVK_RING_DBG")) {
             std::fprintf(stderr,
                 "lsfg-vk: ring claim seq=%llu slot=%d K=%u\n",
@@ -1996,6 +2006,15 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                 std::vector<VkSemaphore>(semaphores.begin(), semaphores.end()) });
         }
         this->ringCv.notify_one();
+        {
+            static std::atomic<std::uint32_t> nQueued{0};
+            if (nQueued.fetch_add(1) < 12) {
+                std::fprintf(stderr,
+                    "lsfg-vk: ring job queued seq=%llu slot=%u waits=%zu\n",
+                    (unsigned long long)seq, idx, semaphores.size());
+                std::fflush(stderr);
+            }
+        }
         if (std::getenv("LSFGVK_RING_DBG")) {
             std::fprintf(stderr,
                 "lsfg-vk: ring published seq=%llu slot=%u (no CPU copy, no wait on the doubler)\n",
