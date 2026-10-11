@@ -151,24 +151,24 @@ stop_comm() {
   done
 }
 echo "--- stop ---"
+# Only stop what THIS SCRIPT owns. re2.exe and Steam belong to the user's own
+# Steam session: killing re2.exe here kills the game they have open, and Steam
+# sits above the game, so it goes down too - the exact failure mode that kept
+# taking Steam with the run. lsfg-vk-app and furmark are ours; re2.exe is not.
 stop_comm lsfg-vk-app
 stop_comm furmark
-stop_comm re2.exe
 for _ in $(seq 1 50); do
   if ! /usr/bin/pgrep -x lsfg-vk-app >/dev/null \
-    && ! /usr/bin/pgrep -x furmark >/dev/null \
-    && ! /usr/bin/pgrep -x re2.exe >/dev/null; then
+    && ! /usr/bin/pgrep -x furmark >/dev/null; then
     break
   fi
   sleep 0.2
 done
 if /usr/bin/pgrep -x lsfg-vk-app >/dev/null \
-  || /usr/bin/pgrep -x furmark >/dev/null \
-  || /usr/bin/pgrep -x re2.exe >/dev/null; then
-  echo "REFUSING: old process still alive" | /usr/bin/tee "$LOG"
+  || /usr/bin/pgrep -x furmark >/dev/null; then
+  echo "REFUSING: our own doubler/bench is still alive" | /usr/bin/tee "$LOG"
   /usr/bin/pgrep -a -x lsfg-vk-app || true
   /usr/bin/pgrep -a -x furmark || true
-  /usr/bin/pgrep -a -x re2.exe || true
   exit 1
 fi
 echo "stop: clear"
@@ -407,8 +407,17 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
     CONSOLE_MARK="$(/usr/bin/wc -l < "$CONSOLE")"
   fi
   echo "console_mark=$CONSOLE_MARK"
+  # Never spawn Steam. A client this script starts is a client this script ends
+  # up in a position to kill on teardown, and Steam sits above the game - so
+  # stopping the run took Steam (and the user's shell) down with it. Steam must
+  # already be running; this only asks the running client to launch the app.
+  if ! /usr/bin/pgrep -x steam >/dev/null; then
+    echo "REFUSING: Steam is not running. Start Steam yourself, then re-run." \
+      | /usr/bin/tee "$LOG"
+    exit 1
+  fi
   timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" >/dev/null 2>&1 &
-  echo "steam cli pid=$!"
+  echo "steam launch requested (attached to the already-running client), cli pid=$!"
   GAME_PID=""
   for _ in $(seq 1 120); do
     while read -r cand; do
@@ -444,9 +453,11 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
       > "$OUT/game-console.txt" || true
     echo "game-console lines=$(/usr/bin/wc -l < "$OUT/game-console.txt")"
   fi
-  if kill -0 "$GAME_PID" 2>/dev/null; then
-    /bin/kill -TERM "$GAME_PID" 2>/dev/null || true
-  fi
+  # Deliberately do NOT kill the game. re2.exe belongs to the user's Steam
+  # session, and killing it from here is what dragged Steam down with the run.
+  # The doubler and recorder ARE ours and are stopped below; the game is not
+  # ours to end.
+  echo "leaving game pid=${GAME_PID:-none} to the user's Steam session"
 else
   echo "REFUSING: unknown GAME_KIND=$GAME_KIND"
   exit 1

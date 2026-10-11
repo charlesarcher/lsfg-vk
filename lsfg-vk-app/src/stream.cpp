@@ -361,6 +361,21 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", mfdFlags));
         if (memfd < 0 || ::ftruncate(memfd, static_cast<off_t>(mapBytes)) != 0)
             throw ls::error("memfd_create/ftruncate failed for POSIX staging");
+        /* Seal NOW, before the mmap+mlock of a ~14 MB mapping. The seal only
+           needs the fd to be open, and closing the window matters: it used to
+           run AFTER the mapping was established, and another stream's teardown
+           could close this fd NUMBER in between (measured: errno=9 EBADF, fd=28
+           no longer open when fcntl ran). Do it while the window is one
+           syscall wide. */
+        if (hostBounce && ::fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
+            const int e = errno;
+            ::close(memfd);
+            throw ls::error(std::string("F_ADD_SEALS(F_SEAL_SHRINK) failed for "
+                "udmabuf staging: errno=") + std::to_string(e) + " (" +
+                std::strerror(e) + ") hostBounce=" + std::to_string(hostBounce) +
+                " mfdFlags=0x" + [&]{ char b[16]; std::snprintf(b, sizeof b, "%x", mfdFlags); return std::string(b); }() +
+                " fd=" + std::to_string(memfd) + " bytes=" + std::to_string(mapBytes));
+        }
         void* map = ::mmap(nullptr, static_cast<size_t>(mapBytes),
             PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
         if (map == MAP_FAILED) {
@@ -382,10 +397,18 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         // shared mappings for external_memory_host). Proven by
         // tools/testing/test_udmabuf.sh.
         if (hostBounce) {
+            /* Already sealed above, while the fd window was tiny. This is a
+               no-op re-seal (F_ADD_SEALS is idempotent) kept as a guard: if the
+               fd has been closed since, we find out here with a clear error
+               instead of later inside UDMABUF_CREATE. */
             if (::fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
                 ::munmap(map, static_cast<size_t>(mapBytes));
                 ::close(memfd);
-                throw ls::error("F_ADD_SEALS(F_SEAL_SHRINK) failed for udmabuf staging");
+                throw ls::error(std::string("F_ADD_SEALS(F_SEAL_SHRINK) failed for "
+                    "udmabuf staging: errno=") + std::to_string(errno) + " (" +
+                    std::strerror(errno) + ") hostBounce=" + std::to_string(hostBounce) +
+                    " mfdFlags=0x" + [&]{ char b[16]; std::snprintf(b, sizeof b, "%x", mfdFlags); return std::string(b); }() +
+                    " fd=" + std::to_string(memfd) + " bytes=" + std::to_string(mapBytes));
             }
             int udev = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
             if (udev < 0) {
