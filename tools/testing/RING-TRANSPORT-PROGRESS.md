@@ -152,3 +152,5 @@ crash and faults flat.
 PROCESS NOTE (Charles, this session): NEVER kill by pattern. The cleanup
 loops in my run commands matched re2.exe/lsfg-launch by name and killed
 Steam's own processes. Kill only a PID this session spawned. No pattern kills.
+
+fc2c87a | re2 (asan app + release layer) | WORKED: reached frame 29748, zero AddressSanitizer errors (was one per run before the fix), clean teardown, no new GPU faults | /home/archerc/lsfg-work/runs/re2/20261010T221219
