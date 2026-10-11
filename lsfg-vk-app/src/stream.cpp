@@ -361,58 +361,30 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", mfdFlags));
         if (memfd < 0 || ::ftruncate(memfd, static_cast<off_t>(mapBytes)) != 0)
             throw ls::error("memfd_create/ftruncate failed for POSIX staging");
-        /* Seal NOW, before the mmap+mlock of a ~14 MB mapping. The seal only
-           needs the fd to be open, and closing the window matters: it used to
-           run AFTER the mapping was established, and another stream's teardown
-           could close this fd NUMBER in between (measured: errno=9 EBADF, fd=28
-           no longer open when fcntl ran). Do it while the window is one
-           syscall wide. */
-        if (hostBounce && ::fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
-            const int e = errno;
-            ::close(memfd);
-            throw ls::error(std::string("F_ADD_SEALS(F_SEAL_SHRINK) failed for "
-                "udmabuf staging: errno=") + std::to_string(e) + " (" +
-                std::strerror(e) + ") hostBounce=" + std::to_string(hostBounce) +
-                " mfdFlags=0x" + [&]{ char b[16]; std::snprintf(b, sizeof b, "%x", mfdFlags); return std::string(b); }() +
-                " fd=" + std::to_string(memfd) + " bytes=" + std::to_string(mapBytes));
-        }
-        void* map = ::mmap(nullptr, static_cast<size_t>(mapBytes),
-            PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-        if (map == MAP_FAILED) {
-            ::close(memfd);
-            throw ls::error("mmap memfd failed for POSIX staging");
-        }
-        ::memset(map, 0, static_cast<size_t>(mapBytes));
-        (void)::mlock(map, static_cast<size_t>(mapBytes));
-
-        // Host-buffer bounce: wrap these exact pages in a udmabuf so OUR gpu
-        // can import them and DMA out with no CPU copy. The layer keeps
-        // receiving the plain memfd below and keeps DMAing into it, so the
-        // two processes share one physical allocation:
-        //
-        //     render GPU --DMA--> system memory --DMA--> doubler GPU
-        //
-        // No p2p (the two cards have no usable cross-device page-table
-        // mapping here) and no host-pointer import (radv rejects mmap'd
-        // shared mappings for external_memory_host). Proven by
-        // tools/testing/test_udmabuf.sh.
+        /* Everything that needs the memfd FD, back to back, BEFORE the slow
+           part. This used to run after mmap+mlock of a ~14 MB mapping, and in
+           that window another stream's teardown closed this fd NUMBER out from
+           under us: measured errno=9 (EBADF) on fd=28 at the seal, which
+           rejected the stream and produced a ~950-times reconnect loop (hang +
+           continuous logging). Keep the window one syscall wide.
+           The bounce wraps these exact pages in a udmabuf so OUR gpu imports
+           them and DMAs out with no CPU copy, while the layer keeps receiving
+           the plain memfd and DMAing in - one physical allocation:
+               render GPU --DMA--> system memory --DMA--> doubler GPU
+           No p2p and no host-pointer import (radv rejects mmap'd shared
+           mappings for external_memory_host). Proven by tools/testing/test_udmabuf.sh. */
         if (hostBounce) {
-            /* Already sealed above, while the fd window was tiny. This is a
-               no-op re-seal (F_ADD_SEALS is idempotent) kept as a guard: if the
-               fd has been closed since, we find out here with a clear error
-               instead of later inside UDMABUF_CREATE. */
             if (::fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
-                ::munmap(map, static_cast<size_t>(mapBytes));
+                const int e = errno;
                 ::close(memfd);
                 throw ls::error(std::string("F_ADD_SEALS(F_SEAL_SHRINK) failed for "
-                    "udmabuf staging: errno=") + std::to_string(errno) + " (" +
-                    std::strerror(errno) + ") hostBounce=" + std::to_string(hostBounce) +
+                    "udmabuf staging: errno=") + std::to_string(e) + " (" +
+                    std::strerror(e) + ") hostBounce=" + std::to_string(hostBounce) +
                     " mfdFlags=0x" + [&]{ char b[16]; std::snprintf(b, sizeof b, "%x", mfdFlags); return std::string(b); }() +
                     " fd=" + std::to_string(memfd) + " bytes=" + std::to_string(mapBytes));
             }
             int udev = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
             if (udev < 0) {
-                ::munmap(map, static_cast<size_t>(mapBytes));
                 ::close(memfd);
                 throw ls::error("open /dev/udmabuf failed for host bounce");
             }
@@ -424,12 +396,19 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             const int udfd = ::ioctl(udev, UDMABUF_CREATE, &uc);
             ::close(udev);
             if (udfd < 0) {
-                ::munmap(map, static_cast<size_t>(mapBytes));
                 ::close(memfd);
                 throw ls::error("UDMABUF_CREATE failed for host bounce");
             }
             state.udmaFds.at(i) = udfd;
         }
+        void* map = ::mmap(nullptr, static_cast<size_t>(mapBytes),
+            PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+        if (map == MAP_FAILED) {
+            ::close(memfd);
+            throw ls::error("mmap memfd failed for POSIX staging");
+        }
+        ::memset(map, 0, static_cast<size_t>(mapBytes));
+        (void)::mlock(map, static_cast<size_t>(mapBytes));
 
         state.shmMaps.at(i) = map;
         if (hostBounce) {
