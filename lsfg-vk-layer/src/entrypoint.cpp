@@ -1011,14 +1011,25 @@ namespace {
                         PendingPresentWork work;
                         work.vk = &it->second.get();
                         work.height = iso.extent.height;
+                        /* ringPath is included deliberately: the ring path
+                           forces skipIpc false so that every present reaches
+                           presentSwapchain, but the deferred work that
+                           CONSUMES the game's present wait-semaphores is
+                           gated on skipIpc. Without it nothing consumes them,
+                           vkd3d's present never completes, and the game stops
+                           after one frame - which is what we measured
+                           (one ring claim per stream, then silence). */
+                        const bool consumeWaits = skipIpc
+                            || layer_info->root.activeTransport()
+                                == ls::Transport::UdmabufRing;
                         if (iso.extent.height >= 1440) {
                             // Nested QueueSubmit during QueuePresent races
                             // vkd3d's QueueSubmit2. Defer dedicated work.
-                            if (skipIpc)
+                            if (consumeWaits)
                                 work.waits = waitSemaphores;
-                            if (skipIpc)
+                            if (consumeWaits)
                                 work.recycle = iso.recycleFences.at(idx).handle();
-                        } else if (skipIpc) {
+                        } else if (consumeWaits) {
                             isolatedSignal(it->second.get(), iso.signalQueue, iso.signalQueue,
                                 VK_NULL_HANDLE, iso.recycleFences.at(idx).handle());
                         }
