@@ -32,3 +32,72 @@ e2ef15b+7859d37 | furmark-decoupled-bench | BLOCKED: 9070 XT dropped out of the 
 e02ed76+ | dp7-record (FurMark) | HITCH CHECK FAILS: 240fps/2560x1440/14755 frames; in-game 1-59s has 3 duplicate runs: t=1.967s 20.8ms, t=25.100s 25.0ms, t=56.008s 4.2ms. Plus 191.7ms freeze at t=0.075s (startup) and 37.5ms repeats at 60.1s+ (post-bench teardown, clip 61.48s vs elapsed 60.009s) | /tmp/lsfg-runs/dp7-record/20261004T221308 + tools/testing/hitch_check.py
 2241f12 | re2 | RE2 visible+2x on DP-7 (base 123 / doubled 242, frame 6159/12318), 127s capture, 3 streams incl both 1440p, 14195 frames realized, dmesg 11->11. Hitch check: 40-110s steady state = ZERO stalls over 16800 frames; 30-120s = 11 frames/45.8ms (3 events, all in first 32s menu transition) | /tmp/lsfg-runs/re2/20261004T224140
 c845979+be600c2 | dp7-record (FurMark 300s) | HITCHES CONFIRMED VISUALLY: 55 events / 246 stalled frames over 296s (median changed 39.921%). At t=41.30s full-res PNGs show 6 identical frames then 4 identical (byte-identical sha256). MangoHud p99=16.2ms vs p50=5.1ms. presents/s=129.58 gen=38875 real=38875 exit=0, dmesg 11->11 | /home/archerc/lsfg-work/runs/dp7-record/20261004T232353 + ~/lsfg-work/vis/
+
+## 2026-10-10 session: ring faults root-caused, frames finally published
+
+Everything below is measured, not inferred. Card ended off the bus; needs reboot.
+
+### The faults (three separate causes, found in this order)
+
+1. **Image import is impossible on this driver.** The probe reports
+   `handles=0x0` for EVERY candidate format on the 9070:
+   `no linear+dma-buf format for render dst`. An image import is ACCEPTED at
+   creation and then faults the GPU page tables on first use. That was the
+   original MAPPING_ERROR / -4 cascade. Fix: import slots as BUFFERS
+   (7dbb93c), which is what the working udmabuf transport always did.
+   NOTE: the pre-existing ring probe's BUFFER_ONLY mode forces DOUBLER_ONLY
+   (`#if BUFFER_ONLY && !DOUBLER_ONLY -> #define DOUBLER_ONLY 1`), so its
+   "buffers proven" result never covered the render card. That misled three
+   separate attempts.
+
+2. **Nested submit during the present hook.** 21 faults. The layer's own
+   comment (entrypoint.cpp:1010) says it: "Nested QueueSubmit during
+   QueuePresent races vkd3d's QueueSubmit2." Fault count per run:
+   in-present 21 -> worker thread 3 (shared VkDevice, no external sync
+   possible) -> acquire-driven 0.
+
+3. **The isolated recycle-fence signal was a SECOND nested submit.**
+   isolatedSignal is a bare empty QueueSubmit that only signals a fence, and
+   a submit can signal exactly ONE fence - so the ring's copy submit now
+   carries the recycle fence instead (42e7d0d). Faults 19 -> 3 per run.
+
+### The deadlock (separate from the faults)
+
+The ring forces skipIpc false so every present reaches presentSwapchain, but
+the deferred work that CONSUMES the game's present wait-semaphores is gated
+on skipIpc and flushed from vkQueueSubmit2. Nothing consumed them, so
+vkd3d's present never completed and the game stopped after ONE frame per
+swapchain. The ring now consumes them in its in-present submit.
+
+### The silent no-submit
+
+`ringSubmitQ` was set during ring setup, but captureQ is not assigned until
+later in the constructor and vk.queue() was null there -> every submit went
+to VK_NULL_HANDLE and did nothing, with no error. Found by an ungated
+`q=(nil)` print (resolve the queue at submit time, as the decoupled path
+does).
+
+### The doubler never released slots
+
+The ring branch in the input thread claims a slot and `continue`s, so it
+never reached the wire path's buffer->image copy and Release block
+(presentation.cpp:2890-3670). Nothing copied the slot and nothing released
+it, so the ring filled after K frames and the producer skipped forever
+(`ring claim seq=4 -> slot -1`). Fixed in 0219bba: the ring now does its own
+copy (slot buffer -> genSources) on the app device with its own fence, then
+releases before handing the frame to the output thread.
+
+### Where it stands
+
+- Submits work, frames publish to the control block (9), faults flat
+  (77 -> 77 across the last runs), and the doubler realizes a frame.
+- Remaining failure observed: `stream ended: failed to open backend context
+  - backend context is not cross-device`, with the app reporting
+  `stream from 'AMD Radeon RX 9060 XT'` - i.e. the GAME had fallen back to
+  the 9060 because the 9070 was already off the bus, making the context
+  same-device. That error is a SYMPTOM of the missing card, not a code
+  defect (an earlier claim that skipping the STAGING exchange caused it was
+  wrong and is retracted).
+- To resume: reboot (the 9070 will not re-enumerate after resets; the 9060
+  also wedged a compute queue). Then confirm the game lands on the 9070
+  (`stream from 'AMD Radeon RX 9070 XT'`) before reading anything else.
