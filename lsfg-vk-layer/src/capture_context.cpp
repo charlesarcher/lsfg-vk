@@ -749,6 +749,16 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
                disagree about. */
             const VkBufferUsageFlags slotUsage =
                 VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            /* One line, never gated: which queue the ring copy will use. If
+               this is null the submit falls back to the graphics queue, and
+               RADV then lowers CmdCopyImageToBuffer to a color-backend draw
+               (probe finding) - the fault we are chasing. */
+            std::fprintf(stderr,
+                "lsfg-vk: ring copy queue = %p (transfer family idx %u, "
+                "graphics queue %p)\n",
+                (void*)vk.transferQueueHandle(), vk.transferQueueFamilyIndex(),
+                (void*)vk.queue());
+            std::fflush(stderr);
             this->copySlotBufs.reserve(k);
             this->ringPendingSeq.assign(k, 0);
             this->copyCbs.reserve(k);
