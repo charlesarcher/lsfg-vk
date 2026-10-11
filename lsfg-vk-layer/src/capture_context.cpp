@@ -1546,6 +1546,17 @@ void CaptureContext::flushRingCopy(const vk::Vulkan& vk) {
     /* Called from myvkAcquireNextImageKHR - the game's own thread, at the top
        of a frame, outside any nested submit. Two jobs: publish a copy whose
        fence has signalled, and submit the copy armed by the last present. */
+    {
+        static std::atomic<std::uint32_t> nEnter{0};
+        if (nEnter.fetch_add(1) < 10) {
+            std::fprintf(stderr,
+                "lsfg-vk: ring flush enter: ring=%d armed=%d inFlight=%d\n",
+                this->ring != nullptr ? 1 : 0,
+                this->ringPending.armed ? 1 : 0,
+                this->ringInFlight ? 1 : 0);
+            std::fflush(stderr);
+        }
+    }
     if (this->ring == nullptr)
         return;
     if (this->ringInFlight) {
@@ -2024,11 +2035,41 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
            executes them, and by then this image is presented and released.
            See the header for why neither the present hook nor a worker thread
            works. */
-        this->ringPending.armed = true;
-        this->ringPending.idx = idx;
-        this->ringPending.seq = seq;
-        this->ringPending.cb = cb.raw();
-        this->ringPending.src = srcImage;
+        /* Submit HERE, consuming the game's present wait-semaphores, exactly
+           as the working decoupled capture path does. Deferring them
+           deadlocked the game: the deferred work that consumes them is
+           flushed from vkQueueSubmit2, and the game never reaches its next
+           submit because its present is waiting on semaphores nobody took.
+           The copy goes through the VRAM intermediate, which is what makes
+           this safe to submit here (the direct image -> dma-buf buffer copy
+           was the combination that faulted). */
+        std::vector<VkPipelineStageFlags> stages(semaphores.size(),
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT);
+        VkSubmitInfo rsi{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+        rsi.waitSemaphoreCount = (std::uint32_t)semaphores.size();
+        rsi.pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data();
+        rsi.pWaitDstStageMask = stages.empty() ? nullptr : stages.data();
+        const VkCommandBuffer rawRingCb = cb.raw();
+        rsi.commandBufferCount = 1;
+        rsi.pCommandBuffers = &rawRingCb;
+        const VkResult ringSr = cvk.df().QueueSubmit(this->ringSubmitQ, 1, &rsi,
+            fence.handle());
+        if (ringSr != VK_SUCCESS) {
+            std::fprintf(stderr, "lsfg-vk: ring submit failed rc=%d slot=%u\n",
+                (int)ringSr, idx);
+            std::fflush(stderr);
+            this->ring->control().release(idx);
+        } else {
+            this->ringInFlight = true;
+            this->ringInFlightIdx = idx;
+            this->ringInFlightSeq = seq;
+            static std::atomic<std::uint32_t> nSub2{0};
+            if (nSub2.fetch_add(1) < 12) {
+                std::fprintf(stderr, "lsfg-vk: ring submitted seq=%llu slot=%u (in-present)\n",
+                    (unsigned long long)seq, idx);
+                std::fflush(stderr);
+            }
+        }
         if (std::getenv("LSFGVK_RING_DBG")) {
             std::fprintf(stderr,
                 "lsfg-vk: ring published seq=%llu slot=%u (no CPU copy, no wait on the doubler)\n",
