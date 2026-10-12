@@ -332,7 +332,12 @@ APP_PID=$!
 echo "app pid=$APP_PID"
 check_exe "$APP_PID" "$APP_HASH" app
 
-for _ in $(seq 1 80); do
+# The app binds the socket only after its device, swapchain and queues exist, so this
+# window also covers driver init on the render card. The Intel iGPU needs more than the
+# 4 s this used to allow while the previous run's app is still being torn down: pair
+# 9060-to-igpu at 20261012T080352 gave up here although the app logged "listening" a
+# moment later. 400 x 0.05 s = 20 s.
+for _ in $(seq 1 400); do
   if [[ -S "$SOCK" ]] && kill -0 "$APP_PID" 2>/dev/null; then
     break
   fi
@@ -361,9 +366,9 @@ fi
 GAME_PID=""
 if [[ "$GAME_KIND" == "furmark" ]]; then
   FM_CMD=( /usr/bin/mangohud --dlsym /usr/bin/furmark
-    --demo furmark-vk --gpu-index 1
-    --width 2560 --height 1440 --fullscreen
-    --msaa 4 --vsync 0 --no-resize --disable-demo-options
+    --demo furmark-vk --gpu-index "${FM_GPU_INDEX:-1}"
+    --width "${FM_W:-2560}" --height "${FM_H:-1440}" --fullscreen
+    --msaa "${FM_MSAA:-4}" --vsync 0 --no-resize --disable-demo-options
     --print-render-speed --no-score-box --max-time "$LSFG_MAX_TIME" --no-osi )
   echo "--- furmark command ---"
   printf '%q ' "${FM_CMD[@]}"; echo
@@ -372,7 +377,7 @@ if [[ "$GAME_KIND" == "furmark" ]]; then
     VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation \
     VK_LOADER_DEBUG=error,warn,info,layer \
     LSFGVK_PROFILE=furmark-oneway \
-    LSFGVK_CAPTURE_WxH=2560x1440 \
+    LSFGVK_CAPTURE_WxH="${FM_W:-2560}x${FM_H:-1440}" \
     LSFGVK_CONFIG="$CFG" \
     LSFGVK_APP_SOCK="$SOCK" \
     MANGOHUD=1 \

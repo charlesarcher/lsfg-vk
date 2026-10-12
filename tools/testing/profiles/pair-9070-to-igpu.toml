@@ -1,0 +1,32 @@
+version = 2
+
+# Pair 9070-to-igpu: the game renders on the RX 9070 XT, the doubler processes and presents on
+# the Intel iGPU (ARL). The game card is pinned by FM_GPU_INDEX in the .env (FurMark's adapter
+# index: 0 = RX 9060 XT, 1 = RX 9070 XT, 2 = Intel iGPU on this machine); the gpu keys
+# below name the render card, which is what the layer's dual-host device and the app's
+# output swapchain are built on. The window always goes to DP-7, the connected panel, so
+# a render card without a monitor still presents, through X11.
+# Measured at 1920x1080 MSAA 2 for this pair.
+
+[global]
+dll = "/mnt/windows/Games/Steam/steamapps/common/Lossless Scaling/Lossless.dll"
+allow_fp16 = true
+
+[[profile]]
+name = "app-oneway"
+gpu = "Intel(R) Graphics (ARL)"
+presentation = "external"
+multiplier = 2
+transport = "decoupled"
+output = "DP-7"
+hud = true
+
+[[profile]]
+name = "furmark-oneway"
+active_in = "furmark"
+gpu = "Intel(R) Graphics (ARL)"
+presentation = "external"
+multiplier = 2
+transport = "decoupled"
+output = "DP-7"
+hud = true
