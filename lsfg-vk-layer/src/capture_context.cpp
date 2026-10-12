@@ -535,22 +535,57 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         }
         if (this->profile.transport == ls::Transport::DecoupledDma) {
             try {
-                auto selectB = [](const vk::VulkanInstanceFuncs& fi,
+                auto identity = [](const vk::VulkanInstanceFuncs& fi,
+                                     VkPhysicalDevice pd) {
+                    VkPhysicalDeviceProperties2 p{
+                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
+                    };
+                    fi.GetPhysicalDeviceProperties2(pd, &p);
+                    char ids[12];
+                    std::snprintf(ids, sizeof ids, "0x%04X:0x%04X",
+                        p.properties.vendorID, p.properties.deviceID);
+                    return std::pair { std::string(p.properties.deviceName), std::string(ids) };
+                };
+                // the game's physical device handle belongs to the game's own instance:
+                // asking about it through the second instance's entry points is invalid and
+                // the loader aborts on it, so the game device is excluded by its identity
+                const auto game = identity(vk.fi(), vk.physdev());
+                const std::string gameName = game.first;
+                std::string renderName;
+                // the render card is whatever the profile's gpu key names - the selector
+                // language instance.cpp uses (device name, "0xVVVV:0xDDDD" or a pci bus id);
+                // with the key unset, any device but the game's own
+                auto selectB = [this, &game, &identity, &renderName](const vk::VulkanInstanceFuncs& fi,
                         const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
+                    const std::string wanted = this->profile.gpu.value_or(std::string {});
+                    std::string seen;
                     for (auto pd : devs) {
-                        VkPhysicalDeviceProperties2 p{
-                            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
-                        };
-                        fi.GetPhysicalDeviceProperties2(pd, &p);
-                        if (p.properties.deviceID == 0x7590)
+                        const auto [name, ids] = identity(fi, pd);
+                        seen += (seen.empty() ? std::string() : ", ") + name + " [" + ids + "]";
+                        if (name == game.first && ids == game.second)
+                            continue;
+                        if (!wanted.empty()) {
+                            if (name == wanted || ids == wanted) {
+                                renderName = name;
+                                return pd;
+                            }
+                        } else {
+                            renderName = name;
                             return pd;
+                        }
                     }
-                    throw ls::error("dual-host: RX 9060 XT not found");
+                    throw ls::error(wanted.empty()
+                        ? "dual-host: no device beside the game's " + game.first
+                            + "; seen: " + seen
+                        : "dual-host: render card '" + wanted + "' not found beside game card "
+                            + game.first + "; seen: " + seen);
                 };
                 this->bVk = std::make_unique<vk::Vulkan>(
                     "lsfg-dual-host", vk::version{2, 0, 0},
                     "lsfg-dual-host", vk::version{2, 0, 0},
                     selectB, true, std::nullopt, std::nullopt, true, false);
+                std::cerr << "lsfg-vk: dual-host game=" << gameName
+                    << " render=" << renderName << "\n";
                 const VkDeviceSize hostSize =
                     (static_cast<VkDeviceSize>(this->info.extent.width) * 4
                         * this->info.extent.height + 4095) & ~4095ull;
