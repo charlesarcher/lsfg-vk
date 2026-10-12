@@ -469,7 +469,7 @@ if [[ -n "$REC_PID" ]] && kill -0 "$REC_PID" 2>/dev/null; then
   set -e
 fi
 if [[ -f "$OUT/cap.mp4" ]]; then
-  /usr/bin/ffmpeg -y -ss 2 -i "$OUT/cap.mp4" -frames:v 1 "$OUT/frame.png" \
+  /usr/bin/ffmpeg -nostdin -y -ss 2 -i "$OUT/cap.mp4" -frames:v 1 "$OUT/frame.png" \
     >"$OUT/frame-extract.log" 2>&1 || echo "frame extract failed"
 fi
 
