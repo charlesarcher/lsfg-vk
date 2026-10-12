@@ -213,6 +213,14 @@ screen (`present-count kind=gen|real` in the app's log). `gen == real` on either
 side is *exact* doubling — one generated frame per real frame. The gap between the
 two columns is the render card falling behind.
 
+`tools/testing/collect-pair-matrix.sh` prints all of it per pair, including
+`ratio = (gen + real) / real`, which reads **2.0000** for every pairing that ran.
+Two metrics need a grain of salt: the recorder's `damage fps` is how often the
+*screen* changed, so it saturates at the panel's 240 Hz and cannot distinguish a
+264 fps doubled stream from an 11 fps one — the HUD row read off a captured frame
+is the on-screen evidence; and a ratio computed from a single frame, as in the two
+aborted rows, is reported as no ratio at all.
+
 | game card | render card | settings | game fps | captured pairs | presented pairs | presented fps | on-screen HUD |
 |---|---|---|---|---|---|---|---|
 | RX 9070 XT | RX 9060 XT (has the panel) | 1440p MSAA 4 | 132.0 | 7922 | 7906 | 263.5 | `game fps 132`, `doubled fps 264 (2x)` |
@@ -265,7 +273,10 @@ Each profile pins the game card with `FM_GPU_INDEX` (FurMark's own enumeration o
 this machine: `0` = RX 9060 XT, `1` = RX 9070 XT, `2` = Intel iGPU) and names the
 render card in the `gpu` key; the run's `furmark.log` carries the
 `dual-host game=… render=…` line quoted above, which is what says which card ended
-up in which role.
+up in which role. After a batch of runs, `tools/testing/collect-pair-matrix.sh`
+reads every `pair-*` run directory back into the table above, and takes the HUD
+column by running OCR over a frame extracted from the screen recording, so the
+on-screen doubling rate is checked rather than assumed.
 
 ## Requirements
 
