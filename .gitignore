@@ -11,9 +11,9 @@
 /.ccls
 
 # local build/data artifacts
-/build-asan
-/build-asan-o0
-/build-framedbg
+# One build tree: ./build. Configure variants in place (cmake -B build -D...), never
+# in a sibling directory. This guard catches a stray build-foo/ before it gets committed.
+/build-*/
 /vk_layer_settings.txt
 /measurements/raw
 
