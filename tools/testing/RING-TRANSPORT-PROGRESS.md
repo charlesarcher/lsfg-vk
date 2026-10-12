@@ -154,3 +154,75 @@ loops in my run commands matched re2.exe/lsfg-launch by name and killed
 Steam's own processes. Kill only a PID this session spawned. No pattern kills.
 
 fc2c87a | re2 (asan app + release layer) | WORKED: reached frame 29748, zero AddressSanitizer errors (was one per run before the fix), clean teardown, no new GPU faults | /home/archerc/lsfg-work/runs/re2/20261010T221219
+
+## 2026-10-12 session: frame doubling PROVEN on decoupled; the profile value was the blocker
+
+DECISION: keep the shipped profile as it is, and A/B it with a new one. The FurMark
+profile pair added this session (furmark-decoupled-dma.toml/.env, plus -record and
+-view variants) is the way to run the decoupled transport through the scripts.
+
+THE FINDING: tools/testing/profiles/furmark-decoupled.toml is named after the decoupled
+transport and shipped transport = "udmabuf" since 2945819. On FurMark that bounce costs
+almost everything: the app stalls ~40 ms per frame, its newest-two inbox cap then drops
+roughly four of every five game frames, and DP-7 shows ~25 fps out of a 128 fps game.
+That is a config value, not branch code.
+
+Same script, same 60 s 2560x1440 MSAA4 FurMark on 0000:04:00.0 (index 1), presented on
+DP-7 (2560x1440 @ 239.88 Hz) from 0000:87:00.0. Build verified each time (all trees
+built at fc2006b; app exe 9922701f, mapped layer 925c53a4).
+
+  transport       game renders    into the app             out to DP-7            app tick gap p50/p90/p99
+  udmabuf         127.77/s        1532 of 7667 = 24.6/s    25.11/s (781+781)      0.069 / 0.094 / 40.58 ms
+  decoupled       131.46/s        7873 of 7889 = 131.48/s  262.95/s (7873 x2)     3.566 / 5.670 / 6.13 ms
+  decoupled       131.05/s        7848 of 7864 = 131.05/s  262.10/s (7848 x2)     3.525 / 5.923 / 6.41 ms
+  decoupled 180s  130.01/s        23387 of 23403 = 130/s   260.03/s (23387 x2)    3.600 / 5.733 / 6.20 ms
+
+Doubling is exact: generated == real == received == the game's render rate, and delivery
+is 99.9%. The 180 s run proves it does not decay with time. Copy telemetry healthy:
+decoupled-copy pollMs 1.736 submitToFenceMs 1.162 gpuCopyMs 0.121.
+
+PIXEL CHECK (the display, not just the counters). The -record profile captures DP-7 at
+240 fps; decoded per the method in tools/testing/hitch_check.py (rawvideo ON DISK, /tmp
+is tmpfs):
+
+  ffmpeg -i cap.mp4 -vf "fps=240,format=gray,scale=640:-1" -f rawvideo frames.raw
+  python3 tools/testing/hitch_check.py frames.raw 240 640 360 2 58
+
+  steady state 2-58 s: 13440 frames, median 40.1% of pixels changing per frame,
+                       6 stalled frames in 2 events = 25.0 ms = 0.045% of the window
+  whole clip 0-61.5 s: 286 frames / 70 events / 1191.7 ms / 1.939%, but 48 of those
+                       frames (200 ms) are the t=0.042 s fade-in and the rest are after
+                       t=60 s, i.e. teardown
+  layout: content fills the full 2560x1440 (no letterbox at this preset); the HUD card
+          region at top-right is 92.1% non-black, so the card is drawn
+
+GPU: amdgpu fault count 9 -> 9 across all four runs. "cards still present" every time,
+furmark exit=0, app wait=143 (the script's own SIGTERM).
+
+OPEN, three items:
+- longest_gap_ms is ~44.6 in every decoupled run (45.398 / 44.629 / 44.563) and 17.159
+  in the bounce. One gap per run, and the capture shows no matching pixel stall, so it is
+  a present-counter gap, not a visible hitch. Nobody has chased it. NEXT.
+- 260-263 presents/s against a 239.88 Hz panel means ~20-23 generated frames per second
+  are superseded before they scan out. A clean 2x on this panel needs the game at or
+  under 120 fps, so FurMark at ~130 overshoots. The capture shows almost no duplicate
+  frames (0.045%) precisely BECAUSE the queue is always full - do not read that as
+  "nothing is dropped at scanout".
+- The HUD's own numeric rows were not read this session: the agent's model cannot see
+  images. Charles to read the card at the display: game ~131, doubled ~260. The game row
+  has previously shown half instead of double.
+
+HOW TO RUN:
+  bash tools/testing/verify_build.sh                            # all trees built at fc2006b
+  ./tools/testing/lsfg-launch.sh furmark-decoupled-dma          # 60 s, decoupled
+  ./tools/testing/profiles/furmark-decoupled-dma-record.sh      # + 240 fps DP-7 capture
+  ./tools/testing/profiles/furmark-decoupled-dma-view.sh        # 180 s, no recorder
+  ./tools/testing/profiles/furmark-decoupled-bench.sh           # the shipped bounce, for contrast
+
+TRAP: LSFG_CONFIG_NAME cannot be overridden from outside a run - lsfg-launch.sh rebuilds
+CFG from it and the env -i re-exec whitelist does not forward it, so a new profile pair is
+the only script-native way to change one config value. Run dirs go under
+/home/archerc/lsfg-work/runs/ (never /tmp: tmpfs, and a 240 fps decode is 3.2 GB).
+
+20261011T184727 | furmark (release, decoupled, captured) | DOUBLED: 131.05/s in, 262.10/s out, 0.045% pixel stalls in the steady window, faults flat | /home/archerc/lsfg-work/runs/furmark-decoupled-dma-record/20261011T184727
+20261011T191531 | furmark (release, decoupled, 180 s) | DOUBLED: 130.01/s in, 260.03/s out, jitter flat to minute 3, faults flat | /home/archerc/lsfg-work/runs/furmark-decoupled-dma-view/20261011T191531
