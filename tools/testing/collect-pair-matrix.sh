@@ -12,7 +12,12 @@ PAIRS=${*:-9070-to-9060 9060-to-9070 9070-to-igpu 9060-to-igpu igpu-to-9060 igpu
 
 hud_of() {
   local L=$1 f
-  for f in frame.png mid.png hud45.png hud30.png hud20.png; do
+  if ! ls "$L"/*.png >/dev/null 2>&1 && [ -f "$L/cap.mp4" ]; then
+    for t in 60 90 25; do
+      /usr/bin/ffmpeg -nostdin -v error -ss $t -i "$L/cap.mp4" -frames:v 1 -y "$L/hud$t.png" 2>/dev/null
+    done
+  fi
+  for f in frame.png hud60.png hud90.png mid.png hud45.png hud30.png hud20.png; do
     [ -f "$L/$f" ] || continue
     for psm in 11 6; do
       local r
@@ -34,6 +39,7 @@ printf '%-15s %-8s %-12s %-12s %-8s %-9s %-7s %-9s %s\n' \
   pair game-fps captured presented ratio out-fps damage gap_ms hud
 for p in $PAIRS; do
   L=$(ls -1dt "$RUNS/pair-$p"/*/ 2>/dev/null | head -1)
+  [ -n "${L:-}" ] || L=$(ls -1dt "$RUNS/$p"/*/ 2>/dev/null | head -1)
   [ -n "${L:-}" ] || { printf '%-15s NO RUN\n' "$p"; continue; }
 
   BENCH=$(grep -hao 'LSFGVK-BENCH.*' "$L/furmark.log" "$L/launch.log" 2>/dev/null | tail -1)
