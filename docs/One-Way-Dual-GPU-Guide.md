@@ -145,35 +145,14 @@ Consequences:
 
 ## Frame Transport Architecture & Trade-Offs
 
-`lsfg-vk` provides three distinct frame-sharing mechanisms between the game GPU and the display coprocessor. When the two GPUs differ and `transport` is not set, both sides select decoupled. `transport = "udmabuf"` is an explicit opt-in: it puts the shared buffer on the game's submits and stalls about 30 ms under load.
+`lsfg-vk` has one frame-sharing mechanism between the game GPU and the display coprocessor: decoupled zero-copy hardware DMA. When the two GPUs differ and `transport` is not set it is selected automatically; `decoupled` is the only accepted value, and naming any removed transport is a hard error.
 
-### 1. POSIX Shared Memory CPU Copy (`transport = "shm"`) — explicit opt-in, not the cross-GPU default
-- **How it works**: The layer sets up a dedicated background worker (`CopyHop`). When the game finishes rendering a frame, `CopyHop` performs a CPU pixel walk / memcpy from host-visible image memory into a shared memory (`memfd`) ring buffer. Over IPC, `lsfg-vk-app` maps the shared memory and copies pixels into the processing GPU's staging texture.
-- **Latency & Performance**: Delivers **~2.2 ms** generation latency, **~6.5 ms** real present latency, achieving **97.9%** native render throughput retention at 1440p MSAA 4.
-- **Pitfalls & Shortcomings**:
-  * **It IS a CPU copy of the framebuffer**: Do not claim this path is zero-copy. It consumes CPU cycles and host memory bus bandwidth (~1.5–2 ms of CPU time per frame at 1440p).
-  * High-resolution HDR streams (e.g. 4K FP16) increase CPU memory bus pressure significantly compared to 1080p/1440p SDR.
-
-### 2. DRM PRIME Zero-Copy DMA-BUF with Implicit Sync (`transport = "dmabuf"`)
-- **How it works**: The game GPU self-exports its rendered framebuffer as a DRM PRIME DMA-BUF (`VK_EXT_external_memory_dma_buf`). File descriptors are passed over the Unix domain socket via `SCM_RIGHTS`. The doubler GPU imports the buffer directly into its Vulkan memory space (`VkImportMemoryFdInfoKHR`) and executes a pure hardware DMA blit across the PCIe bus without CPU mediation.
-- **Latency & Performance**: Hardware PCIe DMA transfer takes only **~2 ms**, but presentation latency increases to **~36–54 ms**.
-- **Pitfalls & Shortcomings**:
-  * **PRIME Implicit-Sync Parking**: Under current Linux AMDGPU DRM drivers, imported DMA-BUFs enforce kernel implicit synchronization (`dma_resv` reservation object). Even after the hardware DMA copy completes, the buffer parks in the kernel wait queue for **~28–33 ms** waiting for driver fence retirement before userspace can acquire it.
-  * Userspace cannot manually call `dma_fence_signal`. Until Linux kernel explicit synchronization (`sync_file` / DRM syncobj timelines) completely replaces implicit sync across cross-device PRIME imports, this parking penalty caps frame presentation to ~30 FPS unless bypassed by the CPU copy path.
-  * **Export is render-only**: DMA-BUF export occurs strictly on the render GPU. A second Vulkan device on the render GPU is not a second GPU and is not required to export. The doubler GPU only executes the DMA copy.
-
-### 3. Decoupled Zero-Copy Hardware DMA without Implicit Sync (`transport = "decoupled"`)
+### Decoupled Zero-Copy Hardware DMA without Implicit Sync (`transport = "decoupled"`)
 - **How it works**: Instead of exchanging cross-device DRM PRIME DMA-BUF GEMs, both GPUs bind images to shared host-memory pages (`p`) via `VK_EXT_external_memory_host`. The render GPU executes a hardware PCIe DMA write into host memory, and the doubler GPU executes a hardware PCIe DMA read into its VRAM.
 - **Latency & Performance**: Delivers **~0.5–2.0 ms** generation latency and avoids the kernel implicit-sync penalty by construction.
 - **Pitfalls & Shortcomings**:
   * Because both GPUs access anonymous host pages via userptr (`VK_EXT_external_memory_host`), the Linux kernel does NOT create cross-GPU `dma_resv` reservation objects.
   * Preserves single-process isolation on games to prevent multi-device context loss under Proton/vkd3d.
-
-### 4. Destination DMA-BUF Hop (Preserved for Future PCIe P2P)
-- **Why it is kept**: The codebase intentionally retains the destination DMA-BUF hop (`dest` poisoned GEM buffers) specifically for eventual direct peer-to-peer (P2P) DMA over PCIe.
-- **Rules & Shortcomings**:
-  * A raw wrap or host bounce is NOT true P2P and must never replace the destination hop.
-  * Once Linux kernel P2P DMA subsystem support matures for consumer GPUs without root complex restrictions, this path enables direct GPU-to-GPU BAR DMA transfers with zero CPU involvement and zero implicit-sync stalls.
 
 ## Cabling: which GPU does the display plug into?
 
