@@ -238,43 +238,6 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     };
     const VkSharingMode sourceSharing = vk.hasTransferQueue()
         ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
-    {
-        const size_t probeSz = 4ull * 1024 * 1024;
-        void* mall = nullptr;
-        if (::posix_memalign(&mall, 4096, probeSz) == 0) {
-            try {
-                vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    mall, probeSz);
-                LSFG_FRAME_DBG("host-import malloc OK");
-            } catch (const std::exception& e) {
-                LSFG_FRAME_DBG("host-import malloc FAIL %s", e.what());
-            }
-            ::free(mall);
-        }
-        {
-            const size_t probeSz = 4ull * 1024 * 1024;
-            const int sfd = ::shm_open("/lsfg-vk-host-probe", O_CREAT | O_RDWR, 0600);
-            if (sfd >= 0) {
-                (void)::ftruncate(sfd, static_cast<off_t>(probeSz));
-                void* p = ::mmap(nullptr, probeSz, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
-                ::shm_unlink("/lsfg-vk-host-probe");
-                if (p != MAP_FAILED) {
-                    ::memset(p, 0, probeSz);
-                    try {
-                        vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                            p, probeSz);
-                        LSFG_FRAME_DBG("host-import shm_open OK");
-                    } catch (const std::exception& e) {
-                        LSFG_FRAME_DBG("host-import shm_open FAIL %s", e.what());
-                    }
-                    ::munmap(p, probeSz);
-                }
-                ::close(sfd);
-            }
-        }
-    }
     for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
         const uint64_t bytes = (static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull;
         state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },
