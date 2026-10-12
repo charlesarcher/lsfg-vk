@@ -317,8 +317,7 @@ if /usr/bin/pgrep -x lsfg-vk-app >/dev/null; then
   exit 1
 fi
 /usr/bin/env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH \
-  -u LSFGVK_POSIX_SHM -u LSFGVK_WAIT_COPY -u LSFGVK_COPY_ON_GFX \
-  -u LSFGVK_CAPTURE_PRIO -u LSFGVK_CO_EXPERIMENT \
+  -u LSFGVK_CO_EXPERIMENT \
   LSFGVK_CONFIG="$CFG" \
   LSFGVK_APP_SOCK="$SOCK" \
   LSFGVK_MEASURE="${LSFGVK_MEASURE:-0}" \
@@ -368,8 +367,7 @@ if [[ "$GAME_KIND" == "furmark" ]]; then
     --print-render-speed --no-score-box --max-time "$LSFG_MAX_TIME" --no-osi )
   echo "--- furmark command ---"
   printf '%q ' "${FM_CMD[@]}"; echo
-  /usr/bin/env -u LSFGVK_POSIX_SHM -u LSFGVK_WAIT_COPY -u LSFGVK_DUAL_HOST \
-    -u LSFGVK_COPY_ON_GFX -u LSFGVK_CAPTURE_PRIO \
+  /usr/bin/env \
     VK_LAYER_PATH="$LAYER" \
     VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation \
     VK_LOADER_DEBUG=error,warn,info,layer \
