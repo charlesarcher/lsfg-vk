@@ -1,24 +1,16 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 #
-# bench_furmark.sh - Automated FurMark A/B and Transport Benchmark for lsfg-vk.
+# bench_furmark.sh - Automated FurMark A/B Benchmark for lsfg-vk.
 #
-# Measures:
-#   1. Native rendering vs. one-way decoupled dual-GPU offload throughput.
-#   2. Transport latency comparison:
-#      - POSIX SHM (CPU copy: CopyHop pixel walk -> shm -> doubler memcpy, ~2-6ms latency)
-#      - DMA-BUF (Zero-copy hardware DMA: parks ~28-38ms on PRIME implicit-sync)
+# Measures native rendering vs. one-way decoupled dual-GPU offload throughput.
 #
 # Topology:
 #   render          = AMD Radeon RX 9070 XT (Vulkan gpu-index 1, 1002:7550)
 #   process/present = AMD Radeon RX 9060 XT (lsfg-vk-app, 1002:7590)
 #
 # Usage:
-#   ./bench_furmark.sh {baseline|doubled|ab|transport-compare} [seconds] [preset] [transport]
-#
-# Transports:
-#   shm      POSIX shared memory CPU copy (default for live 2x doubling)
-#   dmabuf   Zero-copy hardware DMA-BUF export (exposes PRIME implicit-sync parking)
+#   ./bench_furmark.sh {baseline|doubled|ab} [seconds] [preset]
 #
 # Presets:
 #   bound    2560x1440 MSAA4 vsync0 (GPU-bound realism; target ~140-150 fps; default)
@@ -29,23 +21,18 @@
 set -euo pipefail
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  echo "Usage: $0 {baseline|doubled|ab|transport-compare} [seconds] [preset] [transport]"
+  echo "Usage: $0 {baseline|doubled|ab} [seconds] [preset]"
   echo ""
   echo "Modes:"
-  echo "  baseline          - run unlayered native FurMark on render GPU"
-  echo "  doubled           - run one-way decoupled frame doubling with lsfg-vk-app"
-  echo "  ab                - run baseline vs doubled in selected transport"
-  echo "  transport-compare - 3-way benchmark: baseline vs POSIX SHM (CPU copy) vs DMA-BUF (zero-copy)"
+  echo "  baseline - run unlayered native FurMark on render GPU"
+  echo "  doubled  - run one-way decoupled frame doubling with lsfg-vk-app"
+  echo "  ab       - run baseline vs doubled"
   echo ""
   echo "Presets:"
-  echo "  bound             - 2560x1440 MSAA4 vsync0 (GPU-bound, ~140-150 fps; default)"
-  echo "  light             - 1280x720  MSAA1 vsync0 (lightweight)"
-  echo "  panel             - 2560x1440 MSAA1 vsync0"
-  echo "  heavy             - 2560x1440 MSAA8 vsync0"
-  echo ""
-  echo "Transports:"
-  echo "  shm               - POSIX SHM CPU copy (CopyHop, ~2.2-6.5ms latency; default)"
-  echo "  dmabuf            - Zero-copy DMA-BUF (exposes ~30ms PRIME implicit sync wait)"
+  echo "  bound    - 2560x1440 MSAA4 vsync0 (GPU-bound, ~140-150 fps; default)"
+  echo "  light    - 1280x720  MSAA1 vsync0 (lightweight)"
+  echo "  panel    - 2560x1440 MSAA1 vsync0"
+  echo "  heavy    - 2560x1440 MSAA8 vsync0"
   exit 0
 fi
 
@@ -54,7 +41,6 @@ REPO_ROOT="$(cd "$(dirname "$REAL_SOURCE")/../.." && pwd)"
 MODE=${1:-ab}
 SECS=${2:-8}
 PRESET=${3:-bound}
-TRANSPORT=${4:-${LSFGVK_TRANSPORT:-${TRANSPORT:-shm}}}
 SOCK=${LSFGVK_APP_SOCK:-$HOME/.local/state/lsfg-vk/app.sock}
 APP="$REPO_ROOT/build/lsfg-vk-app/lsfg-vk-app"
 LAYER_DIR="$REPO_ROOT/build/lsfg-vk-layer"
@@ -114,10 +100,8 @@ require_build() {
 
 start_app() {
   local logname="${1:-app.log}"
-  local shm_flag="${2:-1}"
-  local dual_host_flag="${3:-0}"
   if pgrep -x lsfg-vk-app >/dev/null; then
-    echo "lsfg-vk-app already running, terminating to apply fresh profile/transport..."
+    echo "lsfg-vk-app already running, terminating to apply fresh profile..."
     pkill -x lsfg-vk-app 2>/dev/null || true
     for _ in $(seq 1 30); do
       if ! pgrep -x lsfg-vk-app >/dev/null; then break; fi
@@ -130,8 +114,6 @@ start_app() {
 
   env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH -u LSFGVK_LAYER_DBG \
     LSFGVK_APP_DBG=1 \
-    LSFGVK_POSIX_SHM="$shm_flag" \
-    LSFGVK_DUAL_HOST="$dual_host_flag" \
     LSFGVK_CONFIG="$CONFIG_FILE" \
     LSFGVK_APP_SOCK="$SOCK" \
     LSFGVK_LAYER_SHELL=1 \
@@ -216,19 +198,9 @@ run_doubled() {
   local log_doubled="doubled${suffix}.log"
   require_build
 
-  local shm_flag="1"
-  local dual_host_flag="0"
-  if [[ "$TRANSPORT" == "dmabuf" || "$TRANSPORT" == "dma" ]]; then
-    shm_flag="0"
-    dual_host_flag="0"
-  elif [[ "$TRANSPORT" == "decoupled" || "$TRANSPORT" == "decoupled_dma" || "$TRANSPORT" == "zero_copy" ]]; then
-    shm_flag="0"
-    dual_host_flag="1"
-  fi
+  start_app "$log_app"
 
-  start_app "$log_app" "$shm_flag" "$dual_host_flag"
-
-  echo "--- running doubled [transport=$TRANSPORT, shm=$shm_flag, dual_host=$dual_host_flag] (${SECS}s, ${W}x${H} MSAA${MSAA}) ---"
+  echo "--- running doubled (${SECS}s, ${W}x${H} MSAA${MSAA}) ---"
   local rc=0
   local layer_env=(
     VK_LAYER_PATH="$LAYER_DIR"
@@ -237,8 +209,6 @@ run_doubled() {
     LSFGVK_CAPTURE_WxH="${LSFGVK_CAPTURE_WxH:-2560x1440}"
     LSFGVK_CONFIG="$CONFIG_FILE"
     LSFGVK_APP_SOCK="$SOCK"
-    LSFGVK_POSIX_SHM="$shm_flag"
-    LSFGVK_DUAL_HOST="$dual_host_flag"
     LSFGVK_LAYER_DBG=1
   )
   if [[ "${MANGOHUD:-1}" == "1" ]] && command -v mangohud >/dev/null 2>&1; then
@@ -246,7 +216,7 @@ run_doubled() {
   else
     run_furmark_cmd "$OUT/$log_doubled" "${layer_env[@]}" || rc=$?
   fi
-  parse_stats "$OUT/$log_doubled" "doubled (one-way decoupled [${TRANSPORT}])"
+  parse_stats "$OUT/$log_doubled" "doubled (one-way decoupled)"
   if [[ -f "$OUT/$log_app" ]]; then
     echo "  app presented sample:"
     grep -E 'fps game|latency|wait_import' "$OUT/$log_app" | tail -n 4 | sed 's/^/    /' || true
@@ -256,7 +226,7 @@ run_doubled() {
 
 run_ab() {
   echo "=========================================================="
-  echo "  lsfg-vk A/B Benchmark (Preset: $PRESET, ${W}x${H} MSAA${MSAA}, Transport: $TRANSPORT)"
+  echo "  lsfg-vk A/B Benchmark (Preset: $PRESET, ${W}x${H} MSAA${MSAA})"
   echo "=========================================================="
   run_baseline || true
   echo ""
@@ -279,70 +249,10 @@ run_ab() {
   echo "  Artifact directory: $OUT"
 }
 
-run_transport_compare() {
-  echo "================================================================================"
-  echo "  lsfg-vk Transport Comparison: 3 Forward FG Mechanisms vs Native Baseline"
-  echo "  Preset: $PRESET (${W}x${H} MSAA${MSAA}), Duration: ${SECS}s each"
-  echo "================================================================================\n"
-  
-  echo "=== 1. Native Baseline (Direct Swapchain, No Layer) ==="
-  run_baseline || true
-  echo ""
-  sleep 1
-
-  echo "=== 2. Mechanism 1: POSIX SHM (CPU Copy: CopyHop -> memfd -> doubler memcpy) ==="
-  TRANSPORT="shm"
-  run_doubled "-shm" || true
-  echo ""
-  sleep 1
-
-  echo "=== 3. Mechanism 2: Direct DMA-BUF (Zero-Copy with Kernel Implicit-Sync Parking) ==="
-  TRANSPORT="dmabuf"
-  run_doubled "-dmabuf" || true
-  echo ""
-  sleep 1
-
-  echo "=== 4. Mechanism 3: Decoupled Zero-Copy DMA (WITHOUT Kernel Implicit Sync) ==="
-  TRANSPORT="decoupled"
-  run_doubled "-decoupled" || true
-  echo ""
-
-  echo "================================================================================"
-  echo "  Transport Latency & Performance Summary (3 Forward FG Mechanisms)"
-  echo "================================================================================"
-  local base_avg shm_avg dma_avg dec_avg
-  base_avg=$(grep "FPS (min/avg/max)" "$OUT/baseline.log" | awk -F'/' '{gsub(/ /,"",$4); print $4}' || true)
-  shm_avg=$(grep "FPS (min/avg/max)" "$OUT/doubled-shm.log" | awk -F'/' '{gsub(/ /,"",$4); print $4}' || true)
-  dma_avg=$(grep "FPS (min/avg/max)" "$OUT/doubled-dmabuf.log" | awk -F'/' '{gsub(/ /,"",$4); print $4}' || true)
-  dec_avg=$(grep "FPS (min/avg/max)" "$OUT/doubled-decoupled.log" | awk -F'/' '{gsub(/ /,"",$4); print $4}' || true)
-
-  local shm_real shm_gen dma_real dma_gen dec_real dec_gen
-  shm_real=$(grep "MEASURED LATENCY: REAL present slot" "$OUT/app-shm.log" | tail -n 1 | sed -E 's/.*latency ([0-9\.]+) ms.*/\1/' || true)
-  shm_gen=$(grep "MEASURED LATENCY: GEN present slot" "$OUT/app-shm.log" | tail -n 1 | sed -E 's/.*latency ([0-9\.]+) ms.*/\1/' || true)
-  dma_real=$(grep "MEASURED LATENCY: REAL present slot" "$OUT/app-dmabuf.log" | tail -n 1 | sed -E 's/.*latency ([0-9\.]+) ms.*/\1/' || true)
-  dma_gen=$(grep "MEASURED LATENCY: GEN present slot" "$OUT/app-dmabuf.log" | tail -n 1 | sed -E 's/.*latency ([0-9\.]+) ms.*/\1/' || true)
-  dec_real=$(grep "MEASURED LATENCY: REAL present slot" "$OUT/app-decoupled.log" | tail -n 1 | sed -E 's/.*latency ([0-9\.]+) ms.*/\1/' || true)
-  dec_gen=$(grep "MEASURED LATENCY: GEN present slot" "$OUT/app-decoupled.log" | tail -n 1 | sed -E 's/.*latency ([0-9\.]+) ms.*/\1/' || true)
-
-  printf "  %-24s | %-10s | %-12s | %-12s | %s\n" "Mechanism" "Render FPS" "Real Latency" "Gen Latency" "Characteristics"
-  echo "  -------------------------+------------+--------------+--------------+--------------------------------"
-  printf "  %-24s | %-10s | %-12s | %-12s | %s\n" "Native Baseline (Ref)" "${base_avg:-0} FPS" "N/A" "N/A" "Direct swapchain, zero layer overhead"
-  printf "  %-24s | %-10s | %-12s | %-12s | %s\n" "1. POSIX SHM (CPU copy)" "${shm_avg:-0} FPS" "${shm_real:-0} ms" "${shm_gen:-0} ms" "Working 2x path; CPU walk + memcpy (~2ms)"
-  printf "  %-24s | %-10s | %-12s | %-12s | %s\n" "2. DMA-BUF (Implicit)" "${dma_avg:-0} FPS" "${dma_real:-0} ms" "${dma_gen:-0} ms" "Zero-copy DMA; parks ~30ms on implicit sync"
-  printf "  %-24s | %-10s | %-12s | %-12s | %s\n" "3. Decoupled DMA (No-Sync)" "${dec_avg:-0} FPS" "${dec_real:-0} ms" "${dec_gen:-0} ms" "Zero-copy DMA; no cross-GPU GEM resv"
-  echo ""
-  if [[ -n "${dma_real:-}" && -n "${shm_real:-}" ]]; then
-    local delta
-    delta=$(awk "BEGIN { printf \"%.2f\", $dma_real - $shm_real }")
-    echo "  Implicit-sync parking penalty: +${delta} ms latency over CPU copy path."
-  fi
-  echo "  Artifact directory: $OUT"
-}
 
 case "$MODE" in
-  baseline)          run_baseline ;;
-  doubled)           run_doubled ;;
-  ab)                run_ab ;;
-  transport-compare) run_transport_compare ;;
-  *) echo "unknown mode: $MODE (baseline|doubled|ab|transport-compare)" >&2; exit 2 ;;
+  baseline) run_baseline ;;
+  doubled)  run_doubled ;;
+  ab)       run_ab ;;
+  *) echo "unknown mode: $MODE (baseline|doubled|ab)" >&2; exit 2 ;;
 esac

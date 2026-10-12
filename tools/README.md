@@ -51,8 +51,8 @@ Any new agent or developer can reproduce the entire suite of throughput and late
 cmake --preset release
 cmake --build --preset release
 
-# 2. Run the 4-way transport comparison (Native baseline vs SHM vs DMA-BUF vs Decoupled DMA)
-MANGOHUD=0 ./test_furmark.sh transport-compare 6 bound
+# 2. Run the A/B benchmark (native baseline vs decoupled doubling)
+MANGOHUD=0 ./test_furmark.sh ab 6 bound
 ```
 
 *Note on configuration:* The benchmark harness automatically uses `~/.config/lsfg-vk/conf.toml` if present; if running in a fresh environment, it falls back to `tools/conf.toml.example` out-of-the-box.
@@ -62,9 +62,7 @@ MANGOHUD=0 ./test_furmark.sh transport-compare 6 bound
 | Mechanism | Render FPS | Real Latency | Gen Latency | Key Characteristic |
 | :--- | :--- | :--- | :--- | :--- |
 | **Native Baseline (Ref)** | ~142–145 FPS | N/A | N/A | Direct swapchain, unlayered reference |
-| **1. POSIX SHM (CPU copy)** | ~138–140 FPS | ~6.3–6.6 ms | ~2.1–2.6 ms | Proven 2x path; CPU walk + memcpy (~2 ms CPU work) |
-| **2. DMA-BUF (Implicit Sync)** | ~143–145 FPS | ~55–65 ms | ~54–60 ms | Hardware DMA, but kernel parks ~30 ms on implicit read fence |
-| **3. Decoupled DMA (No-Sync)** | ~138–140 FPS | **~4.4–4.9 ms** | **~0.5–2.5 ms** | **Fastest**: 0 bytes CPU memcpy, 0 kernel implicit sync stalls |
+| **Decoupled DMA (No-Sync)** | ~138–140 FPS | **~4.4–4.9 ms** | **~0.5–2.5 ms** | **Fastest**: 0 bytes CPU memcpy, 0 kernel implicit sync stalls |
 
 ---
 
@@ -75,7 +73,7 @@ The primary automated A/B benchmark for verifying frame-generation throughput re
 
 - **Usage**:
   ```bash
-  ./tools/benchmarks/bench_furmark.sh {baseline|doubled|ab|transport-compare} [seconds] [preset] [transport]
+  ./tools/benchmarks/bench_furmark.sh {baseline|doubled|ab} [seconds] [preset]
   ```
   *(Note: A convenience symlink `./test_furmark.sh` exists at the repository root).*
 
@@ -83,7 +81,6 @@ The primary automated A/B benchmark for verifying frame-generation throughput re
   * `baseline`: Measures unlayered native FurMark on the render GPU.
   * `doubled`: Launches `lsfg-vk-app` on the presentation GPU, injects `lsfg-vk-layer`, and measures doubled output.
   * `ab`: Executes `baseline` followed by `doubled`, reporting native retention % (target: $\ge 95\%$).
-  * `transport-compare`: Runs an exhaustive evaluation comparing all 3 forward frame-generation mechanisms (POSIX SHM, Direct DMA-BUF with implicit sync, and Decoupled DMA without implicit sync) against the native baseline.
 
 - **Presets**:
   * `bound`: `2560x1440 MSAA 4 vsync 0` (Default — GPU-bound realism, ~140–150 native FPS).
@@ -91,11 +88,7 @@ The primary automated A/B benchmark for verifying frame-generation throughput re
   * `panel`: `2560x1440 MSAA 1 vsync 0`.
   * `heavy`: `2560x1440 MSAA 8 vsync 0`.
 
-- **Transports** (`transport` in `conf.toml`): omitted on a cross-GPU profile selects `decoupled`. Explicit values are `shm`, `dmabuf`, `decoupled`, and `udmabuf`. `udmabuf` is an opt-in that puts the shared buffer on the game's submits and stalls about 30 ms under load.
-  * `shm`: POSIX shared memory CPU copy (CopyHop pixel walk, ~2–6 ms presentation latency).
-  * `dmabuf`: Direct DRM PRIME zero-copy DMA (parks ~28–38 ms on Linux implicit sync).
-  * `decoupled`: selected when transport is omitted and the GPUs differ.
-  * `udmabuf`: explicit opt-in only. Puts the shared buffer on the game's submits and stalls about 30 ms under load.
+- **Transport** (`transport` in `conf.toml`): `decoupled` is the only value, and it is what a cross-GPU profile with no `transport` key selects. Any other value is a hard error naming the removed transport.
 
 - **Environment Overrides**:
   * `MANGOHUD=0`: Disables MangoHud for pure numeric headless A/B comparisons.

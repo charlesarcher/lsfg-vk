@@ -66,7 +66,6 @@ def main():
     parser = argparse.ArgumentParser(description="lsfg-vk Topology Permutation Benchmarker")
     parser.add_argument("--seconds", type=int, default=6, help="Test duration per cell in seconds (default: 6)")
     parser.add_argument("--preset", type=str, default="bound", help="FurMark preset: bound|light|panel|heavy (default: bound)")
-    parser.add_argument("--transport", type=str, choices=["shm", "dmabuf"], default="shm", help="Transport mechanism: shm (CPU copy) or dmabuf (zero-copy) (default: shm)")
     parser.add_argument("--json", type=str, default="", help="Optional path to write results as JSON")
     args = parser.parse_args()
 
@@ -132,7 +131,7 @@ def main():
             subprocess.run(["pkill", "-x", "lsfg-vk-app"], stderr=subprocess.DEVNULL)
             time.sleep(0.5)
 
-            cmd = [bench_furmark_sh, "doubled", str(args.seconds), args.preset, args.transport]
+            cmd = [bench_furmark_sh, "doubled", str(args.seconds), args.preset]
             test_env = env_base.copy()
             test_env["RENDER_GPU_INDEX"] = str(r["vk_idx"])
             test_env["LSFGVK_APP_PROFILE"] = f"app-{c['profile_key']}"

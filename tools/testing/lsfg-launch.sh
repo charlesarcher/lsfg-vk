@@ -82,6 +82,7 @@ if [[ -z "${LSFG_LAUNCH_ISOLATED:-}" || -n "${LD_PRELOAD:-}${LD_LIBRARY_PATH:-}"
     ${ASAN_OPTIONS:+ASAN_OPTIONS="$ASAN_OPTIONS"} \
     ${LSFGVK_RING_DBG:+LSFGVK_RING_DBG="$LSFGVK_RING_DBG"} \
     ${LSFGVK_MEASURE:+LSFGVK_MEASURE="$LSFGVK_MEASURE"} \
+    ${LSFGVK_CONFIG:+LSFGVK_CONFIG="$LSFGVK_CONFIG"} \
     HOME="$HOME" \
     USER="${USER:-archerc}" \
     LOGNAME="${USER:-archerc}" \
@@ -114,8 +115,8 @@ mkdir -p "$OUT"
 LOG="$OUT/launch.log"
 STEAM_ENV="$HOME/.local/state/lsfg-vk/steam-game.env"
 
-# LSFG_APP lets a profile run a different doubler build (e.g. the ASan tree in
-# build-asan) without editing this script. Unset = the release binary.
+# LSFG_APP lets a profile run a different doubler build (e.g. an ASan build of
+# the same tree) without editing this script. Unset = the release binary.
 APP="${LSFG_APP:-$REPO/build/lsfg-vk-app/lsfg-vk-app}"
 # LSFG_LAYER does the same for the layer. Overriding only LSFG_APP would mix a
 # new doubler with an old layer, so a baseline/bisect run must set both.
@@ -150,24 +151,24 @@ stop_comm() {
   done
 }
 echo "--- stop ---"
+# Only stop what THIS SCRIPT owns. re2.exe and Steam belong to the user's own
+# Steam session: killing re2.exe here kills the game they have open, and Steam
+# sits above the game, so it goes down too - the exact failure mode that kept
+# taking Steam with the run. lsfg-vk-app and furmark are ours; re2.exe is not.
 stop_comm lsfg-vk-app
 stop_comm furmark
-stop_comm re2.exe
 for _ in $(seq 1 50); do
   if ! /usr/bin/pgrep -x lsfg-vk-app >/dev/null \
-    && ! /usr/bin/pgrep -x furmark >/dev/null \
-    && ! /usr/bin/pgrep -x re2.exe >/dev/null; then
+    && ! /usr/bin/pgrep -x furmark >/dev/null; then
     break
   fi
   sleep 0.2
 done
 if /usr/bin/pgrep -x lsfg-vk-app >/dev/null \
-  || /usr/bin/pgrep -x furmark >/dev/null \
-  || /usr/bin/pgrep -x re2.exe >/dev/null; then
-  echo "REFUSING: old process still alive" | /usr/bin/tee "$LOG"
+  || /usr/bin/pgrep -x furmark >/dev/null; then
+  echo "REFUSING: our own doubler/bench is still alive" | /usr/bin/tee "$LOG"
   /usr/bin/pgrep -a -x lsfg-vk-app || true
   /usr/bin/pgrep -a -x furmark || true
-  /usr/bin/pgrep -a -x re2.exe || true
   exit 1
 fi
 echo "stop: clear"
@@ -316,8 +317,7 @@ if /usr/bin/pgrep -x lsfg-vk-app >/dev/null; then
   exit 1
 fi
 /usr/bin/env -u VK_INSTANCE_LAYERS -u VK_LAYER_PATH \
-  -u LSFGVK_POSIX_SHM -u LSFGVK_WAIT_COPY -u LSFGVK_COPY_ON_GFX \
-  -u LSFGVK_CAPTURE_PRIO -u LSFGVK_CO_EXPERIMENT \
+  -u LSFGVK_CO_EXPERIMENT \
   LSFGVK_CONFIG="$CFG" \
   LSFGVK_APP_SOCK="$SOCK" \
   LSFGVK_MEASURE="${LSFGVK_MEASURE:-0}" \
@@ -367,8 +367,7 @@ if [[ "$GAME_KIND" == "furmark" ]]; then
     --print-render-speed --no-score-box --max-time "$LSFG_MAX_TIME" --no-osi )
   echo "--- furmark command ---"
   printf '%q ' "${FM_CMD[@]}"; echo
-  /usr/bin/env -u LSFGVK_POSIX_SHM -u LSFGVK_WAIT_COPY -u LSFGVK_DUAL_HOST \
-    -u LSFGVK_COPY_ON_GFX -u LSFGVK_CAPTURE_PRIO \
+  /usr/bin/env \
     VK_LAYER_PATH="$LAYER" \
     VK_INSTANCE_LAYERS=VK_LAYER_LSFGVK_frame_generation \
     VK_LOADER_DEBUG=error,warn,info,layer \
@@ -406,8 +405,17 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
     CONSOLE_MARK="$(/usr/bin/wc -l < "$CONSOLE")"
   fi
   echo "console_mark=$CONSOLE_MARK"
+  # Never spawn Steam. A client this script starts is a client this script ends
+  # up in a position to kill on teardown, and Steam sits above the game - so
+  # stopping the run took Steam (and the user's shell) down with it. Steam must
+  # already be running; this only asks the running client to launch the app.
+  if ! /usr/bin/pgrep -x steam >/dev/null; then
+    echo "REFUSING: Steam is not running. Start Steam yourself, then re-run." \
+      | /usr/bin/tee "$LOG"
+    exit 1
+  fi
   timeout 20 /usr/bin/steam "steam://rungameid/${STEAM_APPID}" >/dev/null 2>&1 &
-  echo "steam cli pid=$!"
+  echo "steam launch requested (attached to the already-running client), cli pid=$!"
   GAME_PID=""
   for _ in $(seq 1 120); do
     while read -r cand; do
@@ -443,9 +451,11 @@ elif [[ "$GAME_KIND" == "steam" ]]; then
       > "$OUT/game-console.txt" || true
     echo "game-console lines=$(/usr/bin/wc -l < "$OUT/game-console.txt")"
   fi
-  if kill -0 "$GAME_PID" 2>/dev/null; then
-    /bin/kill -TERM "$GAME_PID" 2>/dev/null || true
-  fi
+  # Deliberately do NOT kill the game. re2.exe belongs to the user's Steam
+  # session, and killing it from here is what dragged Steam down with the run.
+  # The doubler and recorder ARE ours and are stopped below; the game is not
+  # ours to end.
+  echo "leaving game pid=${GAME_PID:-none} to the user's Steam session"
 else
   echo "REFUSING: unknown GAME_KIND=$GAME_KIND"
   exit 1
@@ -459,7 +469,7 @@ if [[ -n "$REC_PID" ]] && kill -0 "$REC_PID" 2>/dev/null; then
   set -e
 fi
 if [[ -f "$OUT/cap.mp4" ]]; then
-  /usr/bin/ffmpeg -y -ss 2 -i "$OUT/cap.mp4" -frames:v 1 "$OUT/frame.png" \
+  /usr/bin/ffmpeg -nostdin -y -ss 2 -i "$OUT/cap.mp4" -frames:v 1 "$OUT/frame.png" \
     >"$OUT/frame-extract.log" 2>&1 || echo "frame extract failed"
 fi
 
@@ -472,6 +482,10 @@ wait "$APP_PID"
 echo "app wait=$?"
 set -e
 rm -f "$STEAM_ENV"
+# Remove the app socket as well. A stale socket file changes "nobody is serving"
+# into ECONNREFUSED, which the layer used to retry-and-log at full speed; an
+# absent socket is the honest state and is what the layer's rate limiter expects.
+rm -f "$SOCK"
 
 if ! cards_ok; then
   echo "CARD DROPPED during run — discard"
