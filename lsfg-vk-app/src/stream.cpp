@@ -34,12 +34,8 @@
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <fcntl.h>
-#include <linux/udmabuf.h>
 #include <sys/ioctl.h>
-#include <sys/mman.h>
 #include <sys/syscall.h>
-#include <linux/memfd.h>
 
 using namespace ls::ipc;
 
@@ -62,41 +58,6 @@ StreamState::~StreamState() {
             this->width, this->height);
         ls::hud::traceLine("stream-close", this->streamId, tb);
     }
-    // RADV FreeMemory on HOST_ALLOCATION_BIT frees the posix_memalign
-    // pointer and aborts the overlay on FurMark swapchain recreate.
-    if (this->shmBytes == 0)
-        return;
-    /* S42e OOM fix: the old dtor moved EVERY dead stream's staging
-       into a process-lifetime static vector — a FurMark-recreate
-       workaround that becomes an unbounded leak when a game
-       reconnects repeatedly (RE2 2026-09-20: six kernel OOM kills,
-       swap exhaustion; watchdog + journal evidence). Policy:
-       retain the FIRST stream's images (the RADV FreeMemory aliasing
-       hazard needs at most one retention), free every stream's
-       memfd maps + host buffers beyond that, and let later streams'
-       images destruct normally. */
-    static unsigned retainedStreams = 0;
-    if (retainedStreams == 0) {
-        static auto* leak = new std::vector<ls::lazy<vk::Image>>;
-        for (auto& im : this->sourceImages)
-            if (im.has_value())
-                leak->push_back(std::move(im));
-        retainedStreams = 1;
-        return;
-    }
-    /* S42m (alt-F4 SIGABRT fix): free ONLY the memfd maps here.
-       The host buffers (hostPtrs) are singly owned by the
-       host-imported DeviceMemory of hostImages: RADV's
-       vkFreeMemory on HOST_ALLOCATION_BIT frees the caller's
-       malloc block (see image.cpp importMemoryHostPointer).
-       The member dtors run AFTER this body, so freeing hostPtrs
-       here — and letting hostImages' vkFreeMemory free the same
-       block again — is a guaranteed glibc double free:
-       'double free or corruption (!prev)' + SIGABRT repro'd on
-       every dxvk/ReFramework/RE2 swapchain teardown (alt-F4).
-       hostImages destruct normally and release everything. */
-    for (auto& m : this->shmMaps)
-        if (m) { ::munmap(m, this->shmBytes + 4096); m = nullptr; }
 }
 
 namespace {
@@ -274,185 +235,8 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     };
     const VkSharingMode sourceSharing = vk.hasTransferQueue()
         ? VK_SHARING_MODE_CONCURRENT : VK_SHARING_MODE_EXCLUSIVE;
-    {
-        const size_t probeSz = 4ull * 1024 * 1024;
-        void* mall = nullptr;
-        if (::posix_memalign(&mall, 4096, probeSz) == 0) {
-            try {
-                vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    mall, probeSz);
-                LSFG_FRAME_DBG("host-import malloc OK");
-            } catch (const std::exception& e) {
-                LSFG_FRAME_DBG("host-import malloc FAIL %s", e.what());
-            }
-            ::free(mall);
-        }
-        {
-            const size_t probeSz = 4ull * 1024 * 1024;
-            const int sfd = ::shm_open("/lsfg-vk-host-probe", O_CREAT | O_RDWR, 0600);
-            if (sfd >= 0) {
-                (void)::ftruncate(sfd, static_cast<off_t>(probeSz));
-                void* p = ::mmap(nullptr, probeSz, PROT_READ | PROT_WRITE, MAP_SHARED, sfd, 0);
-                ::shm_unlink("/lsfg-vk-host-probe");
-                if (p != MAP_FAILED) {
-                    ::memset(p, 0, probeSz);
-                    try {
-                        vk::Image img(vk, VkExtent2D{ 256, 256 }, fmt,
-                            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                            p, probeSz);
-                        LSFG_FRAME_DBG("host-import shm_open OK");
-                    } catch (const std::exception& e) {
-                        LSFG_FRAME_DBG("host-import shm_open FAIL %s", e.what());
-                    }
-                    ::munmap(p, probeSz);
-                }
-                ::close(sfd);
-            }
-        }
-    }
     for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
         const uint64_t bytes = (static_cast<uint64_t>(rowPitch) * h + 4095ull) & ~4095ull;
-        // Host-buffer bounce: same memfd staging the shm path builds, but the
-        // app's GPU DMAs out of the shared mapping instead of the CPU copying
-        // out of it. The render card's leg is identical either way - it DMAs
-        // into this buffer - so the only difference is who does the second
-        // hop. No p2p, no CPU frame copy.
-        const bool hostBounce =
-            conf.presentation == ls::Presentation::External
-            && !envFlagOn("LSFGVK_POSIX_SHM")
-            // DecoupledDma must not take this path. It does not share a
-            // udmabuf with the render process: the layer closes those fds
-            // and never writes them. The app imports the layer's 9060
-            // dma-buf from FRAME instead.
-            && conf.transport == ls::Transport::Udmabuf;
-        // UdmabufRing: the RENDER side owns every buffer. The app creates
-        // nothing, sends no STAGING, and imports the fds it is handed.
-        const bool ringTransport = conf.transport == ls::Transport::UdmabufRing;
-        const bool posixShm = !ringTransport && (hostBounce
-            || (conf.presentation == ls::Presentation::External
-                && (envFlagOn("LSFGVK_POSIX_SHM")
-                    || conf.transport == ls::Transport::PosixShm)));
-        if (ringTransport) {
-            // No app-owned staging in this transport. sourceImages are filled
-            // in when the ring fds arrive (presentation.cpp).
-            for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
-                // Skip when already present: this handshake runs again on
-                // every resize and on Close, and emplace over a live
-                // std::optional throws "lazy: value already present".
-                if (state.sourceImages.at(i).has_value())
-                    continue;
-                state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },
-                    state.captureFormat, imgUsage,
-                    std::nullopt, std::nullopt, layout,
-                    sourceSharing, concurrentFamilies);
-            }
-            LSFG_FRAME_DBG("ring transport: app creates no staging, waiting for K udmabuf fds");
-            continue;
-        }
-        if (posixShm) {
-        const uint64_t mapBytes = bytes + 4096ull;
-        // udmabuf REQUIRES the backing memfd to be sealable and sealed
-        // F_SEAL_SHRINK (and must NOT carry F_SEAL_WRITE), so the flag set
-        // differs between the bounce and the plain POSIX-shm staging.
-        const int mfdFlags = hostBounce
-            ? (MFD_CLOEXEC | MFD_ALLOW_SEALING)
-            : MFD_CLOEXEC;
-        const int memfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-host", mfdFlags));
-        if (memfd < 0 || ::ftruncate(memfd, static_cast<off_t>(mapBytes)) != 0)
-            throw ls::error("memfd_create/ftruncate failed for POSIX staging");
-        void* map = ::mmap(nullptr, static_cast<size_t>(mapBytes),
-            PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-        if (map == MAP_FAILED) {
-            ::close(memfd);
-            throw ls::error("mmap memfd failed for POSIX staging");
-        }
-        ::memset(map, 0, static_cast<size_t>(mapBytes));
-        (void)::mlock(map, static_cast<size_t>(mapBytes));
-
-        // Host-buffer bounce: wrap these exact pages in a udmabuf so OUR gpu
-        // can import them and DMA out with no CPU copy. The layer keeps
-        // receiving the plain memfd below and keeps DMAing into it, so the
-        // two processes share one physical allocation:
-        //
-        //     render GPU --DMA--> system memory --DMA--> doubler GPU
-        //
-        // No p2p (the two cards have no usable cross-device page-table
-        // mapping here) and no host-pointer import (radv rejects mmap'd
-        // shared mappings for external_memory_host). Proven by
-        // tools/testing/test_udmabuf.sh.
-        if (hostBounce) {
-            if (::fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
-                ::munmap(map, static_cast<size_t>(mapBytes));
-                ::close(memfd);
-                throw ls::error("F_ADD_SEALS(F_SEAL_SHRINK) failed for udmabuf staging");
-            }
-            int udev = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
-            if (udev < 0) {
-                ::munmap(map, static_cast<size_t>(mapBytes));
-                ::close(memfd);
-                throw ls::error("open /dev/udmabuf failed for host bounce");
-            }
-            udmabuf_create uc{};
-            uc.memfd = static_cast<uint32_t>(memfd);
-            uc.flags = UDMABUF_FLAGS_CLOEXEC;
-            uc.offset = 0;
-            uc.size = bytes;   // page-aligned by construction; excludes the seq word
-            const int udfd = ::ioctl(udev, UDMABUF_CREATE, &uc);
-            ::close(udev);
-            if (udfd < 0) {
-                ::munmap(map, static_cast<size_t>(mapBytes));
-                ::close(memfd);
-                throw ls::error("UDMABUF_CREATE failed for host bounce");
-            }
-            state.udmaFds.at(i) = udfd;
-        }
-
-        state.shmMaps.at(i) = map;
-        if (hostBounce) {
-            // The bounce's whole point: our GPU DMAs out of the SAME physical
-            // pages the render card DMAs into, so there is no CPU-side staging
-            // buffer at all. Leave hostPtrs null - that null IS the signal the
-            // shm branch uses to skip its 14 MiB memcpy - and leave
-            // sourceImages empty so the fallback at presentation.cpp:2403
-            // cannot pull us back onto the copy path either.
-            state.dmaMaps.at(i) = map;
-            LSFG_FRAME_DBG("host-bounce staging slot %zu size=%llu (no CPU copy)",
-                i, (unsigned long long)bytes);
-        } else {
-        void* host = nullptr;
-        if (::posix_memalign(&host, 4096, static_cast<size_t>(bytes)) != 0) {
-            ::munmap(map, static_cast<size_t>(mapBytes));
-            ::close(memfd);
-            throw ls::error("posix_memalign staging failed");
-        }
-        ::memset(host, 0, static_cast<size_t>(bytes));
-        state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h }, fmt,
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                | VK_IMAGE_USAGE_SAMPLED_BIT,
-            host, bytes);
-        state.hostPtrs.at(i) = host;
-            LSFG_FRAME_DBG("posix-shm staging slot %zu size=%llu",
-                i, (unsigned long long)bytes);
-        }
-        state.shmSeq.at(i) = reinterpret_cast<uint32_t*>(
-            static_cast<char*>(map) + static_cast<size_t>(bytes));
-        state.shmSeen.at(i) = 0;
-        state.shmBytes = static_cast<size_t>(bytes);
-        // The doubler imports this same udmabuf fd as a VkBuffer. Send that fd,
-        // not the memfd: a memfd is not a dma-buf and the render GPU cannot
-        // import it. The memfd stays mapped here for the seq word only.
-        const int sendFd = hostBounce ? ::dup(state.udmaFds.at(i)) : ::dup(memfd);
-        if (sendFd < 0)
-            throw ls::error("dup() failed");
-        ::close(memfd);
-        if (hostBounce)
-            std::fprintf(stderr,
-                "UDMABUF_SEND slot=%zu fd=%d (udmabuf, not memfd)\n", i, sendFd);
-        conn.attachFd(sendFd);
-        conn.send(Staging{});
-        continue;
-        }
         state.sourceImages.at(i).emplace(vk, VkExtent2D{ w, h },
             state.captureFormat, imgUsage,
             std::nullopt /*importFd*/, std::nullopt /*exportFd*/, layout,
@@ -533,19 +317,6 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
     // crosses from the game device every cycle.
     //    on any throw before a successful import, close the handed dups (the
     //    backend has consumed none yet).
-    // Import the first shared buffer up front, on OUR device, before the
-    // backend context opens. The udmabuf precondition below verifies this
-    // import really happened and matches the staging slot, so it cannot be a
-    // check that passes because nothing has been tried yet.
-    if (conf.transport == ls::Transport::Udmabuf && !state.udmaFds.empty()
-            && state.udmaFds.front() >= 0) {
-        state.udmaBufs.front().emplace(
-            vk, ::dup(state.udmaFds.front()),
-            static_cast<size_t>(state.shmBytes),
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        LSFG_FRAME_DBG("udmabuf: pre-imported slot 0 fd=%d bytes=%llu",
-            state.udmaFds.front(), (unsigned long long)state.shmBytes);
-    }
 
     try {
         LSFG_FRAME_DBG("runStream: openContext start");
@@ -556,77 +327,9 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
             w, h, false /*hdr: R8G8B8A8 staging, never format>57*/,
             1.0F / conf.flow_scale, conf.performance_mode);
         LSFG_FRAME_DBG("runStream: openContext done");
-        // The precondition depends on the transport, so the check does too.
-        //
-        // p2p / dmabuf: the backend imports the render GPU's IMAGE directly, so
-        // a same-device context means the import silently landed on the wrong
-        // card. That is fatal, and the check stands unchanged.
-        //
-        // udmabuf: the backend never sees the render GPU's image at all. The
-        // shared slot crosses as a BUFFER that the backend's own device
-        // imports, and this app's GPU does the copy. "cross-device" is
-        // therefore not the property this path needs; what it needs is that
-        // the buffer really was imported on the doubler, and that its size
-        // and row length match the staging slot the app allocated. Checking
-        // those instead of deleting the check keeps a broken setup from
-        // passing here and faulting at the first frame.
-        if (conf.transport == ls::Transport::Udmabuf) {
-            // "not cross-device" only rules out ONE wrong case. The property
-            // that matters is that the shared buffer is imported on the SAME
-            // device the backend runs on, because that is the device whose
-            // GPUVM has to read those pages. Compare the actual device, not
-            // the negation of a flag.
-            // Compare by device UUID rather than by VkPhysicalDevice handle:
-            // the handle is an enumeration-order artefact, and the UUID is the
-            // identity that survives a reboot or a reordered loader. This is
-            // the check that actually proves the buffer lives on the same
-            // physical card the backend generates frames on.
-            const auto toHex = [](const std::array<uint8_t, 16>& id) {
-                static const char* hx = "0123456789abcdef";
-                std::string out;
-                for (const uint8_t b : id) {
-                    out += hx[b >> 4];
-                    out += hx[b & 0xF];
-                }
-                return out;
-            };
-            const auto ourId = toHex(vk.deviceUUID());
-            const auto backendId = toHex(backend.selectedDeviceUUID());
-            if (ourId != backendId)
-                throw ls::error(
-                    "udmabuf: shared buffer is imported on device " + ourId
-                    + " but the backend runs on " + backendId
-                    + "; they must be the same physical card or the copy "
-                    "reads pages this GPUVM cannot see");
-            // Do NOT re-assert !isCrossDevice here. The UUID check above is
-            // the real one: it proves the shared buffer is on the same
-            // physical card the backend runs on. isCrossDevice() answers a
-            // different question - whether the backend imported the RENDER
-            // GPU's image - and on the udmabuf bounce the backend never
-            // receives that image at all; it receives the shared buffer. So
-            // a cross-device flag here is expected, not a fault, and keeping
-            // this assertion was exactly the p2p assumption the transport is
-            // built not to need.
-            const uint64_t wantBytes = static_cast<uint64_t>(state.shmBytes);
-            if (state.udmaBufs.empty() || !state.udmaBufs.front().has_value())
-                throw ls::error("udmabuf: shared buffer not imported on the "
-                    "doubler before the backend context opened");
-            const size_t rowPitch = static_cast<size_t>(state.rowPitch);
-            const bool sizeOk = state.udmaBufs.front()->byteSize() == wantBytes;
-            // row length is in TEXELS; the pitch the app computed must be
-            // exactly width * bytesPerPixel or the bounce copies garbage.
-            const bool pitchOk = rowPitch
-                == static_cast<size_t>(w) * 4;
-            if (!sizeOk || !pitchOk)
-                throw ls::error("udmabuf: shared buffer does not match the "
-                    "staging slot (buffer=" + std::to_string(
-                        state.udmaBufs.front()->byteSize()) + " want="
-                    + std::to_string(wantBytes) + ", rowPitch="
-                    + std::to_string(rowPitch) + " want="
-                    + std::to_string(static_cast<size_t>(w) * 4) + ")");
-            LSFG_FRAME_DBG("udmabuf: backend precondition ok (buffer=%llu pitch=%zu)",
-                (unsigned long long)wantBytes, rowPitch);
-        } else if (!backend.isCrossDevice(ctx)) {
+        // The backend imports the render GPU's IMAGE directly, so a
+        // same-device context means the import landed on the wrong card.
+        if (!backend.isCrossDevice(ctx)) {
             throw ls::error("backend context is not cross-device");
         }
         state.context = ls::owned_ptr<ls::R<lsfgvk::backend::Context>>(
@@ -643,100 +346,6 @@ void runStream(Connection& conn, StreamState& state, const std::atomic<bool>& st
         throw ls::error("failed to open backend context", e);
     }
 
-    // 5b. udmabuf ring: receive K slot fds + the control-block fd from the
-    // render side, map the control block, and import each slot as a dma-buf
-    // image on OUR card. The app waits for these because it cannot present
-    // without them; the render side never waits for anything here.
-    if (conf.transport == ls::Transport::UdmabufRing) {
-        try {
-            auto msg = conn.receive(std::chrono::milliseconds(10000));
-            auto* setup = std::get_if<ls::ipc::RingSetup>(&msg);
-            if (setup == nullptr) {
-                const auto got = ls::ipc::typeOf(msg);
-                throw ls::error(std::string("expected RING_SETUP, got ")
-                    + ls::ipc::nameOf(got));
-            }
-            const std::uint32_t k = setup->slotCount;
-            if (k == 0 || k > 64)
-                throw ls::error("ring slot count out of range");
-
-            std::vector<int> slotFds(k, -1);
-            for (std::uint32_t i = 0; i < k; ++i) {
-                auto m2 = conn.receive(std::chrono::milliseconds(10000));
-                auto* sf = std::get_if<ls::ipc::RingSlotFd>(&m2);
-                if (sf == nullptr || sf->slotIdx >= k)
-                    throw ls::error("expected RING_SLOT in slot order");
-                const int fd = conn.takeReceivedFd();
-                if (fd < 0)
-                    throw ls::error("RING_SLOT arrived without its fd");
-                slotFds.at(sf->slotIdx) = fd;
-            }
-            auto m3 = conn.receive(std::chrono::milliseconds(10000));
-            if (!std::holds_alternative<ls::ipc::RingCtrl>(m3))
-                throw ls::error("expected RING_CTRL");
-            const int ctrlFd = conn.takeReceivedFd();
-            if (ctrlFd < 0)
-                throw ls::error("RING_CTRL arrived without its fd");
-
-            const std::size_t ctrlBytes = sizeof(ls::ipc::RingHeader)
-                + sizeof(ls::ipc::RingSlot) * k;
-            void* map = ::mmap(nullptr, ctrlBytes, PROT_READ | PROT_WRITE,
-                MAP_SHARED, ctrlFd, 0);
-            if (map == MAP_FAILED) {
-                ::close(ctrlFd);
-                for (int fd : slotFds) if (fd >= 0) ::close(fd);
-                throw ls::error("ring: control block mmap failed");
-            }
-            state.ringCtrlMap = map;
-            state.ringCtrlBytes = ctrlBytes;
-            state.ringCtrlFd = ctrlFd;
-            state.ring = std::make_unique<ls::ipc::ControlBlock>(map, ctrlBytes, false);
-            state.ringSlotFds = slotFds;
-            state.ringSlotCount = k;
-            state.transport = ls::Transport::UdmabufRing;
-
-            // Import each slot's udmabuf as a dma-buf image on OUR card. This
-            // is the only GPU->GPU move available here: a host-pointer import
-            // is rejected by radv (VK_ERROR_INVALID_EXTERNAL_HANDLE, proven by
-            // tools/testing/udmabuf_hostptr_probe.cpp), and the source
-            // swapchain image needs image semantics, so the slot is imported
-            // as an image rather than a buffer.
-            // rowPitch must be explicit for a dma-buf exchange image; the
-            // renderer publishes its pitch in the control block header and the
-            // slot payload is width*4 tightly packed, so width*4 is the value
-            // both sides agree on and no per-resize negotiation is needed.
-            vk::ImageLayout slotLayout{};
-            slotLayout.mode = vk::ImageMode::Linear;
-            slotLayout.rowPitch = static_cast<std::size_t>(w) * 4;
-            slotLayout.drmModifier = 0;
-            // resize() only when the vector is empty or the wrong size: a
-            // re-created ring would otherwise resize over live std::optional
-            // members and the next emplace throws "value already present".
-            if (state.ringSlotImages.size() != k) {
-                state.ringSlotImages.clear();
-                state.ringSlotImages.resize(k);
-            }
-            for (std::uint32_t i = 0; i < k; ++i) {
-                if (state.ringSlotImages.at(i).has_value())
-                    continue;
-                state.ringSlotImages.at(i).emplace(vk,
-                    VkExtent2D{ static_cast<std::uint32_t>(w), h },
-                    fmt,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT
-                        | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                        | VK_IMAGE_USAGE_SAMPLED_BIT,
-                    slotFds.at(i), std::nullopt, slotLayout,
-                    sourceSharing, concurrentFamilies);
-            }
-
-            std::fprintf(stderr,
-                "lsfg-vk-app: ring received K=%u ctrl=%zu bytes, imported %u slots as dma-buf images on '%s'\n",
-                k, ctrlBytes, k, "(this device)");
-            std::fflush(stderr);
-        } catch (const std::exception& e) {
-            throw ls::error(std::string("ring handshake failed: ") + e.what());
-        }
-    }
 
     // 6. READY: stream is live.
     conn.send(ls::ipc::Ready{});

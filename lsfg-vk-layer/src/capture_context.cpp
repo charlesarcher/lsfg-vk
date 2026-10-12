@@ -34,7 +34,6 @@
 #include <fcntl.h>
 #include <linux/dma-buf.h>
 #include <linux/memfd.h>
-#include <linux/udmabuf.h>
 #include <sys/eventfd.h>
 #include <sys/syscall.h>
 #include <poll.h>
@@ -56,216 +55,7 @@ bool exportIsolatedOn() {
     const char* e = std::getenv("LSFGVK_EXPORT_ISOLATED");
     return e && e[0] == '1';
 }
-bool rawDmaBufOn() {
-    const char* e = std::getenv("LSFGVK_RAW_DMABUF");
-    return e && e[0] == '1';
-}
 
-// One-shot check of the live copy. The pattern image is linear and is copied
-// into the captured swapchain image; copyImageToBuffer then reads that image,
-// not the pattern image. R = x, G = y, B = x>>8 xor y>>8, A = 0xA5.
-struct UdmaByteRef {
-    vk::Image* img{nullptr};
-    void* ptr{nullptr};
-    std::vector<uint8_t> pattern;
-    VkDeviceSize bytes{0};
-    uint32_t rowPitch{0};
-    bool armed{false};
-    bool done{false};
-};
-UdmaByteRef& udmaByteRef() {
-    static UdmaByteRef r;
-    return r;
-}
-void armUdmaByteRef(const vk::Vulkan& vk, VkExtent2D extent) {
-    // Tool, off by default. LSFGVK_UDMA_PATTERN=1 copies the pattern into the
-    // captured swapchain image and checks the udmabuf after copyImageToBuffer.
-    const char* gate = std::getenv("LSFGVK_UDMA_PATTERN");
-    if (!gate || gate[0] != '1')
-        return;
-    auto& r = udmaByteRef();
-    if (r.img || r.done)
-        return;
-    const VkDeviceSize bytes =
-        (static_cast<VkDeviceSize>(extent.width) * 4 * extent.height + 4095) & ~4095ull;
-    if (::posix_memalign(&r.ptr, 4096, static_cast<size_t>(bytes)) != 0)
-        return;
-    std::memset(r.ptr, 0, static_cast<size_t>(bytes));
-    try {
-        // Leaked on purpose: destroying it at exit races the device teardown.
-        r.img = new vk::Image(vk, extent, VK_FORMAT_R8G8B8A8_UNORM,
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-            r.ptr, bytes);
-        VkSubresourceLayout layout{};
-        const VkImageSubresource sub{ VK_IMAGE_ASPECT_COLOR_BIT, 0, 0 };
-        vk.df().GetImageSubresourceLayout(vk.dev(), r.img->handle(), &sub, &layout);
-        r.rowPitch = layout.rowPitch;
-        const size_t tight = static_cast<size_t>(extent.width) * 4;
-        r.pattern.assign(tight * extent.height, 0);
-        auto* host = static_cast<uint8_t*>(r.ptr);
-        for (uint32_t y = 0; y < extent.height; ++y) {
-            for (uint32_t x = 0; x < extent.width; ++x) {
-                const uint8_t px[4] = {
-                    static_cast<uint8_t>(x & 0xff),
-                    static_cast<uint8_t>(y & 0xff),
-                    static_cast<uint8_t>(((x >> 8) ^ (y >> 8)) & 0xff),
-                    0xA5
-                };
-                std::memcpy(r.pattern.data() + static_cast<size_t>(y) * tight
-                    + static_cast<size_t>(x) * 4, px, 4);
-                std::memcpy(host + layout.offset
-                    + static_cast<size_t>(y) * layout.rowPitch
-                    + static_cast<size_t>(x) * 4, px, 4);
-            }
-        }
-        r.bytes = bytes;
-        r.armed = true;
-        std::cerr << "udmabuf-bytes: pattern filled rowPitch=" << layout.rowPitch
-            << " tight=" << tight
-            << " row0=" << std::hex
-            << int(r.pattern[0]) << int(r.pattern[1])
-            << " row1=" << int(r.pattern[tight + 1]) << std::dec << "\n";
-    } catch (const std::exception& e) {
-        std::cerr << "udmabuf-bytes: pattern image failed: " << e.what() << "\n";
-        r.done = true;
-    }
-}
-void barrierPatternSrc(const vk::Vulkan& vk, VkCommandBuffer cmd, VkImage img) {
-    VkImageMemoryBarrier toSrc{
-        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-        .srcAccessMask = VK_ACCESS_HOST_WRITE_BIT,
-        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
-        .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-        .image = img,
-        .subresourceRange = {
-            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-            .levelCount = 1,
-            .layerCount = 1
-        }
-    };
-    vk.df().CmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &toSrc);
-}
-void finishUdmaByteRef(const vk::Vulkan& vk, int syncFd, int mapFd,
-        uint32_t width, uint32_t height) {
-    (void)height;
-    auto& r = udmaByteRef();
-    if (!r.armed || r.done)
-        return;
-    r.done = true;
-    r.armed = false;
-    if (syncFd < 0 || mapFd < 0 || r.pattern.empty()) {
-        std::cerr << "udmabuf-bytes: skipped (syncFd=" << syncFd
-            << " mapFd=" << mapFd << ")\n";
-        return;
-    }
-    const int waitFd = ::dup(syncFd);
-    pollfd pfd{};
-    pfd.fd = waitFd;
-    pfd.events = POLLIN;
-    const int pr = ::poll(&pfd, 1, 2000);
-    if (waitFd >= 0) ::close(waitFd);
-    if (pr <= 0) {
-        std::cerr << "udmabuf-bytes: sync poll failed pr=" << pr << "\n";
-        return;
-    }
-    void* mapped = ::mmap(nullptr, static_cast<size_t>(r.bytes),
-        PROT_READ, MAP_SHARED, mapFd, 0);
-    if (mapped == MAP_FAILED) {
-        std::cerr << "udmabuf-bytes: mmap failed errno=" << errno << "\n";
-        return;
-    }
-    const auto* expect = r.pattern.data();
-    const auto* buf = static_cast<const uint8_t*>(mapped);
-    const size_t tight = static_cast<size_t>(width) * 4;
-    auto hex8 = [](const uint8_t* p) {
-        char s[32];
-        std::snprintf(s, sizeof(s), "%02x%02x%02x%02x %02x%02x%02x%02x",
-            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
-        return std::string(s);
-    };
-    const bool have512 = 512 + 8 <= r.pattern.size();
-    const bool haveRow = tight + 8 <= r.pattern.size();
-    const bool m0 = std::memcmp(expect, buf, 8) == 0;
-    const bool m512 = have512 && std::memcmp(expect + 512, buf + 512, 8) == 0;
-    const bool mrow = haveRow && std::memcmp(expect + tight, buf + tight, 8) == 0;
-    const bool rowsDiffer = haveRow && std::memcmp(expect, expect + tight, 8) != 0;
-    std::cerr << "udmabuf-bytes: pattern rowPitch=" << r.rowPitch
-        << " tight=" << tight
-        << " rowsDiffer=" << rowsDiffer
-        << " off0 match=" << m0
-        << " expect=" << hex8(expect) << " buf=" << hex8(buf);
-    if (have512)
-        std::cerr << " off512 match=" << m512
-            << " expect=" << hex8(expect + 512) << " buf=" << hex8(buf + 512);
-    if (haveRow)
-        std::cerr << " row1 match=" << mrow
-            << " expect=" << hex8(expect + tight) << " buf=" << hex8(buf + tight);
-    std::cerr << "\n";
-    std::cerr << "udmabuf-bytes: read mmap(mapFd, offset 0) of the dup taken before import;"
-        << " copy bufferOffset=0 bufferRowLength=" << width << "\n";
-    const size_t dumpN = std::min(r.bytes, static_cast<VkDeviceSize>(8192));
-    if (FILE* df = std::fopen("/tmp/udmabuf-xy.txt", "w")) {
-        std::fprintf(df, "# off decoded_x decoded_y R G B A\n");
-        for (size_t off = 0; off + 4 <= dumpN; off += 4) {
-            const uint8_t R = buf[off], G = buf[off + 1], B = buf[off + 2], A = buf[off + 3];
-            if (A == 0xA5)
-                std::fprintf(df, "%zu %u %u %u %u %u %u\n",
-                    off, static_cast<unsigned>(R | (B << 8)), static_cast<unsigned>(G),
-                    R, G, B, A);
-            else
-                std::fprintf(df, "%zu -1 -1 %u %u %u %u\n", off, R, G, B, A);
-        }
-        std::fclose(df);
-        std::cerr << "udmabuf-bytes: wrote " << (dumpN / 4)
-            << " pixels to /tmp/udmabuf-xy.txt\n";
-    }
-    ::munmap(mapped, static_cast<size_t>(r.bytes));
-}
-int createRawDmaBuf(size_t bytes, void** mapOut) {
-    *mapOut = nullptr;
-    const int mfd = static_cast<int>(::syscall(SYS_memfd_create, "lsfg-raw",
-        static_cast<long>(MFD_CLOEXEC | MFD_ALLOW_SEALING)));
-    if (mfd < 0)
-        return -1;
-    if (::ftruncate(mfd, static_cast<off_t>(bytes)) != 0) {
-        ::close(mfd);
-        return -1;
-    }
-    if (::fcntl(mfd, F_ADD_SEALS, F_SEAL_SHRINK) != 0) {
-        ::close(mfd);
-        return -1;
-    }
-    const int ufd = ::open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
-    if (ufd < 0) {
-        ::close(mfd);
-        return -1;
-    }
-    udmabuf_create cr{};
-    cr.memfd = static_cast<__u32>(mfd);
-    cr.flags = UDMABUF_FLAGS_CLOEXEC;
-    cr.offset = 0;
-    cr.size = bytes;
-    const int dfd = ::ioctl(ufd, UDMABUF_CREATE, &cr);
-    const int err = errno;
-    ::close(ufd);
-    ::close(mfd);
-    if (dfd < 0) {
-        errno = err;
-        return -1;
-    }
-    void* p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, dfd, 0);
-    if (p == MAP_FAILED) {
-        ::close(dfd);
-        return -1;
-    }
-    *mapOut = p;
-    return dfd;
-}
 int existingRenderFd() {
     DIR* dir = ::opendir("/proc/self/fd");
     if (!dir)
@@ -390,97 +180,6 @@ bool gemIsExplicitSync(int dmaFd) {
 }
 }
 
-struct lsfgvk::layer::CopyHop {
-    struct Job {
-        void* src{nullptr};
-        void* dst{nullptr};
-        size_t n{0};
-        int fd{-1};
-        int destFd{-1};
-        int readyFd{-1};
-        uint32_t* seq{nullptr};
-    };
-    std::mutex mx;
-    std::condition_variable cv;
-    std::queue<Job> q;
-    std::atomic<bool> stop{false};
-    std::thread th;
-
-    CopyHop() { th = std::thread([this] { this->run(); }); }
-    CopyHop(const CopyHop&) = delete;
-    CopyHop& operator=(const CopyHop&) = delete;
-    ~CopyHop() {
-        stop.store(true);
-        cv.notify_all();
-        if (th.joinable())
-            th.join();
-        while (!q.empty()) {
-            if (q.front().fd >= 0)
-                ::close(q.front().fd);
-            q.pop();
-        }
-    }
-    void push(Job j) {
-        {
-            std::lock_guard<std::mutex> lk(mx);
-            q.push(j);
-        }
-        cv.notify_one();
-    }
-    void run() {
-        while (!stop.load()) {
-            Job j{};
-            {
-                std::unique_lock<std::mutex> lk(mx);
-                cv.wait(lk, [&] { return stop.load() || !q.empty(); });
-                if (stop.load() && q.empty())
-                    return;
-                if (q.empty())
-                    continue;
-                j = q.front();
-                q.pop();
-            }
-            if (j.fd >= 0) {
-                pollfd pfd{};
-                pfd.fd = j.fd;
-                pfd.events = POLLIN;
-                ::poll(&pfd, 1, 2);
-                ::close(j.fd);
-                j.fd = -1;
-            }
-            if (j.destFd >= 0) {
-                dma_buf_sync st{};
-                st.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
-                (void)::ioctl(j.destFd, DMA_BUF_IOCTL_SYNC, &st);
-            }
-            if (j.src && j.dst && j.n) {
-                // Game swapchain is B8G8R8A8_UNORM; FG/overlay want RGBA.
-                // copyImage is bit-preserving (R/B swap). Capture queue is
-                // compute — cannot vkCmdBlitImage. Swizzle on the hop thread.
-                auto* d = static_cast<std::uint32_t*>(j.dst);
-                const auto* s = static_cast<const std::uint32_t*>(j.src);
-                const size_t px = j.n / 4;
-                for (size_t i = 0; i < px; ++i) {
-                    const std::uint32_t v = s[i];
-                    d[i] = (v & 0xFF00FF00u)
-                        | ((v & 0xFFu) << 16)
-                        | ((v >> 16) & 0xFFu);
-                }
-            }
-            if (j.destFd >= 0) {
-                dma_buf_sync en{};
-                en.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-                (void)::ioctl(j.destFd, DMA_BUF_IOCTL_SYNC, &en);
-            }
-            if (j.readyFd >= 0) {
-                const uint64_t one = 1;
-                (void)::write(j.readyFd, &one, sizeof(one));
-            }
-            if (j.seq)
-                __atomic_add_fetch(j.seq, 1u, __ATOMIC_RELEASE);
-        }
-    }
-};
 
 namespace {
     // TEMP DEBUG (Session 13.29d): per-phase absolute wall-clock timestamps
@@ -543,11 +242,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     // reusable from frame 1)
     this->slotFree.fill(true);
     this->localExportFds.fill(-1);
-    this->rawExportFds.fill(-1);
-    this->rawMemFds.fill(-1);
-    this->rawReadyFds.fill(-1);
     this->bExportFds.fill(-1);
-    this->udmaMmapFds.fill(-1);
 
     // --- IPC handshake (2 s deadline on the NEGOTIATED reply) --------------
     std::filesystem::path sockPath;
@@ -560,6 +255,28 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     try {
         this->ipcConn.emplace(ls::ipc::Connection::connect(sockPath));
     } catch (const std::exception& e) {
+        /* Rate-limit this message. With no doubler serving the socket the game
+           recreates its swapchain, which lands here again immediately - so an
+           unserved socket became a tight connect/fail/log loop: hundreds of
+           lines of console output and an apparent hang. Report the first
+           failure, then at most one every 5 s, and count what was suppressed. */
+        static std::atomic<std::uint64_t> lastLogMs{0};
+        static std::atomic<std::uint32_t> suppressed{0};
+        const std::uint64_t nowMs = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        std::uint64_t prev = lastLogMs.load(std::memory_order_relaxed);
+        if (nowMs - prev >= 5000 && lastLogMs.compare_exchange_strong(
+                prev, nowMs, std::memory_order_relaxed)) {
+            const std::uint32_t skipped = suppressed.exchange(0, std::memory_order_relaxed);
+            std::cerr << "lsfg-vk: failed to connect to app socket '"
+                << sockPath.string() << "' (no doubler serving it";
+            if (skipped)
+                std::cerr << "; " << skipped << " further attempts suppressed";
+            std::cerr << ")\n";
+        } else {
+            suppressed.fetch_add(1, std::memory_order_relaxed);
+        }
         throw ls::error("lsfg-vk: failed to connect to app socket '" + sockPath.string() + "'", e);
     }
 
@@ -640,132 +357,6 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         throw;
     }
 
-    // --- udmabuf ring: WE create it, we own it, we hand the fds over ------
-    // The frame data lands on THIS side, so the render process owns every
-    // buffer. The doubler imports the fds we send and never creates one.
-    // K slots + one control block, all kernel udmabufs; slot payload moves by
-    // GPU DMA only and the hand-off is the control block's CAS words, so
-    // neither process ever waits on the other.
-    if (this->profile.transport == ls::Transport::UdmabufRing) {
-        try {
-            const std::size_t slotBytes = static_cast<std::size_t>(this->info.extent.width)
-                * 4 * static_cast<std::size_t>(this->info.extent.height);
-            const std::uint32_t k = this->profile.ringSlots == 0
-                ? 3u : this->profile.ringSlots;
-
-            this->ring = std::make_unique<ls::ipc::UdmabufRing>(k, slotBytes,
-                this->info.extent.width, this->info.extent.height,
-                static_cast<std::uint32_t>(this->info.format));
-
-            // RING_SETUP carries no fd; it tells the app how many slots follow.
-            // RING_SLOT carries one udmabuf fd each, in slot order. RING_CTRL
-            // carries the control-block fd last, so the app holds every slot fd
-            // before it can map the block and start consuming.
-            {
-                std::lock_guard<std::mutex> lk(this->ipcMu);
-                this->ipcConn->send(ls::ipc::RingSetup{ k, slotBytes });
-                for (std::uint32_t i = 0; i < k; ++i) {
-                    this->ipcConn->attachFd(::dup(this->ring->slots()[i].udmabuf));
-                    this->ipcConn->send(ls::ipc::RingSlotFd{ i });
-                }
-                this->ipcConn->attachFd(this->ring->releaseControlFd());
-                this->ipcConn->send(ls::ipc::RingCtrl{});
-            }
-            // Import the slots on a COPY-ONLY VkDevice on the render card, not
-            // on the game's device. radv's global BO list is per VkDevice, so
-            // the game's submits no longer carry these buffers at all - that
-            // is what removes the ~30 ms implicit-sync stall.
-            // Select the SAME physical device as the game, by deviceID, so the
-            // copy runs on the render card rather than drifting to device 0.
-            const std::string gameName = this->gameDeviceName;
-            auto selectSameCard = [&vk, gameName](const vk::VulkanInstanceFuncs& fi,
-                    const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
-                VkPhysicalDeviceProperties2 gp{
-                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
-                };
-                // Match by NAME, not by handle. The game device belongs to a
-                // different VkInstance, so querying it here is invalid:
-                //   vkGetPhysicalDeviceProperties2: Invalid physicalDevice
-                // The game device name is already known as a string.
-                const std::string want = gameName;
-                for (auto pd : devs) {
-                    VkPhysicalDeviceProperties2 p{
-                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2
-                    };
-                    fi.GetPhysicalDeviceProperties2(pd, &p);
-                    if (want == p.properties.deviceName)
-                        return pd;
-                }
-                throw ls::error("ring: render card '" + want
-                    + "' not found among physical devices");
-            };
-            /* Two changes here, both forced by VK_ERROR_DEVICE_LOST after three
-               frames:
-                 - isGraphical=false + enableTransferQueue=true. A graphics
-                   device on the same card needs a graphics queue, and this
-                   card has no non-graphics transfer family, so the copy was
-                   running on a second full graphics queue. The app's proven
-                   dma-in device uses exactly these flags.
-                 - DISABLE_VK_LAYER_LSFGVK_frame_generation around the
-                   construction, so our own layer does not nest inside the copy
-                   device and try to capture it.
-               The copy still reads the game's swapchain images, which belong to
-               the game's device, so this device exists to own the ring BOs and
-               the copy queue - not to be a second scanout. */
-            /* isGraphical MUST stay true. This card reports no non-graphics
-               transfer family, and a non-graphical device with no transfer
-               family ends up with no usable queue at all:
-
-                 lsfg-vk: WARNING no non-graphics transfer queue family; image
-                   copies will not run as DMA. Refusing to fall back to the
-                   graphics qu[eue]
-                 lsfg-vk: transfer selection over 1 families: 0:0x1f -> NONE
-
-               which left the copy device with nothing to submit on, so it lost
-               the device on the first frame. isGraphical=false only works on
-               the doubler card, whose device does have a transfer family.
-               DISABLE_VK_LAYER_LSFGVK_frame_generation is kept so our own layer
-               does not nest inside the copy device. */
-            ::setenv("DISABLE_VK_LAYER_LSFGVK_frame_generation", "1", 1);
-            this->copyVk = std::make_unique<vk::Vulkan>(
-                "lsfg-ring-copy", vk::version{2, 0, 0},
-                "lsfg-ring-copy", vk::version{2, 0, 0},
-                selectSameCard, true, std::nullopt, std::nullopt, true, false);
-            ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
-            std::fprintf(stderr,
-                "lsfg-vk: copy-only device for the ring on the render card\n");
-            std::fflush(stderr);
-
-            // Same tight pitch the doubler imports with (width*4): the slot
-            // payload is width*4 per row, so neither side has to negotiate.
-            vk::ImageLayout slotLayout{};
-            slotLayout.mode = vk::ImageMode::Linear;
-            slotLayout.rowPitch = static_cast<std::size_t>(this->info.extent.width) * 4;
-            slotLayout.drmModifier = 0;
-            const VkImageUsageFlags slotUsage =
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-            this->copySlotImages.reserve(k);
-            this->copyCbs.reserve(k);
-            this->copyFences.reserve(k);
-            for (std::uint32_t i = 0; i < k; ++i) {
-                this->copySlotImages.emplace_back(*this->copyVk,
-                    this->info.extent, this->info.format, slotUsage,
-                    ::dup(this->ring->slots()[i].udmabuf), std::nullopt,
-                    slotLayout);
-                this->copyCbs.emplace_back().emplace(*this->copyVk);
-                this->copyFences.emplace_back().emplace(*this->copyVk, true);
-            }
-
-            std::fprintf(stderr,
-                "lsfg-vk: ring setup K=%u slotBytes=%zu ext=%ux%u fds=%u+ctrl sent, %u slots imported on copy device\n",
-                k, slotBytes, this->info.extent.width, this->info.extent.height, k, k);
-            std::fflush(stderr);
-        } catch (const std::exception& e) {
-            std::cerr << "lsfg-vk: external stream error: ring setup failed: "
-                << e.what() << "\n";
-            throw ls::error(std::string("lsfg-vk: external stream error: ") + e.what());
-        }
-    } else {
 
     // --- receive 2 staging-image handoffs from the app ----------------------
     // the app owns the staging images (created in its OWN local VRAM on the
@@ -789,11 +380,6 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
     }
     this->exchangeLayout = layout;
 
-    /* The ring has no app-owned staging: the render side owns the buffers and
-       sends RING_* instead. Skipping the whole STAGING/READY exchange here is
-       what lets the ring reach its first frame; running it blocked on a message
-       that never came and then failed on the READY the app does send. */
-    if (this->profile.transport != ls::Transport::UdmabufRing) {
     try {
         for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
             auto msg = this->ipcConn->receive(std::chrono::milliseconds(10000));
@@ -810,48 +396,9 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             if (fd < 0)
                 throw ls::error("lsfg-vk: external stream error: STAGING arrived without its fd");
 
-            if (this->profile.transport == ls::Transport::Udmabuf) {
-                const int mapFd = ::dup(fd);
-                const size_t bytes = (static_cast<size_t>(this->info.extent.width) * 4
-                    * this->info.extent.height + 4095) & ~4095;
-                this->udmaBufs.at(i).emplace(vk, fd, bytes,
-                    VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                this->udmaMmapFds.at(i) = mapFd;
-                std::cerr << "lsfg-vk: imported app udmabuf as VkBuffer slot=" << i
-                    << " bytes=" << bytes << "\n";
-                continue;
-            }
-            const bool posixShm = envFlagOn("LSFGVK_POSIX_SHM")
-                || this->profile.transport == ls::Transport::PosixShm;
-            if (!posixShm) {
-                ::close(fd);
-                std::cerr << "lsfg-vk: STAGING fd closed, transport is not udmabuf\n";
-                continue;
-            }
-            const VkDeviceSize hostSize = [&] {
-                const VkDeviceSize np = std::max<VkDeviceSize>(
-                    negotiated.allocationSize,
-                    static_cast<VkDeviceSize>(layout.rowPitch) * extent.height);
-                /* round up to page size: the host-import path requires
-                 * allocationSize be a 4096-multiple, and the seq-counter
-                 * offset must match the app's rounded staging size */
-                return (np + 4095) & ~4095ll;
-            }();
-            const size_t mapBytes = static_cast<size_t>(hostSize) + 4096;
-            void* map = ::mmap(nullptr, mapBytes,
-                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
             ::close(fd);
-            if (map == MAP_FAILED) {
-                std::cerr << "lsfg-vk: posix-shm mmap failed slot " << i
-                    << " errno=" << errno << "\n";
-                continue;
-            }
-            this->shmMaps.at(i) = map;
-            this->shmSeq.at(i) = reinterpret_cast<uint32_t*>(
-                static_cast<char*>(map) + static_cast<size_t>(hostSize));
-            this->hostAllocSize = hostSize;
-            std::cerr << "lsfg-vk: posix-shm mmap slot " << i
-                << " size=" << hostSize << "\n";
+            continue;
+
         }
     } catch (const ls::ipc::socket_error& e) {
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
@@ -885,8 +432,6 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         throw ls::error(std::string("lsfg-vk: external stream error: ") + e.what(), e);
     }
 
-    }
-    }   // end !UdmabufRing: staging + READY exchange
 
     // --- capture command buffer + per-slot sync-fd semaphores ---------------
     try {
@@ -917,9 +462,7 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
         this->localCopyOnly = this->fake
             || (std::getenv("LSFGVK_LOCAL_COPY")
                 && std::getenv("LSFGVK_LOCAL_COPY")[0] == '1');
-        if (this->udmaBufs.at(0))
-            std::cerr << "lsfg-vk: capture dst=app udmabuf VkBuffer (no image fd)\n";
-        if (this->fake && !exportIsolatedOn() && !this->udmaBufs.at(0)) {
+        if (this->fake && !exportIsolatedOn()) {
             this->localImages.reserve(STAGING_RING_DEPTH);
             const VkImageUsageFlags localUsage =
                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
@@ -984,73 +527,13 @@ CaptureContext::CaptureContext(const vk::Vulkan& vk, ls::GameConf profile,
             }
             if (this->localCopyOnly)
                 std::cerr << "lsfg-vk: capture dst=render-owned dma-buf\n";
-            if (rawDmaBufOn() && !this->shmMaps.at(0) && this->rawExportFds.at(0) < 0) {
-                this->rawBytes = gemBytes;
-                for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
-                    const int dfd = this->localExportFds.at(i);
-                    if (dfd < 0)
-                        continue;
-                    void* dm = ::mmap(nullptr, static_cast<size_t>(gemBytes),
-                        PROT_READ, MAP_SHARED, dfd, 0);
-                    if (dm == MAP_FAILED) {
-                        std::cerr << "lsfg-vk: dest mmap failed slot " << i
-                            << " errno=" << errno << "\n";
-                        continue;
-                    }
-                    this->destMaps.at(i) = dm;
-                    void* rm = nullptr;
-                    const int rfd = createRawDmaBuf(static_cast<size_t>(gemBytes), &rm);
-                    if (rfd < 0) {
-                        std::cerr << "lsfg-vk: raw dma-buf create failed slot " << i
-                            << " errno=" << errno << "\n";
-                        ::munmap(dm, static_cast<size_t>(gemBytes));
-                        this->destMaps.at(i) = nullptr;
-                        continue;
-                    }
-                    this->rawExportFds.at(i) = rfd;
-                    this->rawMaps.at(i) = rm;
-                    this->rawReadyFds.at(i) = ::eventfd(0,
-                        EFD_CLOEXEC | EFD_SEMAPHORE | EFD_NONBLOCK);
-                    if (this->rawReadyFds.at(i) < 0) {
-                        std::cerr << "lsfg-vk: raw ready eventfd failed slot " << i
-                            << " errno=" << errno << "\n";
-                    }
-                }
-                if (!this->copyHop)
-                    this->copyHop = std::make_unique<CopyHop>();
-                std::cerr << "lsfg-vk: raw dma-buf re-export size=" << gemBytes << "\n";
-            }
         }
         if (this->fake && exportIsolatedOn()) {
             this->dmaBufSent.fill(false);
             this->localCopyOnly = true;
             std::cerr << "lsfg-vk: capture dst=isolated-image dma-buf (no dest)\n";
         }
-        if (this->fake && this->hostImages.empty() && this->shmMaps.at(0)) {
-            const VkDeviceSize hostSize = this->hostAllocSize
-                ? this->hostAllocSize
-                : ((static_cast<VkDeviceSize>(this->info.extent.width) * 4
-                    * this->info.extent.height + 4095) & ~4095ull);
-            const VkImageUsageFlags hostUsage =
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-            this->hostAllocSize = hostSize;
-            for (size_t i = 0; i < STAGING_RING_DEPTH; ++i) {
-                void* p = nullptr;
-                if (::posix_memalign(&p, 4096, static_cast<size_t>(hostSize)) != 0)
-                    throw ls::error("posix_memalign 9070 host capture failed");
-                std::memset(p, 0, static_cast<size_t>(hostSize));
-                this->hostPtrsA.at(i) = p;
-                this->hostImages.emplace_back(vk, this->info.extent,
-                    VK_FORMAT_R8G8B8A8_UNORM, hostUsage, p, hostSize);
-            }
-            std::cerr << "lsfg-vk: capture dst=9070-host-malloc size=" << hostSize << "\n";
-            this->copyHop = std::make_unique<CopyHop>();
-        }
-        if (this->profile.transport == ls::Transport::DecoupledDma
-                && this->shmMaps.at(0)) {
-            std::cerr << "lsfg-vk: dual-host skipped: transport=decoupled but shmMaps set\n";
-        } else if (this->profile.transport == ls::Transport::DecoupledDma
-                && !this->shmMaps.at(0)) {
+        if (this->profile.transport == ls::Transport::DecoupledDma) {
             try {
                 auto selectB = [](const vk::VulkanInstanceFuncs& fi,
                         const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
@@ -1142,39 +625,22 @@ CaptureContext::CaptureContext(CaptureContext&& o) noexcept :
     // The ring, its copy-only device and the per-slot images must travel with
     // the context. Without them the moved-to context reports ring=0 and skips
     // every capture, which is what happened on the first working handshake.
-    ring(std::move(o.ring)),
-    copyVk(std::move(o.copyVk)),
-    copySlotImages(std::move(o.copySlotImages)),
-    copyCbs(std::move(o.copyCbs)),
-    copyFences(std::move(o.copyFences)),
-    ringSeq(o.ringSeq.load(std::memory_order_relaxed)),
     gameDeviceName(std::move(o.gameDeviceName)),
     fake(o.fake),
     lastImageGateFence(o.lastImageGateFence),
     localImages(std::move(o.localImages)),
-    udmaBufs(std::move(o.udmaBufs)),
-    udmaMmapFds(o.udmaMmapFds),
     hostImages(std::move(o.hostImages)),
     bVk(std::move(o.bVk)),
     bHostImages(std::move(o.bHostImages)),
     bVramImages(std::move(o.bVramImages)),
     hostPtrsA(o.hostPtrsA),
     hostPtrsB(o.hostPtrsB),
-    shmMaps(o.shmMaps),
-    shmSeq(o.shmSeq),
-    copyHop(std::move(o.copyHop)),
     hostAllocSize(o.hostAllocSize),
     bExportFds(o.bExportFds),
     bCbs(std::move(o.bCbs)),
     bFences(std::move(o.bFences)),
     exchangeLayout(o.exchangeLayout),
     localExportFds(o.localExportFds),
-    rawExportFds(o.rawExportFds),
-    rawMemFds(o.rawMemFds),
-    rawReadyFds(o.rawReadyFds),
-    destMaps(o.destMaps),
-    rawMaps(o.rawMaps),
-    rawBytes(o.rawBytes),
     dmaBufSent(o.dmaBufSent),
     localCopyOnly(o.localCopyOnly),
     captureSemaphores(std::move(o.captureSemaphores)),
@@ -1200,30 +666,14 @@ CaptureContext::CaptureContext(CaptureContext&& o) noexcept :
     o.capturePool = VK_NULL_HANDLE;
     o.captureQ = VK_NULL_HANDLE;
     o.bExportFds.fill(-1);
-    o.udmaMmapFds.fill(-1);
     o.localExportFds.fill(-1);
-    o.rawExportFds.fill(-1);
-    o.rawMemFds.fill(-1);
-    o.rawReadyFds.fill(-1);
-    o.destMaps.fill(nullptr);
-    o.rawMaps.fill(nullptr);
-    o.shmMaps.fill(nullptr);
-    o.shmSeq.fill(nullptr);
     o.hostPtrsA.fill(nullptr);
     o.hostPtrsB.fill(nullptr);
 }
 
 CaptureContext& CaptureContext::operator=(CaptureContext&& o) noexcept {
     if (this == &o) return *this;
-    this->copyHop.reset();
     for (int& fd : this->localExportFds) if (fd >= 0) { ::close(fd); fd = -1; }
-    for (size_t i = 0; i < this->destMaps.size(); ++i) {
-        if (this->destMaps.at(i)) { ::munmap(this->destMaps.at(i), static_cast<size_t>(this->rawBytes)); this->destMaps.at(i) = nullptr; }
-        if (this->rawMaps.at(i)) { ::munmap(this->rawMaps.at(i), static_cast<size_t>(this->rawBytes)); this->rawMaps.at(i) = nullptr; }
-    }
-    for (int& fd : this->rawExportFds) if (fd >= 0) { ::close(fd); fd = -1; }
-    for (int& fd : this->rawMemFds) if (fd >= 0) { ::close(fd); fd = -1; }
-    for (int& fd : this->rawReadyFds) if (fd >= 0) { ::close(fd); fd = -1; }
     for (int& fd : this->bExportFds) if (fd >= 0) { ::close(fd); fd = -1; }
     this->~CaptureContext();
     new (this) CaptureContext(std::move(o));
@@ -1243,6 +693,7 @@ void CaptureContext::notifyClose() {
 }
 
 CaptureContext::~CaptureContext() {
+
     if (this->ipcConn.has_value() && ::envFlagOn("LSFGVK_MEASURE")) {
         std::fprintf(stderr,
             "lsfg-vk-measure: socket close reason=CaptureContext-dtor fd=%d\n",
@@ -1250,9 +701,6 @@ CaptureContext::~CaptureContext() {
         std::fflush(stderr);
     }
     this->stopFrameThread();
-    for (int fd : this->udmaMmapFds)
-        if (fd >= 0) ::close(fd);
-    this->copyHop.reset();
     if (this->vkPtr) {
         try {
             if (this->fenceSubmitted && this->captureFence.has_value())
@@ -1303,25 +751,6 @@ CaptureContext::~CaptureContext() {
     }
 
     for (int& fd : this->localExportFds) {
-        if (fd >= 0) { ::close(fd); fd = -1; }
-    }
-    for (size_t i = 0; i < this->destMaps.size(); ++i) {
-        if (this->destMaps.at(i)) {
-            ::munmap(this->destMaps.at(i), static_cast<size_t>(this->rawBytes));
-            this->destMaps.at(i) = nullptr;
-        }
-        if (this->rawMaps.at(i)) {
-            ::munmap(this->rawMaps.at(i), static_cast<size_t>(this->rawBytes));
-            this->rawMaps.at(i) = nullptr;
-        }
-    }
-    for (int& fd : this->rawExportFds) {
-        if (fd >= 0) { ::close(fd); fd = -1; }
-    }
-    for (int& fd : this->rawMemFds) {
-        if (fd >= 0) { ::close(fd); fd = -1; }
-    }
-    for (int& fd : this->rawReadyFds) {
         if (fd >= 0) { ::close(fd); fd = -1; }
     }
     for (int& fd : this->bExportFds) {
@@ -1497,23 +926,11 @@ int CaptureContext::drainReleases() {
         } else if (auto* err = std::get_if<ls::ipc::ErrorMsg>(&msg)) {
             std::cerr << "lsfg-vk: external stream error: peer error: " << err->message << "\n";
             throw ls::error("lsfg-vk: external stream error: peer error: " + err->message);
-        } else if (std::get_if<ls::ipc::Ready>(&msg) != nullptr
-                && this->profile.transport == ls::Transport::UdmabufRing) {
-            /* The ring transport does not run the READY handshake, but the app
-               still sends READY once the ring fds are imported. It is a
-               no-op here, not a stream error: the ring's own control block is
-               the hand-off. */
-            continue;
-        } else {
-            // unexpected message in steady state - treat as stream error
-            const auto got = ls::ipc::typeOf(msg);
-            std::cerr << "lsfg-vk: external stream error: unexpected " << ls::ipc::nameOf(got) << " in steady state\n";
-            throw ls::error(std::string("lsfg-vk: external stream error: unexpected ")
-                + ls::ipc::nameOf(got));
         }
     }
     return applied;
 }
+
 
 std::optional<size_t> CaptureContext::trySelectFreeSlot() {
     // never waits on GPU B. one probe; caller skips capture on nullopt.
@@ -1531,25 +948,6 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         VkQueue queue, VkSwapchainKHR swapchain,
         void* next_chain, uint32_t imageIdx,
         const std::vector<VkSemaphore>& semaphores) {
-    if (std::getenv("LSFGVK_RING_DBG")) {
-        static std::uint64_t nPresent = 0;
-        if (++nPresent <= 4
-                || (nPresent % 25) == 0) {
-            std::fprintf(stderr,
-                "lsfg-vk: CaptureContext::present #%llu ring=%d fidx=%llu\n",
-                (unsigned long long)nPresent,
-                this->ring != nullptr ? 1 : 0,
-                (unsigned long long)this->fidx);
-            std::fflush(stderr);
-        }
-    }
-    if (std::getenv("LSFGVK_RING_DBG")) {
-        static std::uint64_t nEnter = 0;
-        ++nEnter;
-        std::fprintf(stderr, "lsfg-vk: present-ENTER #%llu\n",
-            (unsigned long long)nEnter);
-        std::fflush(stderr);
-    }
     // Session 40 dbl-ledger: lazily arm the (capTs -> slot) sink, env-gated.
     this->ledger.init();
 // RELEASE handling frees slots draining non-blocking
@@ -1637,46 +1035,6 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     size_t slot = 0;
     static const bool skipAll = std::getenv("LSFGVK_SKIP_ALL")
         && std::getenv("LSFGVK_SKIP_ALL")[0] == '1';
-    /* The ring has its OWN slot bookkeeping in the control block. It must be
-       consulted INSTEAD of the staging-slot gate below, because in this
-       transport the staging slotFree mask is never maintained, so
-       trySelectFreeSlot() always returns nullopt and the whole capture block
-       was being skipped. */
-    std::uint32_t ringSlotIdx = UINT32_MAX;
-    std::uint64_t ringSeqNow = 0;
-    const bool ringPath = this->profile.transport == ls::Transport::UdmabufRing
-        && this->ring != nullptr;
-    if (ringPath) {
-        /* The ring's own slot bookkeeping lives in the control block, so the
-           staging-slot machinery below is not just unnecessary here, it is
-           wrong: slotFree is never maintained in this transport and the gate
-           below would skip every frame. */
-        const std::uint64_t seq = this->ringSeq.fetch_add(1,
-            std::memory_order_relaxed) + 1;
-        const int claimed = this->ring->control().claimForWrite(seq, 0);
-        if (std::getenv("LSFGVK_RING_DBG")) {
-            std::fprintf(stderr,
-                "lsfg-vk: ring claim seq=%llu slot=%d K=%u\n",
-                (unsigned long long)seq, claimed,
-                this->ring->control().count());
-            std::fflush(stderr);
-        }
-        if (claimed < 0) {
-            if (std::getenv("LSFGVK_RING_DBG")) {
-                static std::uint32_t nSkip = 0;
-                if (nSkip < 8) {
-                    ++nSkip;
-                    std::fprintf(stderr,
-                        "lsfg-vk: ring no free slot, skipping frame seq=%llu\n",
-                        (unsigned long long)seq);
-                    std::fflush(stderr);
-                }
-            }
-        } else {
-            ringSlotIdx = static_cast<std::uint32_t>(claimed);
-            ringSeqNow = seq;
-        }
-    } else
     if (const auto picked = skipAll ? std::nullopt : this->trySelectFreeSlot()) {
         slot = *picked;
     } else {
@@ -1785,209 +1143,13 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
             "n/a", "n/a (game swapchain, not a dma-buf export)");
     }
 
-    // --- udmabuf ring: copy on the PRIVATE device, publish, never wait -----
-    // One free slot or nothing: if the doubler is behind, this frame is
-    // skipped rather than queued behind it. The layer never waits on the
-    // doubler, and never waits on anything but its own copy fence.
-    if (ringPath && ringSlotIdx != UINT32_MAX) {
-        const std::uint64_t seq = ringSeqNow;
-        const int slot = static_cast<int>(ringSlotIdx);
-        if (std::getenv("LSFGVK_RING_DBG")) {
-            std::fprintf(stderr,
-                "lsfg-vk: ring copy begin seq=%llu slot=%d\n",
-                (unsigned long long)seq, slot);
-            std::fflush(stderr);
-        }
-        const auto idx = static_cast<std::uint32_t>(slot);
-        vk::Vulkan& cvk = *this->copyVk;
-        auto& fence = *this->copyFences.at(idx);
-        // Our OWN fence: the only wait in this path. Timeout 0 means "already
-        // signalled", so this never blocks on the doubler or on the GPU.
-        const bool fenceFree = fence.wait(*this->copyVk, 0);
-        if (std::getenv("LSFGVK_RING_DBG")) {
-            std::fprintf(stderr,
-                "lsfg-vk: ring slot %u fenceFree=%d\n", slot, fenceFree ? 1 : 0);
-            std::fflush(stderr);
-        }
-        if (!fenceFree) {
-            this->ring->control().release(idx);
-            if (std::getenv("LSFGVK_RING_DBG")) {
-                std::fprintf(stderr,
-                    "lsfg-vk: ring slot %u still busy, skipping frame seq=%llu\n",
-                    idx, (unsigned long long)seq);
-                std::fflush(stderr);
-            }
-            const VkPresentInfoKHR fwd{
-            .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-            .pNext = next_chain,
-            .waitSemaphoreCount = static_cast<uint32_t>(semaphores.size()),
-            .pWaitSemaphores = semaphores.empty() ? nullptr : semaphores.data(),
-            .swapchainCount = 1,
-            .pSwapchains = &swapchain,
-            .pImageIndices = &imageIdx,
-        };
-        const auto r = vk.df().QueuePresentKHR(queue, &fwd);
-        if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
-            throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
-        return r;
-        }
-        fence.reset(*this->copyVk);
-        auto& cb = *this->copyCbs.at(idx);
-        cb.begin(cvk);
-        const uint32_t w = this->info.extent.width;
-        const uint32_t h = this->info.extent.height;
-        const vk::Image& dst = this->copySlotImages.at(idx);
-        VkImageMemoryBarrier toDst = barrierHelper(dst.handle(),
-            VK_ACCESS_NONE, VK_ACCESS_TRANSFER_WRITE_BIT,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        cvk.df().CmdPipelineBarrier(cb.raw(),
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toDst);
-        const VkImageCopy region{
-            .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-            .extent = { w, h, 1 }
-        };
-        cvk.df().CmdCopyImage(cb.raw(),
-            srcImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            dst.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-        VkImageMemoryBarrier done = barrierHelper(dst.handle(),
-            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_MEMORY_READ_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        cvk.df().CmdPipelineBarrier(cb.raw(),
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &done);
-        cb.end(cvk);
-        cb.submit(cvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
-            fence.handle());
-        // Publish to the control block with release ordering; the doubler sees
-        // the metadata before Complete.
-        this->ring->control().publishComplete(idx, seq, 0,
-            this->info.extent.width, this->info.extent.height,
-            static_cast<std::uint32_t>(this->info.format));
-        if (std::getenv("LSFGVK_RING_DBG")) {
-            std::fprintf(stderr,
-                "lsfg-vk: ring published seq=%llu slot=%u (no CPU copy, no wait on the doubler)\n",
-                (unsigned long long)seq, idx);
-            std::fflush(stderr);
-        }
-        /* Forward the game's present so the render side keeps running, and do
-           it the way the working staging tail does: pNext null and ZERO wait
-           semaphores.
-
-           Passing next_chain through hands the caller's
-           VkSwapchainPresentFenceInfoKHR to this present, so the present fences
-           are consumed here and the caller's isolated deferred work never gets
-           to signal them. The game then waits on a recycle fence that is never
-           signalled and stops presenting after exactly one frame - which is
-           what we measured. With pNext null the fences stay untouched and the
-           caller handles them, and the semaphores were already consumed by the
-           copy submit above. */
-        {
-            const VkPresentInfoKHR ringFwd{
-                .sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR,
-                .pNext = nullptr,
-                .waitSemaphoreCount = 0,
-                .pWaitSemaphores = nullptr,
-                .swapchainCount = 1,
-                .pSwapchains = &swapchain,
-                .pImageIndices = &imageIdx,
-            };
-            /* Test the REAL isolated predicate, not LSFGVK_EXPORT_ISOLATED:
-               that env var is not set by any profile, so testing it made this
-               guard permanently false and the faulting scanout still ran. */
-            if (isIsolated(swapchain)) {
-                /* The isolated swapchain has no scanout: presenting to it
-                   faults inside radv. Its images are only a staging point for
-                   our copy, so there is nothing to scan out and nothing to wait
-                   on. Report success so the game's present fences do not latch,
-                   and let the caller's deferred work own the recycle fences.
-                     core: #0 libvulkan_radeon.so
-                            #1 CaptureContext::present
-                            #2 myvkQueuePresentKHR                     */
-                return VK_SUCCESS;
-            }
-            const auto r = vk.df().QueuePresentKHR(queue, &ringFwd);
-            if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR)
-                throw ls::vulkan_error(r, "vkQueuePresentKHR() failed (ring)");
-            return r;
-        }
-    }
-
     // record blit info.images[imageIdx] -> staging[slot] waiting on game's
     // present wait-semaphores, signal slot's capture semaphore
     const auto& cmdbuf = this->captureCommandBuffers.at(ringIdx);
     cmdbuf.begin(vk);
     static const bool emptyFrame = std::getenv("LSFGVK_EMPTY_FRAME")
         && std::getenv("LSFGVK_EMPTY_FRAME")[0] == '1';
-    if (!emptyFrame && !exportIsolatedOn() && this->udmaBufs.at(slot)) {
-        const uint32_t w = this->info.extent.width;
-        const uint32_t h = this->info.extent.height;
-        VkImageMemoryBarrier toSrc = barrierHelper(srcImage,
-            VK_ACCESS_NONE, VK_ACCESS_TRANSFER_READ_BIT,
-            dummySrc ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        vk.df().CmdPipelineBarrier(cmdbuf.raw(),
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &toSrc);
-        armUdmaByteRef(vk, this->info.extent);
-        auto& pref = udmaByteRef();
-        const bool usePattern = pref.armed && pref.img != nullptr;
-        if (usePattern) {
-            barrierPatternSrc(vk, cmdbuf.raw(), pref.img->handle());
-            VkImageMemoryBarrier toDst = barrierHelper(srcImage,
-                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            vk.df().CmdPipelineBarrier(cmdbuf.raw(),
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &toDst);
-            const VkImageCopy fill{
-                .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-                .extent = { w, h, 1 }
-            };
-            vk.df().CmdCopyImage(cmdbuf.raw(),
-                pref.img->handle(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                srcImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &fill);
-            VkImageMemoryBarrier filled = barrierHelper(srcImage,
-                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-            vk.df().CmdPipelineBarrier(cmdbuf.raw(),
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0, 0, nullptr, 0, nullptr, 1, &filled);
-            std::cerr << "lsfg-vk: pattern copied into swapchain image;"
-                << " copyImageToBuffer reads srcImage slot=" << slot << "\n";
-        }
-        const VkBufferImageCopy region{
-            .bufferOffset = 0,
-            .bufferRowLength = w,
-            .bufferImageHeight = h,
-            .imageSubresource = {
-                .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                .layerCount = 1
-            },
-            .imageExtent = { w, h, 1 }
-        };
-        vk.df().CmdCopyImageToBuffer(cmdbuf.raw(), srcImage,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            this->udmaBufs.at(slot)->handle(), 1, &region);
-        VkImageMemoryBarrier back = barrierHelper(srcImage,
-            VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_MEMORY_READ_BIT,
-            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-            dummySrc ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                     : VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
-        vk.df().CmdPipelineBarrier(cmdbuf.raw(),
-            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &back);
-        static uint32_t nUdmaCopy = 0;
-        if (nUdmaCopy < 8) {
-            ++nUdmaCopy;
-            std::cerr << "lsfg-vk: udmabuf copyImageToBuffer slot=" << slot << "\n";
-        }
-    } else if (!emptyFrame && !exportIsolatedOn()) {
+    if (!emptyFrame && !exportIsolatedOn()) {
     const vk::Image& dstImage = !this->hostImages.empty()
         ? this->hostImages.at(slot)
         : this->localImages.at(slot);
@@ -2179,40 +1341,6 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
         std::cerr << "lsfg-vk: external stream error: " << e.what() << "\n";
         throw ls::error(std::string("lsfg-vk: external stream error: export sync fd failed: ") + e.what(), e);
     }
-    if (slot < this->udmaBufs.size() && this->udmaBufs.at(slot))
-        finishUdmaByteRef(vk, syncFd, this->udmaMmapFds.at(slot),
-            this->info.extent.width, this->info.extent.height);
-    if (this->copyHop && syncFd >= 0) {
-        if (slot < this->shmMaps.size() && this->shmMaps.at(slot)
-                && this->hostPtrsA.at(slot) && this->hostAllocSize > 0) {
-            const int hopFd = ::dup(syncFd);
-            if (hopFd >= 0) {
-                this->copyHop->push(CopyHop::Job{
-                    this->hostPtrsA.at(slot),
-                    this->shmMaps.at(slot),
-                    static_cast<size_t>(this->hostAllocSize),
-                    hopFd,
-                    -1,
-                    -1,
-                    this->shmSeq.at(slot)
-                });
-            }
-        } else if (slot < this->rawMaps.size() && this->rawMaps.at(slot)
-                && this->destMaps.at(slot) && this->rawBytes > 0) {
-            const int hopFd = ::dup(syncFd);
-            if (hopFd >= 0) {
-                this->copyHop->push(CopyHop::Job{
-                    this->destMaps.at(slot),
-                    this->rawMaps.at(slot),
-                    static_cast<size_t>(this->rawBytes),
-                    hopFd,
-                    this->localExportFds.at(slot),
-                    this->rawReadyFds.at(slot),
-                    nullptr
-                });
-            }
-        }
-    }
 
     static const bool noFrame = std::getenv("LSFGVK_NO_FRAME")
         && std::getenv("LSFGVK_NO_FRAME")[0] == '1';
@@ -2227,13 +1355,7 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
     bool deferred = false;
     try {
         int sendFd = syncFd;
-        if (slot < this->udmaBufs.size() && this->udmaBufs.at(slot)) {
-            static bool loggedUdmaFrame = false;
-            if (!loggedUdmaFrame) {
-                loggedUdmaFrame = true;
-                std::cerr << "lsfg-vk: FRAME carries udmabuf sync_fd only (no image fd)\n";
-            }
-        } else if (exportIsolatedOn() && this->fake && isIsolated(swapchain)) {
+        if (exportIsolatedOn() && this->fake && isIsolated(swapchain)) {
             auto& iso = isolatedAt(swapchain);
             if (imageIdx < iso.exportFds.size() && iso.exportFds.at(imageIdx) >= 0) {
                 if (!this->dmaBufSent.at(slot)) {
@@ -2259,24 +1381,6 @@ VkResult CaptureContext::present(const vk::Vulkan& vk,
                         std::cerr << "lsfg-vk: FRAME carries isolated WRITE fence\n";
                     }
                 }
-            }
-        } else if (this->shmMaps.at(0)) {
-            // POSIX shm already has the pixels; keep the 9070 capture sync-fd
-        } else if (slot < this->rawExportFds.size()
-                && this->rawExportFds.at(slot) >= 0) {
-            if (!this->dmaBufSent.at(slot)) {
-                sendFd = ::dup(this->rawExportFds.at(slot));
-                if (sendFd < 0)
-                    sendFd = syncFd;
-                else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
-                this->dmaBufSent.at(slot) = true;
-                std::cerr << "lsfg-vk: FRAME carries raw dma-buf slot="
-                    << slot << " fd=" << sendFd << "\n";
-            } else if (this->rawReadyFds.at(slot) >= 0) {
-                sendFd = ::dup(this->rawReadyFds.at(slot));
-                if (sendFd < 0)
-                    sendFd = syncFd;
-                else if (syncFd >= 0) { ::close(syncFd); syncFd = -1; }
             }
         } else if (slot < this->bExportFds.size()
                 && this->bExportFds.at(slot) >= 0) {

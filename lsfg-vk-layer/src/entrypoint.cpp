@@ -955,13 +955,7 @@ namespace {
                     }
                     bool skipIpc = false;
                     try {
-                        /* The udmabuf ring owns the data path, so it must see
-                           EVERY present: skipping the first 16 at >=1440 would
-                           leave the ring unfed for its first 16 frames. Other
-                           transports keep the existing debug skip. */
-                        const bool ringPath = layer_info->root.activeTransport()
-                            == ls::Transport::UdmabufRing;
-                        if (isIsolated(swapchain) && !ringPath) {
+                        if (isIsolated(swapchain)) {
                             auto& iso = isolatedAt(swapchain);
                             if (iso.extent.height >= 1440 && iso.presentCount < 16) {
                                 skipIpc = true;
@@ -1006,14 +1000,18 @@ namespace {
                         PendingPresentWork work;
                         work.vk = &it->second.get();
                         work.height = iso.extent.height;
+                        /* Binary semaphores: the first waiter consumes the
+                           signal, so only one path may consume the present
+                           waits - a second waiter parks forever. */
+                        const bool consumeWaits = skipIpc;
                         if (iso.extent.height >= 1440) {
                             // Nested QueueSubmit during QueuePresent races
                             // vkd3d's QueueSubmit2. Defer dedicated work.
-                            if (skipIpc)
+                            if (consumeWaits)
                                 work.waits = waitSemaphores;
-                            if (skipIpc)
+                            if (consumeWaits)
                                 work.recycle = iso.recycleFences.at(idx).handle();
-                        } else if (skipIpc) {
+                        } else if (consumeWaits) {
                             isolatedSignal(it->second.get(), iso.signalQueue, iso.signalQueue,
                                 VK_NULL_HANDLE, iso.recycleFences.at(idx).handle());
                         }

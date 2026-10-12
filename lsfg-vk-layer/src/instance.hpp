@@ -36,14 +36,6 @@ namespace lsfgvk::layer {
                 && this->active_profile->presentation == ls::Presentation::External;
         }
 
-        /// transport of the active profile, or PosixShm when none is active.
-        /// The ring transport must see every present, so the present hook asks
-        /// this instead of guessing from the swapchain state.
-        [[nodiscard]] ls::Transport activeTransport() const {
-            return this->active_profile.has_value()
-                ? this->active_profile->transport : ls::Transport::PosixShm;
-        }
-
         /// ensure the layer is up-to-date
         /// @return true if the configuration was updated
         bool update();

@@ -426,7 +426,7 @@ int main(int argc, char** argv) {
                   << " (processing on '" << devName << "')\n";
 
         // --- accept loop ---------------------------------------------------
-        // registry of live streams keyed by accepted connection fd. each entry
+        // registry of live streams keyed by a unique stream key (never an fd). each entry
         // owns its staging fds and closes them when the entry is erased below.
         // THREADED: a game (e.g. re2 windowed->fullscreen) can open a SECOND
         // layer connection while the first stream is still live; a synchronous
@@ -434,9 +434,18 @@ int main(int argc, char** argv) {
         // layer's handshake deadline fires and the game crashes. one detached
         // thread per connection; the registry entry lives for the thread's
         // duration and is erased by the thread itself.
-        std::map<int, ls::ipc::StreamState> streams;
+        /* Keyed by a UNIQUE, never-reused stream key - NOT by the accepted
+           connection's fd number. fd numbers are recycled by the kernel the
+           moment a socket closes, so keying by fd made identities collide:
+           stream A ends, the kernel hands its fd number to a new connection B,
+           A's thread then erases B's entry (deleting LIVE state), and the
+           "already present" branch dropped and closed B's live socket. That is
+           the measured send()/setsockopt(SO_RCVTIMEO) EBADF on the ipc socket,
+           the failing staging mmap, and "dropped stream on fd 9". */
+        std::map<std::uint64_t, ls::ipc::StreamState> streams;
         std::mutex streamsMtx;
         std::condition_variable streamsCv;  // signaled when a stream ends
+        std::uint64_t nextStreamKey{1};     // monotonic; a key is never reused
         /* A swapchain recreate opens a NEW connection while the old one is
            still live. Both would drive the one overlay card. Retire the older
            stream on the same device by shutting down its socket, which makes
@@ -451,7 +460,7 @@ int main(int argc, char** argv) {
                    destroyed before it existed. Nothing survived the switch.
                    Retirement is now driven by the layer's close message. */
                 std::lock_guard<std::mutex> lk(streamsMtx);
-                for (const auto& [fd, st] : streams)
+                for (const auto& [k, st] : streams)
                     if (st.streamId == newId)
                         ls::hud::traceLine("stream-adopt", newId, "owner=1");
             });
@@ -488,15 +497,18 @@ int main(int argc, char** argv) {
                 auto conn = listener.accept();
                 LSFG_FRAME_DBG("accept returned");
 
-                const int key = conn.fd();
+                const int connFd = conn.fd();          // logging only
+                /* A fresh key per accepted connection. The old code keyed by
+                   connFd and dropped the connection when the number was already
+                   present - but a number can only be "already present" because
+                   an entry went stale, so that branch threw away a LIVE socket. */
+                const std::uint64_t key = nextStreamKey++;
                 {
                     std::lock_guard<std::mutex> lk(streamsMtx);
-                    if (streams.count(key)) {
-                        std::cerr << "lsfg-vk-app: dropped stream on fd " << key << "\n";
-                        continue;
-                    }
                     streams.emplace(key, ls::ipc::StreamState{});
                 }
+                LSFG_FRAME_DBG("accepted stream key=%llu fd=%d",
+                    (unsigned long long)key, connFd);
                 auto connPtr = std::make_unique<ls::ipc::Connection>(std::move(conn));
                 auto thread = std::thread(
                     [connPtr = std::move(connPtr), key, &streams, &streamsMtx, &streamsCv,

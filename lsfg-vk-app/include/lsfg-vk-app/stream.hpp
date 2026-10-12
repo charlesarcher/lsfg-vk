@@ -5,7 +5,6 @@
 #include "lsfg-vk-backend/lsfgvk.hpp"
 #include "lsfg-vk-common/configuration/config.hpp"
 #include "lsfg-vk-common/helpers/pointers.hpp"
-#include "lsfg-vk-common/ipc/control_block.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
@@ -46,51 +45,9 @@ namespace ls::ipc {
         /// 9070-owned capture images imported on B for the snapshot only.
         std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> aImports{};
         /// Offload DMA-in device (no gfx). 9070 share is imported here only.
-        std::unique_ptr<vk::Vulkan> dmaVk;
-        std::array<std::optional<vk::CommandBuffer>, STAGING_RING_DEPTH> dmaCbs{};
-        std::array<std::optional<vk::Fence>, STAGING_RING_DEPTH> dmaFences{};
-        std::array<std::optional<vk::Image>, STAGING_RING_DEPTH> dmaSrc{};
-        std::array<std::optional<vk::Image>, STAGING_RING_DEPTH> dmaDst{};
-        std::array<int, STAGING_RING_DEPTH> dmaDstFds{};
         uint32_t rowPitch{0};
-        /// POSIX memfd maps (not Vulkan). Layer memcpy capture here; we memcpy
-        /// into hostPtrs (9060 malloc import) then GPU-copy to genSources.
-        std::array<void*, STAGING_RING_DEPTH> shmMaps{};
-        std::array<void*, STAGING_RING_DEPTH> hostPtrs{};
-        /// udmabuf dma-buf fd per slot (hostBounce only). The layer still
-        /// receives the plain memfd and DMAs into it; this is the SAME
-        /// physical pages seen from our own device, so the app can DMA out
-        /// without a CPU copy. -1 when unused.
-        std::array<int, STAGING_RING_DEPTH> udmaFds{};
-        /// the same udmabuf imported on OUR device as a plain VkBuffer, one
-        /// per slot. This is the udmabuf transport's middle hop: the render
-        /// card DMAs into it with vkCmdCopyImageToBuffer and we DMA out with
-        /// vkCmdCopyBufferToImage, both on a transfer-only family. A buffer
-        /// rather than an image because a dma-buf backed linear image import
-        /// is not usable on this driver, and because a buffer has no modifier
-        /// or pitch for the two GPUs to disagree about.
-        std::array<std::optional<vk::Buffer>, STAGING_RING_DEPTH> udmaBufs{};
-        std::array<ls::lazy<vk::Image>, STAGING_RING_DEPTH> hostImages{};
-        std::array<void*, STAGING_RING_DEPTH> dmaMaps{};
         std::array<int, STAGING_RING_DEPTH> dmaFds{};
-        // --- udmabuf ring (Transport::UdmabufRing) ---
-        // The RENDER side owns every buffer; these are what it handed us.
-        // ringSlots may be larger than STAGING_RING_DEPTH, so the fds live in
-        // a vector; K comes from the profile, not from the compile-time depth.
-        std::vector<int> ringSlotFds;
-        std::unique_ptr<ls::ipc::ControlBlock> ring;
-        /// each slot's udmabuf imported on OUR card as a dma-buf image, so the
-        /// pixels move by GPU DMA (vkCmdCopyImageToImage) and never touch the
-        /// CPU. Indexed by slot, so sized by K.
-        std::vector<std::optional<vk::Image>> ringSlotImages;
-        void* ringCtrlMap{nullptr};
-        size_t ringCtrlBytes{0};
-        int ringCtrlFd{-1};
-        uint32_t ringSlotCount{0};
 
-        std::array<uint32_t*, STAGING_RING_DEPTH> shmSeq{};
-        std::array<uint32_t, STAGING_RING_DEPTH> shmSeen{};
-        size_t shmBytes{0};
 
         /// the (multiplier-1) B-local destination images, created natively on this
         /// device and self-exported to become the backend's destination
@@ -131,7 +88,7 @@ namespace ls::ipc {
         VkFormat captureFormat{VK_FORMAT_R8G8B8A8_UNORM};
         /// the negotiated transport for this stream, so the consume path knows
         /// which ring (if any) to consume without re-reading the config
-        ls::Transport transport{ls::Transport::PosixShm};
+        ls::Transport transport{ls::Transport::DecoupledDma};
         /// motion-flow factor handed to openContext (1/flow_scale)
         float flow{1.0F};
         /// performance-mode flag handed to openContext
@@ -139,7 +96,7 @@ namespace ls::ipc {
 
         // move-only: user-declared move ops keep std::map<int,StreamState>
         // emplace/erase by value working (copy stays implicitly deleted).
-        StreamState() { dmaFds.fill(-1); dmaDstFds.fill(-1); udmaFds.fill(-1); }
+        StreamState() { dmaFds.fill(-1); }
         ~StreamState();
         StreamState(StreamState&&) = default;
         StreamState& operator=(StreamState&&) = default;

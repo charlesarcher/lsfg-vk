@@ -6,7 +6,6 @@
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/ipc/latency_ledger.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
-#include "lsfg-vk-common/ipc/udmabuf_ring.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
@@ -31,7 +30,6 @@
 namespace lsfgvk::layer {
 
     struct SwapchainInfo;
-    struct CopyHop;
 
     /// capture context for external presentation (one-way dual-GPU).
     /// imports the two app-owned staging images (the app creates them in its
@@ -60,6 +58,7 @@ namespace lsfgvk::layer {
         /// teardown: bounded fence wait (150 ms) draining in-flight capture
         /// work before destroying semaphores/images
         ~CaptureContext();
+
 
         /// Tell the app this stream's swapchain is gone, so it retires THIS
         /// stream and no other. Sent from the layer's vkDestroySwapchainKHR.
@@ -104,32 +103,18 @@ namespace lsfgvk::layer {
 
         // vulkan objects (created on the game device)
         std::vector<vk::Image> localImages;   // 9070-owned capture dest; dma-buf exported on FRAME
-        // App-created udmabuf, imported here as a VkBuffer. FRAME then carries
-        // the capture semaphore's sync-fd only, not an image fd. udmaMmapFds
-        // is a dup kept for the one-shot byte check; Vulkan consumes the import.
-        std::array<std::optional<vk::Buffer>, ls::ipc::STAGING_RING_DEPTH> udmaBufs{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> udmaMmapFds{};
         std::vector<vk::Image> hostImages;    // LINEAR images bound to host memory
-        std::unique_ptr<vk::Vulkan> bVk;      // same-process 9060 device (LSFGVK_DUAL_HOST)
+        std::unique_ptr<vk::Vulkan> bVk;      // second device in this process (render card)
         std::vector<vk::Image> bHostImages;   // 9060 import of a separate malloc
         std::vector<vk::Image> bVramImages;   // 9060-local dma-buf export dest
         std::array<void*, ls::ipc::STAGING_RING_DEPTH> hostPtrsA{};
         std::array<void*, ls::ipc::STAGING_RING_DEPTH> hostPtrsB{};
-        std::array<void*, ls::ipc::STAGING_RING_DEPTH> shmMaps{};
-        std::array<uint32_t*, ls::ipc::STAGING_RING_DEPTH> shmSeq{};
-        std::unique_ptr<CopyHop> copyHop;
         VkDeviceSize hostAllocSize{0};
         std::array<int, ls::ipc::STAGING_RING_DEPTH> bExportFds{};
         std::vector<vk::CommandBuffer> bCbs;
         std::vector<vk::Fence> bFences;
         vk::ImageLayout exchangeLayout{};     // negotiated LINEAR/DRM layout for localImages
         std::array<int, ls::ipc::STAGING_RING_DEPTH> localExportFds{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawExportFds{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawMemFds{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawReadyFds{};
-        std::array<void*, ls::ipc::STAGING_RING_DEPTH> destMaps{};
-        std::array<void*, ls::ipc::STAGING_RING_DEPTH> rawMaps{};
-        VkDeviceSize rawBytes{0};
         lsfgvk::ledger::LayerSink ledger;   // click→photon probe anchor (env-gated)
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> dmaBufSent{};
         bool localCopyOnly{false};
@@ -154,23 +139,6 @@ namespace lsfgvk::layer {
 
         // IPC stream (STAGING_RING_DEPTH slots, maps to the backend's sources)
         std::optional<ls::ipc::Connection> ipcConn;
-        /// udmabuf ring, owned by the RENDER side (Transport::UdmabufRing).
-        /// Null in every other transport, so udmabuf_ring is a new path that
-        /// leaves DecoupledDma and Udmabuf untouched.
-        std::unique_ptr<ls::ipc::UdmabufRing> ring;
-        /// COPY-ONLY VkDevice on the render card (Transport::UdmabufRing).
-        /// The ring slots are imported HERE, not on the game's device, so they
-        /// never enter the game device's global BO list
-        /// (radv_amdgpu_bo.c:1224 -> radv_amdgpu_cs.c:902) and the game's
-        /// submits stop carrying them. That list is per VkDevice
-        /// (radv_CreateDevice -> radv_create_winsys), so a private device on
-        /// the same card has an empty one.
-        std::unique_ptr<vk::Vulkan> copyVk;
-        std::vector<vk::Image> copySlotImages;
-        std::vector<ls::lazy<vk::CommandBuffer>> copyCbs;
-        std::vector<ls::lazy<vk::Fence>> copyFences;
-        /// monotonically increasing frame sequence published to the ring
-        std::atomic<std::uint64_t> ringSeq{0};
 
         // slot ring state
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> slotFree{};

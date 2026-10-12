@@ -53,10 +53,6 @@ namespace ls::ipc {
         /// a second connection from the same device is not evidence that the
         /// first one is dead.
         Close = 8,
-        /// A→C ring geometry, then K RingSlotFd, then RingCtrl
-        RingSetup = 9,
-        RingSlotFd = 10,
-        RingCtrl = 11
     };
 
     /// human-readable name of a message type, for error messages
@@ -69,9 +65,6 @@ namespace ls::ipc {
             case MsgType::Ready: return "READY";
             case MsgType::Frame: return "FRAME";
             case MsgType::Release: return "RELEASE";
-            case MsgType::RingSetup: return "RING_SETUP";
-            case MsgType::RingSlotFd: return "RING_SLOT";
-            case MsgType::RingCtrl: return "RING_CTRL";
             case MsgType::Close: return "CLOSE";
         }
         return "<unknown>";
@@ -154,33 +147,11 @@ namespace ls::ipc {
     /// only the stream that receives it. Sent from vkDestroySwapchainKHR.
     struct Close { };
 
-    /// A→C ring geometry, sent once during the handshake, before any ring fd.
-    /// Carries no fd itself; it tells the app how many RingSlotFd and one
-    /// RingCtrl message to expect.
-    struct RingSetup {
-        /// number of slots in the ring (K)
-        uint32_t slotCount{0};
-        /// payload bytes per slot
-        uint64_t slotBytes{0};
-    };
 
-    /// A→C one udmabuf slot. Carries exactly one fd via SCM_RIGHTS, like
-    /// Staging does. Sent slotCount times, in slot order, after RingSetup.
-    struct RingSlotFd {
-        /// index of this slot within the ring
-        uint32_t slotIdx{0};
-    };
-
-    /// A→C the shared control block for the ring. Carries exactly one fd via
-    /// SCM_RIGHTS. Sent last, so the app has every slot fd before it can map
-    /// the block and start consuming.
-    struct RingCtrl { };
-
-    /// any protocol message; STAGING/FRAME/RING_SLOT/RING_CTRL additionally
-    /// carry one fd each, managed by the Connection (see socket.hpp), never
-    /// inside the payload
+    /// any protocol message; STAGING and FRAME additionally carry one fd each,
+    /// managed by the Connection (see socket.hpp), never inside the payload
     using Message = std::variant<Hello, Negotiated, ErrorMsg, Staging, Ready, Frame,
-        Release, Close, RingSetup, RingSlotFd, RingCtrl>;
+        Release, Close>;
 
     /// message type associated with a concrete message struct
     template<typename T>
@@ -193,9 +164,6 @@ namespace ls::ipc {
         else if constexpr (std::is_same_v<T, Frame>) return MsgType::Frame;
         else if constexpr (std::is_same_v<T, Release>) return MsgType::Release;
         else if constexpr (std::is_same_v<T, Close>) return MsgType::Close;
-        else if constexpr (std::is_same_v<T, RingSetup>) return MsgType::RingSetup;
-        else if constexpr (std::is_same_v<T, RingSlotFd>) return MsgType::RingSlotFd;
-        else if constexpr (std::is_same_v<T, RingCtrl>) return MsgType::RingCtrl;
         else static_assert(!sizeof(T), "not a protocol message type");
     }
 
@@ -204,8 +172,7 @@ namespace ls::ipc {
 
     /// whether a message of this type carries exactly one SCM_RIGHTS fd
     constexpr bool carriesFd(MsgType type) {
-        return type == MsgType::Staging || type == MsgType::Frame
-            || type == MsgType::RingSlotFd || type == MsgType::RingCtrl;
+        return type == MsgType::Staging || type == MsgType::Frame;
     }
 
     /// build a Hello with the device name safely truncated + NUL-padded

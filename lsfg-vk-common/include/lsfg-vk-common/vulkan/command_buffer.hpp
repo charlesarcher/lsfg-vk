@@ -101,8 +101,6 @@ namespace vk {
 
         /// copy a buffer into an image with an EXPLICIT row layout
         ///
-        /// The udmabuf transport moves frames through system memory as a
-        /// buffer, so the row layout has to be stated rather than inferred:
         /// bufferRowLength is in TEXELS, not bytes, and getting that wrong
         /// produces plausible-looking garbage rather than an error.
         ///
@@ -117,8 +115,6 @@ namespace vk {
             uint32_t width, uint32_t height) const;
 
         /// copy an image into a buffer with an EXPLICIT row layout
-        ///
-        /// The render-side half of the udmabuf transport.
         /// @param vk the vulkan instance
         /// @param image the source image
         /// @param buffer the destination buffer

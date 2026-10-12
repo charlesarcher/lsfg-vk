@@ -34,14 +34,11 @@ namespace vk {
 
         /// import a dma-buf fd as a buffer
         ///
-        /// This is the form the udmabuf transport needs. A dma-buf backed
-        /// LINEAR IMAGE import is not usable on this driver: queried correctly
-        /// (VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT with
+        /// A dma-buf backed LINEAR IMAGE import is not usable on this driver:
+        /// queried correctly (VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT with
         /// DRM_FORMAT_MOD_LINEAR) every format comes back with
-        /// compatibleHandleTypes == 0. A buffer import of the same udmabuf is
-        /// clean at 14.06 MiB, 200 iterations, both legs
-        /// (tools/testing/udmabuf_transport_probe.cpp), and a buffer has no
-        /// modifier or pitch for the two GPUs to disagree about.
+        /// compatibleHandleTypes == 0. A buffer import has no modifier or
+        /// pitch for the two GPUs to disagree about.
         ///
         /// Note there is deliberately no VkMemoryDedicatedAllocateInfo here:
         /// dedicated imports are an image feature, and chaining one onto a
@@ -57,11 +54,6 @@ namespace vk {
                                      | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
         /// get the buffer size in bytes
-        ///
-        /// The udmabuf transport asserts on this at context-open: a buffer
-        /// that is not exactly the staging slot's size means the two ends
-        /// disagree about the transfer, and the copy reads or writes past the
-        /// end rather than failing.
         /// @return the buffer size in bytes
         [[nodiscard]] size_t byteSize() const { return this->size; }
 
