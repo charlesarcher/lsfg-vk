@@ -20,13 +20,8 @@ using namespace ls;
 
 void ls::resolveUnsetTransport(GameConf& conf,
         std::string_view localDevice, std::string_view otherDevice) {
-    if (conf.transportExplicit) {
-        if (conf.transport == Transport::Udmabuf) {
-            std::cerr << "lsfg-vk: warning: transport=udmabuf puts the shared "
-                "buffer on the game's submits and stalls about 30 ms under load\n";
-        }
+    if (conf.transportExplicit)
         return;
-    }
     if (conf.presentation != Presentation::External)
         return;
     if (localDevice.empty() || otherDevice.empty() || localDevice == otherDevice)
@@ -52,9 +47,7 @@ void ConfigFile::createDefaultConfigFile(const std::filesystem::path& path) {
 # dll = '/media/games/Lossless Scaling/Lossless.dll' # if you don't have LS in the default location
 allow_fp16 = true # this will improve give a MASSIVE performance boost on AMD, but be super slow on older (!) NVIDIA GPUs
 # transport is omitted. When presentation is external and the game GPU
-# differs from gpu, decoupled is selected. udmabuf is an explicit opt-in
-# that puts the shared buffer on the game's submits and stalls about 30 ms
-# under load.
+# differs from gpu, decoupled is selected - it is the only transport.
 
 [[profile]]
 name = "4x FG / 85% [Performance]"
@@ -140,18 +133,11 @@ namespace {
     }
     /// parse a transport mode from string
     Transport transportFromString(const std::string& str) {
-        if (str == "shm" || str == "posix_shm")
-            return Transport::PosixShm;
-        if (str == "dmabuf" || str == "dma" || str == "dma_buf")
-            return Transport::DmaBuf;
-        if (str == "udmabuf" || str == "udma" || str == "bounce")
-            return Transport::Udmabuf;
         if (str == "decoupled" || str == "decoupled_dma")
             return Transport::DecoupledDma;
-        if (str == "udmabuf_ring" || str == "ring" || str == "udmabuf-ring")
-            return Transport::UdmabufRing;
         throw ls::error("unknown transport mode: " + str
-            + " (allowed values: 'shm', 'dmabuf', 'decoupled', 'udmabuf', 'udmabuf_ring')");
+            + " (the posix_shm, dmabuf, udmabuf and udmabuf_ring transports"
+            " were removed; the only value is \"decoupled\")");
     }
     /// parse the global configuration
     GlobalConf parseGlobalConf(const toml::table& tbl) {
@@ -182,7 +168,6 @@ namespace {
             .output = tbl["output"].value<std::string>(),
             .transport = transportFromString(transportExplicit
                 ? *tbl["transport"].value<std::string>() : "shm"),
-            .ringSlots = tbl["ring_slots"].value_or(3u),
             .transportExplicit = transportExplicit,
             .socket_path = tbl["socket"].value<std::string>(),
             .fake_swapchain = tbl["fake_swapchain"].value_or(false),
@@ -371,6 +356,20 @@ std::filesystem::path ls::findConfigurationFile() {
     const char* envPath = std::getenv("LSFGVK_CONFIG");
     if (envPath && *envPath != '\0')
         return{envPath};
+
+    // then LSFG_CONFIG_NAME as a file next to the launch script's profiles
+    const char* cfgName = std::getenv("LSFG_CONFIG_NAME");
+    if (cfgName && *cfgName != '\0') {
+        const char* profHome = std::getenv("LSFG_PROFILE_ROOT");
+        if (profHome && *profHome != '\0') {
+            std::filesystem::path p = std::filesystem::path(profHome) / cfgName;
+            if (std::filesystem::exists(p))
+                return p;
+            throw ls::error("LSFG_CONFIG_NAME='" + std::string(cfgName)
+                + "' not found under LSFG_PROFILE_ROOT='"
+                + std::string(profHome) + "'");
+        }
+    }
 
     // then check the XDG overriden location
     const char* xdgPath = std::getenv("XDG_CONFIG_HOME");

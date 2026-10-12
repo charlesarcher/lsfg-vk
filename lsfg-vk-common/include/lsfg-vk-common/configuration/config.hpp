@@ -40,42 +40,11 @@ namespace ls {
 
     /// transport mode for cross-device one-way external presentation
     enum class Transport : uint8_t {
-        /// POSIX shared memory CPU copy (CopyHop pixel walk, ~2-6ms latency)
-        PosixShm,
-        /// DRM PRIME DMA-BUF zero-copy export (parks on implicit-sync ~30ms)
-        DmaBuf,
-        /// Host-buffer bounce: render GPU DMAs into a shared buffer both
-        /// processes have mapped, the app's GPU DMAs out of that same mapping
-        /// into the backend's source image. No p2p and no CPU frame copy - the
-        /// CPU only moves readiness. This is the path for platforms that do NOT
-        /// support cross-GPU import (e.g. kennykiller, where importing the
-        /// render card's dma-buf into the doubler GPUVM faults with
-        /// MAPPING_ERROR even though pcie_p2p is enabled module-wide).
-        /// The enum value keeps its historical name; the old "decoupled
-        /// dual-host" implementation was gated on the isolated/fake swapchain
-        /// and never ran in the external one-way path.
+        /// The render GPU DMAs the frame into memory the doubler imports as a
+        /// source image, so neither GPU waits on the other's submits and no CPU
+        /// ever touches a pixel. The posix_shm, dmabuf, udmabuf and ring
+        /// transports were removed on 2026-10-12.
         DecoupledDma,
-        /// udmabuf bounce. The shared slot is one udmabuf in system memory,
-        /// imported by BOTH GPUs as a plain VkBuffer. The render side DMAs
-        /// with vkCmdCopyImageToBuffer, the app side with
-        /// vkCmdCopyBufferToImage, both on a transfer-only family with
-        /// bufferRowLength/bufferImageHeight set explicitly.
-        ///
-        /// This is the kennykiller path and it is proven: 200 iterations at
-        /// 2560x1440 across both legs, no p2p and no CPU frame copy
-        /// (tools/testing/udmabuf_transport_probe.cpp). The buffer hop is
-        /// deliberate - a dma-buf backed LINEAR IMAGE import queries back
-        /// with compatibleHandleTypes==0 on this driver, and a buffer has no
-        /// modifier or pitch for the two GPUs to disagree about. DmaBuf
-        /// (p2p) is unchanged and still selected by transport="dmabuf".
-        Udmabuf,
-        /// Ring of K kernel udmabufs, created by the RENDER side, imported as
-        /// dma-bufs on each card. Only GPU DMA copies move pixels: no malloc,
-        /// no posix_memalign, no VK_EXT_external_memory_host, no CPU frame
-        /// copy. The hand-off is a shared control block (sequence + state per
-        /// slot) rather than a cross-process wait, so neither side ever blocks
-        /// on the other. K comes from `ringSlots`, default 3.
-        UdmabufRing
     };
 
     /// game profile configuration
@@ -99,11 +68,9 @@ namespace ls {
         /// optional output name for external presentation
         std::optional<std::string> output;
         /// transport mode for one-way external presentation
-        ls::Transport transport{ls::Transport::PosixShm};
+        ls::Transport transport{ls::Transport::DecoupledDma};
         /// false when the profile did not set transport. Cross-GPU then
         /// selects decoupled. udmabuf is never the default.
-        /// number of slots in the udmabuf ring (Transport::UdmabufRing only)
-        std::uint32_t ringSlots{3};
         bool transportExplicit{false};
         /// custom IPC socket path override
         std::optional<std::string> socket_path;

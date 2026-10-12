@@ -420,13 +420,6 @@ namespace lsfgvk::gui {
             ImGui::Separator();
             ImGui::Spacing();
 
-            const char* transports[] = {
-                "Decoupled (cross-GPU default when transport is unset)",
-                "POSIX SHM (explicit CPU copy)",
-                "udmabuf (explicit opt-in: stalls about 30 ms under load)"
-            };
-            ImGui::Combo("Transport", &g_guiState.transportMode, transports, IM_ARRAYSIZE(transports));
-
             const char* presentations[] = { "Internal (Single GPU)", "External (One-Way Dual-GPU app)" };
             ImGui::Combo("Presentation", &g_guiState.presentationMode, presentations, IM_ARRAYSIZE(presentations));
 
