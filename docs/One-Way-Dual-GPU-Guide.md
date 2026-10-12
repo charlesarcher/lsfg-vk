@@ -201,6 +201,20 @@ authoritative check of what actually got selected:
 lsfg-vk: dual-host game=AMD Radeon RX 9070 XT (RADV GFX1201) render=AMD Radeon RX 9060 XT (RADV GFX1200)
 ```
 
+Where the key is actually consumed, if you need to debug a selection:
+
+- `lsfg-vk-common/src/configuration/config.cpp:162` reads `gpu`; `:184` rejects
+  `presentation = "external"` with *"external presentation requires 'gpu' to select
+  the processing device"*; `:223` lets `LSFGVK_GPU` override it.
+- `lsfg-vk-app/src/main.cpp:310-375` turns it into the app's processing device
+  (instance, then physical device) — this is the card that presents.
+- `lsfg-vk-layer/src/instance.cpp:176-178` keys the layer's own device on it.
+- `lsfg-vk-layer/src/capture_context.cpp:558-587` picks the *second* device for the
+  decoupled path: it excludes the game's own device by name plus vendor:device, then
+  takes the one `gpu` names (or any other device when `gpu` is unset), and prints the
+  `dual-host game=… render=…` line above. Until this was written it accepted only
+  `deviceID == 0x7590`, so no other render card could be selected at all.
+
 ### Measured on this machine (2026-10-12)
 
 `DP-7` (2560×1440 @ 239.88 Hz) is on `87:00.0` = **RX 9060 XT**; the iGPU
