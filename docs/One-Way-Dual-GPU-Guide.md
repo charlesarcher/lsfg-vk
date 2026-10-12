@@ -183,6 +183,90 @@ for o in /sys/class/drm/card*-*; do
 done
 ```
 
+## Choosing the two cards
+
+Two roles, chosen by two different means. Getting this backwards is the single
+most common reason a pair "does not double":
+
+| Role | What it does | How you pick it |
+|---|---|---|
+| **game card** | renders the game; the layer captures its presents | from the *game* side: `MESA_VK_DEVICE_SELECT=<vendor:device>` for any Vulkan game, `--gpu-index N`/`--gpu_number N` for the benchmarks, or nothing (then it is the loader's first device) |
+| **render card** (a.k.a. doubler) | imports each captured frame, runs generation, presents | the `gpu` key, and it must be **the same value in both profiles** (the game profile and `app-oneway`) |
+
+`gpu` accepts the exact `deviceName`, an uppercase `0xVVVV:0xDDDD` id, or a PCI
+bus id. Whatever you chose is reported by the layer, and that line is the
+authoritative check of what actually got selected:
+
+```
+lsfg-vk: dual-host game=AMD Radeon RX 9070 XT (RADV GFX1201) render=AMD Radeon RX 9060 XT (RADV GFX1200)
+```
+
+### Measured on this machine (2026-10-12)
+
+`DP-7` (2560×1440 @ 239.88 Hz) is on `87:00.0` = **RX 9060 XT**; the iGPU
+(`00:02.0`) has no connected output. Each row is one FurMark Vulkan run of ~60 s.
+
+There are two `gen`/`real` counters and they answer different questions, so both
+are tabulated: **captured** is what the game rendered and the layer forwarded
+(`LSFGVK-BENCH` in the game's log), **presented** is what the doubler put on
+screen (`present-count kind=gen|real` in the app's log). `gen == real` on either
+side is *exact* doubling — one generated frame per real frame. The gap between the
+two columns is the render card falling behind.
+
+| game card | render card | settings | game fps | captured pairs | presented pairs | presented fps | on-screen HUD |
+|---|---|---|---|---|---|---|---|
+| RX 9070 XT | RX 9060 XT (has the panel) | 1440p MSAA 4 | 132.0 | 7922 | 7906 | 263.5 | `game fps 132`, `doubled fps 264 (2x)` |
+| RX 9060 XT | RX 9070 XT (no panel) | 1440p MSAA 4 | 35.1 | 2107 | 2091 | 69.7 | `game fps 34`, `doubled fps 72 (2x)` |
+| RX 9070 XT | Intel iGPU (no panel) | 1080p MSAA 2 | 321.5 | 19284 | 318 | 10.6 | `doubled fps 10 (2x)`, latency p50 1.1 s |
+| RX 9060 XT | Intel iGPU (no panel) | 1080p MSAA 2 | 152.8 | 9171 | 325 | 10.8 | `doubled fps 10 (2x)` |
+| Intel iGPU | RX 9060 XT | 720p MSAA 1 | — | — | 1 | — | game aborts (see below) |
+| Intel iGPU | RX 9070 XT | 720p MSAA 1 | — | — | 1 | — | game aborts (see below) |
+
+The rule the table gives you: **the game card caps how fast frames are made, the
+render card caps how fast they are shown — pick the pair so neither is the
+bottleneck, and put the panel on the render card.** Both Radeon cards work in
+either role; on the 263.5 fps row the panel can only scan out 240 of them, so the
+last ~10 % are vblank-discarded.
+
+Three consequences that the runs pin down:
+
+- **A render card without the monitor works, but you pay a copy every frame.**
+  The 9060-game/9070-render row presents on a card with nothing plugged into it,
+  so the compositor copies each presented frame to the 9060's output; its longest
+  inter-frame gap is 142.3 ms against the good pairing's 44.6 ms. Cable the panel
+  to the render card.
+- **A render card that cannot keep up does not stall the game — it shows fewer
+  frames, still exactly doubled.** With the iGPU as render card the game kept its
+  own 321.5 / 152.8 fps while the doubler managed ~11 fps of presents, because the
+  game-side layer sheds captures (`droppedCaptures`,
+  `lsfg-vk-layer/src/capture_context.cpp:1079,1113`) instead of making the game
+  wait on the 2-slot capture ring. What survives is still 1:1 (`gen == real`), so
+  the HUD reads `doubled fps 10 (2x)`, but the latency column is the tell: p50
+  1.1 s at t = 35 s into the iGPU run. Generation cost on the ARL iGPU is the
+  ceiling (~11 fps at 1080p), not bandwidth.
+- **The iGPU cannot be the game card (yet).** Both iGPU-as-game runs abort within
+  a second, on the first captured frame: it exposes a *single* queue family
+  (`queue families (1): 0[raw=0x1f qc=1 GCT] (graphics=0 transfer=NONE)`), the
+  layer falls back to a render queue for the capture copy, and the very next wait
+  fails — `capture fence wait before 9060 copy -4`, then
+  `vkWaitForFences() failed (error -4)` = `VK_ERROR_DEVICE_LOST` in the game
+  process (exit 134, core dumped). Frame generation is therefore **asymmetric**
+  today: never put the game on the iGPU. As a *render* card it also logs
+  `no non-graphics transfer queue family; image copies will not run as DMA`.
+
+Reproduce any row with the committed pair profiles
+(`tools/testing/profiles/pair-<game>-to-<render>.{toml,env}`):
+
+```bash
+./tools/testing/lsfg-launch.sh pair-9070-to-9060
+```
+
+Each profile pins the game card with `FM_GPU_INDEX` (FurMark's own enumeration on
+this machine: `0` = RX 9060 XT, `1` = RX 9070 XT, `2` = Intel iGPU) and names the
+render card in the `gpu` key; the run's `furmark.log` carries the
+`dual-host game=… render=…` line quoted above, which is what says which card ended
+up in which role.
+
 ## Requirements
 
 - Both GPUs must expose `VK_EXT_external_memory_dma_buf` and
