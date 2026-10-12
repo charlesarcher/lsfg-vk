@@ -6,7 +6,6 @@
 #include "lsfg-vk-common/helpers/pointers.hpp"
 #include "lsfg-vk-common/ipc/latency_ledger.hpp"
 #include "lsfg-vk-common/ipc/socket.hpp"
-#include "lsfg-vk-common/ipc/udmabuf_ring.hpp"
 #include "lsfg-vk-common/vulkan/command_buffer.hpp"
 #include "lsfg-vk-common/vulkan/fence.hpp"
 #include "lsfg-vk-common/vulkan/image.hpp"
@@ -31,7 +30,6 @@
 namespace lsfgvk::layer {
 
     struct SwapchainInfo;
-    struct CopyHop;
 
     /// capture context for external presentation (one-way dual-GPU).
     /// imports the two app-owned staging images (the app creates them in its
@@ -61,12 +59,6 @@ namespace lsfgvk::layer {
         /// work before destroying semaphores/images
         ~CaptureContext();
 
-        /// Submit any armed ring copy and publish any finished one. Called from
-        /// the acquire hook, on the game's own thread.
-        void flushRingCopy(const vk::Vulkan& vk);
-        /// Hand the isolated recycle fence in, so the ring copy submit can
-        /// signal it instead of a separate nested submit.
-        void setRingRecycleFence(VkFence f) { this->ringRecycleFence = f; }
 
         /// Tell the app this stream's swapchain is gone, so it retires THIS
         /// stream and no other. Sent from the layer's vkDestroySwapchainKHR.
@@ -111,32 +103,18 @@ namespace lsfgvk::layer {
 
         // vulkan objects (created on the game device)
         std::vector<vk::Image> localImages;   // 9070-owned capture dest; dma-buf exported on FRAME
-        // App-created udmabuf, imported here as a VkBuffer. FRAME then carries
-        // the capture semaphore's sync-fd only, not an image fd. udmaMmapFds
-        // is a dup kept for the one-shot byte check; Vulkan consumes the import.
-        std::array<std::optional<vk::Buffer>, ls::ipc::STAGING_RING_DEPTH> udmaBufs{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> udmaMmapFds{};
         std::vector<vk::Image> hostImages;    // LINEAR images bound to host memory
-        std::unique_ptr<vk::Vulkan> bVk;      // same-process 9060 device (LSFGVK_DUAL_HOST)
+        std::unique_ptr<vk::Vulkan> bVk;      // second device in this process (render card)
         std::vector<vk::Image> bHostImages;   // 9060 import of a separate malloc
         std::vector<vk::Image> bVramImages;   // 9060-local dma-buf export dest
         std::array<void*, ls::ipc::STAGING_RING_DEPTH> hostPtrsA{};
         std::array<void*, ls::ipc::STAGING_RING_DEPTH> hostPtrsB{};
-        std::array<void*, ls::ipc::STAGING_RING_DEPTH> shmMaps{};
-        std::array<uint32_t*, ls::ipc::STAGING_RING_DEPTH> shmSeq{};
-        std::unique_ptr<CopyHop> copyHop;
         VkDeviceSize hostAllocSize{0};
         std::array<int, ls::ipc::STAGING_RING_DEPTH> bExportFds{};
         std::vector<vk::CommandBuffer> bCbs;
         std::vector<vk::Fence> bFences;
         vk::ImageLayout exchangeLayout{};     // negotiated LINEAR/DRM layout for localImages
         std::array<int, ls::ipc::STAGING_RING_DEPTH> localExportFds{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawExportFds{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawMemFds{};
-        std::array<int, ls::ipc::STAGING_RING_DEPTH> rawReadyFds{};
-        std::array<void*, ls::ipc::STAGING_RING_DEPTH> destMaps{};
-        std::array<void*, ls::ipc::STAGING_RING_DEPTH> rawMaps{};
-        VkDeviceSize rawBytes{0};
         lsfgvk::ledger::LayerSink ledger;   // click→photon probe anchor (env-gated)
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> dmaBufSent{};
         bool localCopyOnly{false};
@@ -161,66 +139,6 @@ namespace lsfgvk::layer {
 
         // IPC stream (STAGING_RING_DEPTH slots, maps to the backend's sources)
         std::optional<ls::ipc::Connection> ipcConn;
-        /// udmabuf ring, owned by the RENDER side (Transport::UdmabufRing).
-        /// Null in every other transport, so udmabuf_ring is a new path that
-        /// leaves DecoupledDma and Udmabuf untouched.
-        std::unique_ptr<ls::ipc::UdmabufRing> ring;
-        /// COPY-ONLY VkDevice on the render card (Transport::UdmabufRing).
-        /// The ring slots are imported HERE, not on the game's device, so they
-        /// never enter the game device's global BO list
-        /// (radv_amdgpu_bo.c:1224 -> radv_amdgpu_cs.c:902) and the game's
-        /// submits stop carrying them. That list is per VkDevice
-        /// (radv_CreateDevice -> radv_create_winsys), so a private device on
-        /// the same card has an empty one.
-        std::unique_ptr<vk::Vulkan> copyVk;
-        /* The ring copy is submitted from the game's OWN THREAD, at frame
-           acquire - not from inside the present hook, and not from a worker
-           thread.
-
-           Measured: submitting inside present() gave 21 faults (nested QueueSubmit
-           during QueuePresent races vkd3d's QueueSubmit2, entrypoint.cpp:1010),
-           and submitting from a worker thread gave exactly 3 faults for 3 jobs -
-           every submit faulted - because the game's VkDevice is shared and Vulkan
-           requires external synchronization we cannot get from vkd3d.
-
-           So the copy for the frame captured at present N is recorded and
-           submitted at acquire N+1: same thread as vkd3d's calls, outside any
-           nested submit, and by then that image has been presented and released.
-           Cost is one frame of latency. */
-        struct RingPending {
-            bool armed{false};
-            std::uint32_t idx{0};
-            std::uint64_t seq{0};
-            VkImage src{VK_NULL_HANDLE};
-            VkCommandBuffer cb{VK_NULL_HANDLE};
-        };
-        RingPending ringPending;
-        VkQueue ringSubmitQ{VK_NULL_HANDLE};
-        /// The isolated path's recycle fence for the image being presented.
-        /// Our copy submit signals THIS instead of the empty isolatedSignal
-        /// submit: that extra nested QueueSubmit is what faults (deferred =
-        /// deadlock, inline = 19 faults), and a submit can only signal one
-        /// fence, so the copy carries it. The game's acquire then waits on it,
-        /// which is exactly the semantic we want.
-        VkFence ringRecycleFence{VK_NULL_HANDLE};
-        VkFence ringInFlightFence{VK_NULL_HANDLE};
-
-        bool ringInFlight{false};
-        std::uint32_t ringInFlightIdx{0};
-        std::uint64_t ringInFlightSeq{0};
-
-
-        std::vector<vk::Image> ringIntermediate;
-        std::vector<vk::Buffer> copySlotBufs;
-        /// per-slot sequence number of a submitted-but-unpublished copy.
-        /// 0 means nothing pending. A slot is published to the control block
-        /// only after its fence signals, so the doubler never reads a
-        /// half-written buffer.
-        std::vector<std::uint64_t> ringPendingSeq;
-        std::vector<ls::lazy<vk::CommandBuffer>> copyCbs;
-        std::vector<ls::lazy<vk::Fence>> copyFences;
-        /// monotonically increasing frame sequence published to the ring
-        std::atomic<std::uint64_t> ringSeq{0};
 
         // slot ring state
         std::array<bool, ls::ipc::STAGING_RING_DEPTH> slotFree{};

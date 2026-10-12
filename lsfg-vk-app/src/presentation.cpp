@@ -508,341 +508,6 @@ namespace {
         return envFlagOn("LSFGVK_APP_VERBOSE");
     }
 
-    struct DmaHopTs {
-        VkQueryPool pool{VK_NULL_HANDLE};
-        float periodNs{1.0f};
-        PFN_vkGetCalibratedTimestampsEXT getCal{nullptr};
-    };
-    DmaHopTs g_dmaHopTs{};
-
-    bool sampleCalDevice(const vk::Vulkan& dvk, uint64_t& deviceTs) {
-        if (!g_dmaHopTs.getCal)
-            return false;
-        const VkCalibratedTimestampInfoEXT info{
-            .sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT,
-            .timeDomain = VK_TIME_DOMAIN_DEVICE_EXT,
-        };
-        uint64_t ts = 0;
-        uint64_t maxDev = 0;
-        const VkResult r = g_dmaHopTs.getCal(dvk.dev(), 1, &info, &ts, &maxDev);
-        if (r != VK_SUCCESS)
-            return false;
-        deviceTs = ts;
-        return true;
-    }
-
-    /// Record TOP/BOTTOM timestamps around `record`, submit on the dma-in
-    /// queue, log wall / copy / park. Fence must be signaled on entry.
-    template<typename Record>
-    void submitDmaTimed(ls::ipc::StreamState& state, const char* tag, Record&& record) {
-        auto& dvk = *state.dmaVk;
-        auto& cb = *state.dmaCbs.at(0);
-        auto& fence = *state.dmaFences.at(0);
-        if (!fence.wait(dvk, 50ULL * 1000 * 1000)) {
-            LSFG_FRAME_DBG("dma-in probe %s: fence wait failed before submit", tag);
-            return;
-        }
-        fence.reset(dvk);
-        cb.begin(dvk);
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
-            cb.resetQueryPool(dvk, g_dmaHopTs.pool, 0, 2);
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
-            dvk.df().CmdWriteTimestamp(cb.handle(),
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_dmaHopTs.pool, 0);
-        record(dvk, cb);
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
-            dvk.df().CmdWriteTimestamp(cb.handle(),
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_dmaHopTs.pool, 1);
-        cb.end(dvk);
-        VkQueue q = dvk.hasTransferQueue() ? dvk.transferQueueHandle() : dvk.queue();
-        cb.submit(dvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
-            fence.handle(), q);
-        const auto t0 = Clock::now();
-        uint64_t calDev0 = 0;
-        const bool haveCal0 = sampleCalDevice(dvk, calDev0);
-        (void)fence.wait(dvk, 50ULL * 1000 * 1000);
-        const auto t1 = Clock::now();
-        uint64_t qv[2] = {0, 0};
-        bool haveQ = false;
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE) {
-            try {
-                haveQ = cb.getQueryPoolResults(dvk, g_dmaHopTs.pool, 0, 2, qv, true);
-            } catch (const std::exception& e) {
-                LSFG_FRAME_DBG("dma-in probe %s timestamp read failed: %s", tag, e.what());
-            }
-        }
-        const double wallMs = elapsedUs(t0, t1) / 1000.0;
-        double copyMs = -1.0;
-        double parkMs = -1.0;
-        if (haveQ) {
-            copyMs = (static_cast<double>(qv[1]) - static_cast<double>(qv[0]))
-                * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
-            if (haveCal0) {
-                parkMs = (static_cast<double>(qv[0]) - static_cast<double>(calDev0))
-                    * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
-            } else {
-                parkMs = wallMs - copyMs;
-            }
-        }
-        LSFG_FRAME_DBG("dma-in probe %s wall %.3f ms exec %.3f ms park %.3f ms cal0=%d",
-            tag, wallMs, copyMs, parkMs, haveCal0);
-    }
-
-    /// First-use discriminator on ctx=3: no imported dma-buf. Empty IB vs
-    /// local vkCmdCopyImage. If empty parks ~33 ms, the hop delay is not
-    /// the share. If empty is fast and local copy is fast, the share is.
-    void probeDmaInQueue(ls::ipc::StreamState& state, VkExtent2D ext, VkFormat fmt) {
-        auto& dvk = *state.dmaVk;
-        const uint32_t dstQ = dvk.hasTransferQueue()
-            ? dvk.transferQueueFamilyIndex() : dvk.queueFamilyIndex();
-        auto empty = [](const vk::Vulkan&, vk::CommandBuffer&) {};
-        submitDmaTimed(state, "empty-1", empty);
-        submitDmaTimed(state, "empty-2", empty);
-        submitDmaTimed(state, "empty-3", empty);
-        try {
-            const vk::ImageLayout lay{};
-            vk::Image src(dvk, {1, 1}, fmt,
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                std::nullopt, std::nullopt, lay);
-            vk::Image dst(dvk, {1, 1}, fmt,
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                std::nullopt, std::nullopt, lay);
-            auto copy1 = [&](const vk::Vulkan& vk, vk::CommandBuffer& cb) {
-                cb.copyImage(vk,
-                    {
-                        makeBlitBarrier(src.handle(),
-                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-                        makeBlitBarrier(dst.handle(),
-                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-                    },
-                    { src.handle(), dst.handle() },
-                    {1, 1},
-                    {});
-                (void)dstQ;
-            };
-            submitDmaTimed(state, "local-1x1-copy-1", copy1);
-            submitDmaTimed(state, "local-1x1-copy-2", copy1);
-            vk::Image srcF(dvk, ext, fmt,
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                std::nullopt, std::nullopt, lay);
-            vk::Image dstF(dvk, ext, fmt,
-                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                std::nullopt, std::nullopt, lay);
-            auto copyF = [&](const vk::Vulkan& vk, vk::CommandBuffer& cb) {
-                cb.copyImage(vk,
-                    {
-                        makeBlitBarrier(srcF.handle(),
-                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL),
-                        makeBlitBarrier(dstF.handle(),
-                            VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-                    },
-                    { srcF.handle(), dstF.handle() },
-                    ext,
-                    {});
-            };
-            submitDmaTimed(state, "local-full-copy-1", copyF);
-            submitDmaTimed(state, "local-full-copy-2", copyF);
-            submitDmaTimed(state, "empty-after-local", empty);
-        } catch (const std::exception& e) {
-            LSFG_FRAME_DBG("dma-in probe local copy failed: %s", e.what());
-        }
-    }
-
-    bool ensureDmaIn(ls::ipc::StreamState& state, const vk::Vulkan& presentVk) {
-        if (state.dmaVk)
-            return true;
-        try {
-            const auto want = presentVk.deviceUUID();
-            auto select = [want](const vk::VulkanInstanceFuncs& fi,
-                    const std::vector<VkPhysicalDevice>& devs) -> VkPhysicalDevice {
-                for (auto pd : devs) {
-                    VkPhysicalDeviceIDProperties id{
-                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES
-                    };
-                    VkPhysicalDeviceProperties2 p{
-                        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-                        .pNext = &id
-                    };
-                    fi.GetPhysicalDeviceProperties2(pd, &p);
-                    std::array<uint8_t, 16> uuid{};
-                    std::memcpy(uuid.data(), id.deviceUUID, 16);
-                    if (uuid == want)
-                        return pd;
-                }
-                throw ls::error("dma-in device: offload GPU not found");
-            };
-            ::setenv("DISABLE_VK_LAYER_LSFGVK_frame_generation", "1", 1);
-            state.dmaVk = std::make_unique<vk::Vulkan>(
-                "lsfg-dma-in", vk::version{2, 0, 0},
-                "lsfg-dma-in", vk::version{2, 0, 0},
-                select, false, std::nullopt, std::nullopt, true, true);
-            ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
-            auto& dvk = *state.dmaVk;
-            const VkCommandPool pool = dvk.hasTransferQueue()
-                ? dvk.transferCmdPoolHandle() : VK_NULL_HANDLE;
-            for (size_t i = 0; i < ls::ipc::STAGING_RING_DEPTH; ++i) {
-                state.dmaCbs.at(i).emplace(dvk, pool);
-                state.dmaFences.at(i).emplace(dvk, true);
-            }
-            {
-                VkPhysicalDeviceProperties2 props{
-                    .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
-                };
-                dvk.fi().GetPhysicalDeviceProperties2(dvk.physdev(), &props);
-                g_dmaHopTs.periodNs = props.properties.limits.timestampPeriod;
-                const VkQueryPoolCreateInfo qi{
-                    .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
-                    .queryType = VK_QUERY_TYPE_TIMESTAMP,
-                    .queryCount = 2,
-                };
-                const auto qres = dvk.df().CreateQueryPool(dvk.dev(), &qi,
-                    VK_NULL_HANDLE, &g_dmaHopTs.pool);
-                if (qres != VK_SUCCESS)
-                    g_dmaHopTs.pool = VK_NULL_HANDLE;
-                g_dmaHopTs.getCal = reinterpret_cast<PFN_vkGetCalibratedTimestampsEXT>(
-                    dvk.fi().GetDeviceProcAddr(dvk.dev(), "vkGetCalibratedTimestampsEXT"));
-                LSFG_FRAME_DBG("dma-in timestamps period %.3f ns/tick pool=%d cal=%d",
-                    g_dmaHopTs.periodNs,
-                    g_dmaHopTs.pool != VK_NULL_HANDLE,
-                    g_dmaHopTs.getCal != nullptr);
-            }
-            LSFG_FRAME_DBG("dma-in device ready (no gfx)");
-            return true;
-        } catch (const std::exception& e) {
-            ::unsetenv("DISABLE_VK_LAYER_LSFGVK_frame_generation");
-            LSFG_FRAME_DBG("dma-in device failed: %s", e.what());
-            state.dmaVk.reset();
-            return false;
-        }
-    }
-
-    /// primary render GPU share → offload VRAM on a device with no gfx. returns dma-buf of
-    /// that VRAM image for the present device to sample. -1 on failure.
-    int hopShareToOffload(ls::ipc::StreamState& state, uint32_t sidx, int shareFd) {
-        if (!state.dmaVk || shareFd < 0)
-            return -1;
-        logDmaGemFlags(shareFd);
-        // Capture-done fd was already polled by the caller. Do not also poll
-        // DMA_BUF_IOCTL_EXPORT_SYNC_FILE WRITE here: that wait is extra gfx
-        // fences on the share (~31 ms) and couples DMA-in to render-GPU gfx.
-        auto& dvk = *state.dmaVk;
-        const VkExtent2D ext{ state.width, state.height };
-        static bool probed = false;
-        if (!probed) {
-            probed = true;
-            probeDmaInQueue(state, ext, state.captureFormat);
-        }
-        const vk::ImageLayout shareLay{
-            .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
-                ? vk::ImageMode::Linear : vk::ImageMode::DrmModifier,
-            .drmModifier = state.negotiatedModifier,
-            .rowPitch = state.rowPitch,
-        };
-        if (!state.dmaSrc.at(sidx)) {
-            const int imp = ::dup(shareFd);
-            if (imp < 0)
-                return -1;
-            try {
-                state.dmaSrc.at(sidx).emplace(dvk, ext, state.captureFormat,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT, imp, std::nullopt, shareLay);
-            } catch (const std::exception& e) {
-                LSFG_FRAME_DBG("dma-in import share failed: %s", e.what());
-                return -1;
-            }
-        }
-        if (!state.dmaDst.at(sidx)) {
-            try {
-                const vk::ImageLayout vramLay{ .mode = vk::ImageMode::Linear };
-                state.dmaDst.at(sidx).emplace(dvk, ext, state.captureFormat,
-                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-                    std::nullopt, std::nullopt, vramLay);
-                auto exp = state.dmaDst.at(sidx)->exportDmaBuf(dvk);
-                state.dmaDstFds.at(sidx) = exp.fd;
-            } catch (const std::exception& e) {
-                LSFG_FRAME_DBG("dma-in vram dest failed: %s", e.what());
-                return -1;
-            }
-        }
-        if (!state.dmaCbs.at(sidx) || !state.dmaFences.at(sidx))
-            return -1;
-        auto& cb = *state.dmaCbs.at(sidx);
-        auto& fence = *state.dmaFences.at(sidx);
-        if (!fence.wait(dvk, 0))
-            return -1;
-        fence.reset(dvk);
-        const uint32_t dstQ = dvk.hasTransferQueue()
-            ? dvk.transferQueueFamilyIndex() : dvk.queueFamilyIndex();
-        cb.begin(dvk);
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
-            cb.resetQueryPool(dvk, g_dmaHopTs.pool, 0, 2);
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
-            dvk.df().CmdWriteTimestamp(cb.handle(),
-                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g_dmaHopTs.pool, 0);
-        cb.copyImage(dvk,
-            {
-                makeBlitBarrier(state.dmaSrc.at(sidx)->handle(),
-                    VK_ACCESS_NONE, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_ACCESS_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                    VK_QUEUE_FAMILY_EXTERNAL, dstQ),
-                makeBlitBarrier(state.dmaDst.at(sidx)->handle(),
-                    VK_ACCESS_NONE, VK_IMAGE_LAYOUT_UNDEFINED,
-                    VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL),
-            },
-            { state.dmaSrc.at(sidx)->handle(), state.dmaDst.at(sidx)->handle() },
-            ext,
-            {});
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE)
-            dvk.df().CmdWriteTimestamp(cb.handle(),
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g_dmaHopTs.pool, 1);
-        cb.end(dvk);
-        VkQueue q = dvk.hasTransferQueue() ? dvk.transferQueueHandle() : dvk.queue();
-        cb.submit(dvk, {}, VK_NULL_HANDLE, 0, {}, VK_NULL_HANDLE, 0,
-            fence.handle(), q);
-        const auto t0 = Clock::now();
-        uint64_t calDev0 = 0;
-        const bool haveCal0 = sampleCalDevice(dvk, calDev0);
-        (void)fence.wait(dvk, 50ULL * 1000 * 1000);
-        const auto t1 = Clock::now();
-        uint64_t calDev1 = 0;
-        const bool haveCal1 = sampleCalDevice(dvk, calDev1);
-        uint64_t qv[2] = {0, 0};
-        bool haveQ = false;
-        if (g_dmaHopTs.pool != VK_NULL_HANDLE) {
-            try {
-                haveQ = cb.getQueryPoolResults(dvk, g_dmaHopTs.pool, 0, 2, qv, true);
-            } catch (const std::exception& e) {
-                LSFG_FRAME_DBG("dma-in timestamp read failed: %s", e.what());
-            }
-        }
-        static int nHop = 0;
-        if (nHop < 24) {
-            const double wallMs = elapsedUs(t0, t1) / 1000.0;
-            double copyMs = -1.0;
-            double parkMs = -1.0;
-            if (haveQ) {
-                copyMs = (static_cast<double>(qv[1]) - static_cast<double>(qv[0]))
-                    * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
-                if (haveCal0) {
-                    parkMs = (static_cast<double>(qv[0]) - static_cast<double>(calDev0))
-                        * static_cast<double>(g_dmaHopTs.periodNs) / 1.0e6;
-                } else {
-                    parkMs = wallMs - copyMs;
-                }
-            }
-            LSFG_FRAME_DBG("dma-in hop slot %u wall %.3f ms copy %.3f ms park %.3f ms "
-                "q0=%llu q1=%llu cal0=%d cal1=%d",
-                sidx, wallMs, copyMs, parkMs,
-                static_cast<unsigned long long>(qv[0]),
-                static_cast<unsigned long long>(qv[1]),
-                haveCal0, haveCal1);
-            ++nHop;
-        }
-        return state.dmaDstFds.at(sidx);
-    }
 
     // Process-lifetime overlay. Recreating exclusive layer-shell on every
     // HELLO (RE2 1080→1080→1440) closes Xwayland :0 (XIO EBADF) and the
@@ -1519,34 +1184,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
     };
 
     // --- OUTPUT thread: the whole swapchain present path ----------------------
-    // --- udmabuf ring consume path ----------------------------------------
-    // The render side publishes slots into the control block and never waits.
-    // The doubler takes the NEWEST complete slot with a CAS; if nothing new is
-    // ready it returns -1 and this thread re-presents its last image rather
-    // than waiting. So the two processes never block each other in either
-    // direction.
-    std::vector<std::optional<vk::CommandBuffer>> ringCbs;
-    std::vector<std::optional<vk::Fence>> ringFences;
-    const bool ringTransport =
-        state.transport == ls::Transport::UdmabufRing && state.ring != nullptr;
-    if (ringTransport) {
-        // Size from the RING's slot count, not from ringSlotImages: slots are
-        // imported as BUFFERS (state.udmaBufs) now, so the images vector is
-        // empty and this collapsed to K=0, leaving the consume path with no
-        // command buffers at all.
-        const size_t ringK = std::max<size_t>(state.ringSlotCount,
-            state.udmaBufs.size());
-        ringCbs.resize(ringK);
-        ringFences.resize(ringK);
-        for (size_t i = 0; i < ringCbs.size(); ++i) {
-            ringCbs.at(i).emplace(vk);
-            ringFences.at(i).emplace(vk, true);   // signaled: first wait passes
-        }
-        std::fprintf(stderr,
-            "lsfg-vk-app: ring consume ready K=%zu on '%s'\n",
-            ringCbs.size(), "(doubler)");
-        std::fflush(stderr);
-    }
 
     /* Hoisted OUT of the output lambda on purpose. ASan showed the
        lambda's own state being read after its scope ended -
@@ -2551,44 +2188,10 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::vector<vk::CommandBuffer> snapCbs;
         std::vector<vk::CommandBuffer> computeCbs;
         std::vector<vk::Fence> snapFences;
-        // Per-frame timing for the udmabuf transport. The two questions this
-        // pass is meant to answer: does the 36.6 ms park survive on the buffer
-        // bounce (step 3), and what does removing the blocking fence wait add
-        // on top (step 4)? So measure the copy, the park, and the
-        // present-to-present interval, and report p50/p99.
-        struct UdmaTiming {
-            std::vector<double> copyMs, parkMs, frameMs;
-            std::chrono::steady_clock::time_point lastPresent{};
-            bool haveLast{ false };
-        } udmaT{};
-        auto stat = [](std::vector<double>& v, const char* label) {
-            if (v.empty()) return;
-            std::sort(v.begin(), v.end());
-            const double p50 = v[v.size() / 2];
-            const double p99 = v[std::min(v.size() - 1, (size_t)(v.size() * 0.99))];
-            std::fprintf(stderr,
-                "udmabuf-timing: %-8s n=%zu p50=%.2f p99=%.2f max=%.2f ms\n",
-                label, v.size(), p50, p99, v.back());
-        };
-        auto dumpTiming = [&]() {
-            stat(udmaT.copyMs, "copy");
-            stat(udmaT.parkMs, "park");
-            stat(udmaT.frameMs, "frame");
-        };
-
-        // The udmabuf bounce submits its own copy of the staging slot into
-        // genSources. It MUST NOT reuse snapCbs/snapFences: the snapshot block
-        // below already begin/end/submits snapCbs.at(sidx), and doing that to
-        // the same command buffer twice loses the context.
-        std::vector<vk::CommandBuffer> bounceCbs;
-        std::vector<vk::Fence> bounceFences;
         for (size_t i = 0; i < ls::ipc::STAGING_RING_DEPTH; ++i) {
             snapCbs.emplace_back(vk, vk.transferCmdPoolHandle());
             computeCbs.emplace_back(vk, vk.transferCmdPoolHandle());
             snapFences.emplace_back(vk, true);
-            bounceCbs.emplace_back(vk, vk.transferCmdPoolHandle());
-            // signalled so the first use of each slot passes the reuse guard
-            bounceFences.emplace_back(vk, true);
         }
         vk::CommandBuffer gfxCb{ vk };
         std::optional<vk::Shader> swizzleShader;
@@ -2597,7 +2200,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         std::array<std::optional<vk::DescriptorSet>, ls::ipc::STAGING_RING_DEPTH> swizzleSets;
         std::array<std::optional<vk::DescriptorSet>, ls::ipc::STAGING_RING_DEPTH> importSwizzleSets;
         std::array<std::optional<vk::Image>, ls::ipc::STAGING_RING_DEPTH> swizzleMid;
-        int pendingDmaRelease = -1;
         vk::CommandBuffer emptyGenCb{ vk };
         vk::Fence emptyGenFence{ vk, true };
         vk::CommandBuffer emptyXferCb{ vk, vk.transferCmdPoolHandle() };
@@ -2625,158 +2227,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
         bool gotFrame{ false };
         try {
             for (;;) {
-            // --- udmabuf ring: consume newest-complete, never wait --------------
-            // The render side publishes slots and never blocks. We take the newest
-            // Complete slot with a CAS; if none is new we fall through to the normal
-            // FRAME-driven path (there is no FRAME in this transport, so the loop
-            // simply keeps its last image). Nothing here waits on the render side.
-            if (ringTransport) {
-                uint64_t seq = 0;
-                int slot = state.ring->claimNewestComplete(&seq);
-                if (slot < 0) {
-                    /* Print the block's address and every slot's state: if the
-                       layer says it published and we see no Complete slot, the
-                       two sides are not looking at the same mapping. */
-                    {
-                        static std::atomic<std::uint32_t> nIdleDump{0};
-                        /* Dump LATE, not on the first few idles: an early dump
-                           predates the layer's first publish and shows all
-                           slots Free, which says nothing. */
-                        const std::uint32_t idleN = nIdleDump.fetch_add(1);
-                        if (std::getenv("LSFGVK_RING_DBG")
-                                && (idleN % 2000) == 0 && idleN < 20001) {
-                            std::fprintf(stderr,
-                                "lsfg-vk-app: ring DIAG stream=%u idle=%u ctrl=%p count=%u slots=%p\n",
-                                state.streamId, idleN,
-                                (void*)state.ringCtrlMap,
-                                state.ring->count(),
-                                (void*)state.ring->header(),
-                                (void*)state.ring->slot(0));
-                            for (std::uint32_t si = 0; si < state.ring->count(); ++si)
-                                std::fprintf(stderr,
-                                    "lsfg-vk-app: ring DIAG slot %u state=%u seq=%llu\n",
-                                    si,
-                                    state.ring->slot(si)->state.load(),
-                                    (unsigned long long)state.ring->slot(si)->seq.load());
-                            std::fflush(stderr);
-                        }
-                    }
-                    if (std::getenv("LSFGVK_RING_DBG")) {
-                        static uint32_t nIdle = 0;
-                        if (nIdle < 8) {
-                            ++nIdle;
-                            std::fprintf(stderr,
-                                "lsfg-vk-app: ring idle (no new complete slot), keeping last image\n");
-                            std::fflush(stderr);
-                        }
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-                const auto idx = static_cast<std::uint32_t>(slot);
-                if (std::getenv("LSFGVK_RING_DBG")) {
-                    std::fprintf(stderr,
-                        "lsfg-vk-app: ring claimed seq=%llu slot=%u\n",
-                        (unsigned long long)seq, idx);
-                    std::fflush(stderr);
-                }
-                /* Do the consume copy HERE and release the slot.
-                   The wire path's buffer->image copy and its Release live
-                   after its receive block; the ring branches past all of that,
-                   so nothing copied the slot and nothing released it. The ring
-                   filled after K frames and the producer skipped forever. */
-                if (state.ringCopyCbs.empty()) {
-                    state.ringCopyCbs.resize(state.ringSlotCount);
-                    state.ringCopyFences.resize(state.ringSlotCount);
-                    for (size_t i = 0; i < state.ringCopyCbs.size(); ++i) {
-                        state.ringCopyCbs.at(i).emplace(vk);
-                        state.ringCopyFences.at(i).emplace(vk, true);
-                    }
-                }
-                try {
-                if (idx < state.udmaBufs.size() && state.udmaBufs.at(idx).has_value()
-                        && idx < state.genSources.size()
-                        && state.genSources.at(idx).has_value()) {
-                    auto& copyFence = *state.ringCopyFences.at(idx);
-                    copyFence.wait(vk, UINT64_MAX);   // our own fence, never the peer
-                    copyFence.reset(vk);
-                    auto& copyCb = *state.ringCopyCbs.at(idx);
-                    const vk::Image& dstImg = *state.genSources.at(idx);
-                    const vk::Buffer& srcBuf = *state.udmaBufs.at(idx);
-                    copyCb.begin(vk);
-                    VkImageMemoryBarrier toDst{
-                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-                    toDst.srcAccessMask = VK_ACCESS_NONE;
-                    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                    toDst.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toDst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toDst.image = dstImg.handle();
-                    toDst.subresourceRange = {
-                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                    vk.df().CmdPipelineBarrier(copyCb.raw(),
-                        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        0, 0, nullptr, 0, nullptr, 1, &toDst);
-                    const VkBufferImageCopy bic{
-                        .bufferOffset = 0,
-                        .bufferRowLength = state.width,
-                        .bufferImageHeight = state.height,
-                        .imageSubresource = {
-                            .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-                            .layerCount = 1
-                        },
-                        .imageExtent = { state.width, state.height, 1 }
-                    };
-                    vk.df().CmdCopyBufferToImage(copyCb.raw(), srcBuf.handle(),
-                        dstImg.handle(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        1, &bic);
-                    VkImageMemoryBarrier toSrc{
-                        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER };
-                    toSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-                    toSrc.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-                    toSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-                    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toSrc.image = dstImg.handle();
-                    toSrc.subresourceRange = {
-                        VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-                    vk.df().CmdPipelineBarrier(copyCb.raw(),
-                        VK_PIPELINE_STAGE_TRANSFER_BIT,
-                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                        0, 0, nullptr, 0, nullptr, 1, &toSrc);
-                    copyCb.end(vk);
-                    copyCb.submit(vk, {}, VK_NULL_HANDLE, 0, {},
-                        VK_NULL_HANDLE, 0, copyFence.handle());
-                    copyFence.wait(vk, UINT64_MAX);
-                }
-                } catch (const std::exception& e) {
-                    /* A failure here was killing the whole stream: the
-                       exception propagated out of the input thread, set
-                       `failed`, and runPresent unwound - which is why the
-                       doubler realized exactly one frame and then stopped.
-                       Report it, drop the frame, and keep the stream alive. */
-                    std::fprintf(stderr,
-                        "lsfg-vk-app: ring consume copy failed slot=%u: %s\n",
-                        idx, e.what());
-                    std::fflush(stderr);
-                }
-                /* Hand the slot back NOW: the copy is done, so the producer may
-                   reuse it. Then let the output thread present it. */
-                state.ring->release(idx);
-                inbox.push(PendingFrame{
-                    .doneFds = {},
-                    .snapFd = -1,
-                    .stagingIdx = idx,
-                    .captureTsNs = seq,
-                    .recvTsNs = 0,
-                    .schedDoneNs = 0,
-                    .srcFidx = UINT64_MAX,
-                });
-                continue;
-            }
 
                 if (stop.load(std::memory_order_relaxed)
                         || failed.load(std::memory_order_relaxed))
@@ -2861,22 +2311,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     continue;
                 }
 
-                // CPU copy / dual-host: render GPU already finished, so Release first is
-                // safe. dma-buf still points at the render GPU buffer — Release first
-                // lets the render GPU rewrite it while the secondary GPU copies.
                 const uint32_t sidxEarly = frame->stagingIdx;
-                const bool udmaSlot = sidxEarly < state.udmaFds.size()
-                    && state.udmaFds.at(sidxEarly) >= 0;
-                const bool dmaHop = (state.shmBytes == 0 && std::getenv("LSFGVK_DUAL_HOST") != nullptr
-                    && std::getenv("LSFGVK_DUAL_HOST")[0] == '0');
-                // udmabuf: the 9060 has not copied out yet. Releasing now lets
-                // the 9070 overwrite the slot mid-copy.
-                if (!dmaHop && !udmaSlot
-                        && conf.transport != ls::Transport::DecoupledDma) {
-                    conn.send(ls::ipc::Release{ frame->stagingIdx });
-                    LSFG_FRAME_DBG("input: Release first (slot %u) (fidx %llu)",
-                        frame->stagingIdx, (unsigned long long)fidx);
-                }
 
                 if (sidxEarly < ls::ipc::STAGING_RING_DEPTH && captureFd >= 0) {
                     char link[64]{};
@@ -2903,7 +2338,7 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     // conversion blit, black FG content. (See the 2026-09-27
                     // black-screen investigation.)
                     const bool isShare = needShare && nlink >= 0;
-                    if (needShare && isShare && !udmaSlot) {
+                    if (needShare && isShare) {
                         int keepFd = ::dup(captureFd);
                         if (keepFd < 0)
                             throw ls::error("dup() failed before render dma-buf keep");
@@ -2925,13 +2360,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     ::close(captureFd);
                     captureFd = -1;
                 }
-                if (dmaHop && captureFd < 0) {
-                    conn.send(ls::ipc::Release{ frame->stagingIdx });
-                    LSFG_FRAME_DBG("input: dma-buf keep, hop on capture-done (slot %u)",
-                        frame->stagingIdx);
-                    ++fidx;
-                    continue;
-                }
 
                 static const bool skipSnap = (std::getenv("LSFGVK_SKIP_SNAP")
                     && std::getenv("LSFGVK_SKIP_SNAP")[0] == '1')
@@ -2949,30 +2377,20 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 auto& computeCb = computeCbs.at(sidx);
                 if (!snapCbFence.wait(vk, 0)) {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
-                    // Overlay did not sample this write. Return the slot, or the
-                    // ring fills and the layer stops. The dmaHop path keeps the
-                    // one slot a coprocessor copy is still reading.
-                    if (!dmaHop
-                            || static_cast<int>(frame->stagingIdx) != pendingDmaRelease) {
-                        conn.send(ls::ipc::Release{ frame->stagingIdx });
-                        std::fprintf(stderr,
-                            "Release skip slot=%u f=%llu\n",
-                            frame->stagingIdx, (unsigned long long)fidx);
-                    }
+                    // Overlay did not sample this write. Return the slot so the
+                    // ring fills and the layer stops.
+                    conn.send(ls::ipc::Release{ frame->stagingIdx });
+                    std::fprintf(stderr,
+                        "Release skip slot=%u f=%llu\n",
+                        frame->stagingIdx, (unsigned long long)fidx);
                     LSFG_FRAME_DBG("input: snapshot skip (cb busy) (fidx %llu)",
                         (unsigned long long)fidx);
                 } else {
                 // The bounce path never submits this fence. Resetting it here
                 // leaves it unsignaled, and every later frame skips. Reset only
                 // in the branches that pass it to QueueSubmit.
-                if (dmaHop && pendingDmaRelease >= 0) {
-                    const uint32_t done = static_cast<uint32_t>(pendingDmaRelease);
-                    conn.send(ls::ipc::Release{ done });
-                    LSFG_FRAME_DBG("input: Release slot %u", done);
-                    pendingDmaRelease = -1;
-                }
                 bool waitWriteDone = false;
-                if (captureFd >= 0 && !state.shmBytes) {
+                if (captureFd >= 0) {
                     pollfd pfd{};
                     pfd.fd = captureFd;
                     pfd.events = POLLIN;
@@ -2988,289 +2406,8 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     captureFd = -1;
                     waitWriteDone = false;
                 }
-                if (dmaHop) {
-                    int srcFd = state.dmaFds.at(sidx);
-                    static const bool noHop = std::getenv("LSFGVK_NO_HOP")
-                        && std::getenv("LSFGVK_NO_HOP")[0] == '1';
-                    if (srcFd >= 0 && !noHop && ensureDmaIn(state, vk)) {
-                        const int hopFd = hopShareToOffload(state, sidx, srcFd);
-                        if (hopFd >= 0) {
-                            srcFd = hopFd;
-                            // Dest data is safely in offload VRAM. Release render
-                            // slot immediately so the game can capture next frame.
-                            conn.send(ls::ipc::Release{ sidx });
-                            LSFG_FRAME_DBG("input: Release immediate after dma-in slot %u", sidx);
-                        }
-                    }
-                    if (srcFd >= 0 && !state.aImports.at(sidx).has_value()) {
-                        try {
-                            const vk::ImageLayout aLayout{
-                                .mode = (state.negotiatedModifier == vk::EXCHANGE_MODIFIER_LINEAR)
-                                    ? vk::ImageMode::Linear : vk::ImageMode::DrmModifier,
-                                .drmModifier = state.negotiatedModifier,
-                                .rowPitch = state.rowPitch,
-                            };
-                            const std::vector<uint32_t> families{
-                                vk.transferQueueFamilyIndex()
-                            };
-                            int tryFd = ::dup(srcFd);
-                            if (tryFd < 0)
-                                throw ls::error("dup() failed before render dma-buf import");
-                            state.aImports.at(sidx).emplace(vk,
-                                VkExtent2D{ state.width, state.height },
-                                state.captureFormat, VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                                tryFd, std::nullopt, aLayout,
-                                VK_SHARING_MODE_EXCLUSIVE, families);
-                            LSFG_FRAME_DBG("input: import render dma-buf slot %u (copy)", sidx);
-                        } catch (const std::exception& e) {
-                            LSFG_FRAME_DBG("input: render dma-buf import failed slot %u: %s",
-                                sidx, e.what());
-                        }
-                    }
-                }
-                // Host-buffer bounce: the render card DMAs into the shared
-                // mapping (state.dmaMaps), and OUR GPU DMAs out of that same
-                // mapping into genSources. Deliberately no CPU copy - the shm
-                // branch below owns the memcpy and is skipped on this transport
-                // because hostPtrs is null there.
-                /* Ring mode has no app-side mmap (shmBytes/dmaMaps are 0): the
-                   slot arrives as a dma-buf BUFFER import and the control
-                   block carries the ordering, so the mmap guards do not apply.
-                   Without this the ring's buffer->image copy never ran and the
-                   doubler starved. */
-                const bool ringSlotReady = ringTransport
-                    && sidx < state.udmaBufs.size()
-                    && state.udmaBufs.at(sidx).has_value();
-                if ((state.shmBytes && sidx < state.dmaMaps.size()
-                        && state.dmaMaps.at(sidx) && sidx < snapCbs.size())
-                        || (ringSlotReady && sidx < snapCbs.size())) {
-                    if (captureFd >= 0) {
-                        // The render card's own sync_fd: signalled only once its
-                        // capture blit into this slot has landed. A timeout
-                        // abandons the slot rather than copying a torn frame.
-                        //
-                        // THIS is the park: the app is idle here waiting for
-                        // the render GPU. If the 36.6 ms shows up in parkMs
-                        // rather than copyMs, the transport is not the cost.
-                        const auto parkT0 = std::chrono::steady_clock::now();
-                        pollfd pfd{};
-                        pfd.fd = captureFd;
-                        pfd.events = POLLIN;
-                        const int prReady = ::poll(&pfd, 1, 2000);
-                        udmaT.parkMs.push_back(
-                            std::chrono::duration<double, std::milli>(
-                                std::chrono::steady_clock::now() - parkT0).count());
-                        if (prReady <= 0) {
-                            ::close(captureFd);
-                            captureFd = -1;
-                            conn.send(ls::ipc::Release{ sidx });
-                            ++g_framesDropped;
-                            if (prReady == 0)
-                                continue;
-                            throw ls::error("poll() on bounce slot-ready failed");
-                        }
-                        ::close(captureFd);
-                        captureFd = -1;
-                    }
-                    // The shared slot is a BUFFER, not an image. A
-                    // dma-buf backed linear image import is not usable on
-                    // this driver (queried correctly, every format comes
-                    // back with compatibleHandleTypes == 0), and a buffer has
-                    // no modifier or pitch for the two GPUs to disagree
-                    // about. Proven both legs at 2560x1440, 200 iterations,
-                    // no faults: tools/testing/udmabuf_transport_probe.cpp.
-                    if (!state.udmaBufs.at(sidx).has_value()) {
-                        const int ufd = state.udmaFds.at(sidx);
-                        if (ufd < 0)
-                            throw ls::error("udmabuf slot has no dma-buf fd");
-                        state.udmaBufs.at(sidx).emplace(vk, ::dup(ufd),
-                            static_cast<size_t>(state.shmBytes),
-                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT
-                          | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-                        LSFG_FRAME_DBG("udmabuf: imported slot %u fd=%d as VkBuffer",
-                            sidx, ufd);
-                    }
-                    auto& bcb = bounceCbs.at(sidx);
-                    auto& bFence = bounceFences.at(sidx);
-                    if (!bFence.wait(vk, 0)) {
-                        // NO DROPS: a busy slot must wait for its own fence.
-                        // Falling through here would silently substitute a
-                        // CPU copy for a frame we promised to DMA.
-                        bFence.wait(vk, UINT64_MAX);
-                    }
-                    bFence.reset(vk);
-                    const auto copyT0 = std::chrono::steady_clock::now();
-                    bcb.begin(vk);
-                    bcb.copyBufferToImage(vk,
-                        state.udmaBufs.at(sidx).value(),
-                        *state.genSources.at(sidx),
-                        state.width, state.height);
-                    bcb.end(vk);
-                    {
-                        std::lock_guard<std::mutex> lk(submitMtx);
-                        bcb.submit(vk, {}, VK_NULL_HANDLE, 0,
-                            {}, copyDone.handle(), 0,
-                            bFence.handle(), vk.dmaQueueHandle());
-                    }
-                    if (dbgOn) {
-                        std::fprintf(stderr, "copy SUBMITTED f=%llu slot=%u\n",
-                            (unsigned long long)fidx, sidx);
-                    }
-                    // The park: this blocking wait is the ~36.6 ms the whole
-                    // investigation is chasing. It is KEPT for this pass on
-                    // purpose, so udmabuf alone can be measured before the
-                    // fence wait is touched.
-                    const bool copySignalled = bFence.wait(vk, UINT64_MAX);
-                    if (dbgOn) {
-                        std::fprintf(stderr, "[M2] f=%llu tid=%ld copy FENCE signalled=%d\n",
-                            (unsigned long long)fidx, ::gettid(), copySignalled ? 1 : 0);
-                    }
-                    if (!copySignalled)
-                        throw ls::vulkan_error(VK_TIMEOUT,
-                            "udmabuf bounce copy fence timed out");
-                    conn.send(ls::ipc::Release{ sidx });
-                    LSFG_FRAME_DBG("input: Release after udmabuf copy (slot %u)", sidx);
-                    const auto copyT1 = std::chrono::steady_clock::now();
-                    udmaT.copyMs.push_back(
-                        std::chrono::duration<double, std::milli>(copyT1 - copyT0).count());
-                    if (udmaT.haveLast)
-                        udmaT.frameMs.push_back(
-                            std::chrono::duration<double, std::milli>(copyT1 - udmaT.lastPresent).count());
-                    udmaT.lastPresent = copyT1;
-                    udmaT.haveLast = true;
-                    LSFG_FRAME_DBG("udmabuf: GPU copy shared buffer -> genSources slot %u",
-                        sidx);
-                    if (udmaT.frameMs.size() == 200) {
-                        dumpTiming();
-                        std::fprintf(stderr,
-                            "udmabuf-timing: 200 frames captured; "
-                            "baseline p99 15.12 ms, doubled p99 14.68 ms\n");
-                    }
-                }
 
-                if (state.shmBytes && sidx < state.shmMaps.size()
-                        && state.shmMaps.at(sidx) && state.hostPtrs.at(sidx)) {
-                    if (captureFd >= 0) {
-                        // BLOCK until the render card says this slot's blit has
-                        // actually landed, then read it.
-                        //
-                        // This used to be `::poll(&pfd, 1, 1)` with the result
-                        // DISCARDED - a 1 ms wait that gave up silently and read
-                        // the slot anyway. captureFd is the render card's
-                        // slot-ready sync semaphore: it is signalled only when
-                        // the capture blit into this slot has completed. Reading
-                        // before that yields a TORN capture (part of frame N,
-                        // part of frame N+1), and the doubler then interpolates
-                        // against garbage. Nothing downstream can detect it.
-                        //
-                        // A large timeout is a FAILURE indication, not licence
-                        // to read: on timeout we never touch the slot, hand it
-                        // straight back, and surface the error.
-                        pollfd pfd{};
-                        pfd.fd = captureFd;
-                        pfd.events = POLLIN;
-                        const int prReady = ::poll(&pfd, 1, 2000);
-                        if (prReady <= 0) {
-                            // Slot abandoned unread - never a torn read.
-                            ::close(captureFd);
-                            captureFd = -1;
-                            if (!dmaHop)
-                                conn.send(ls::ipc::Release{ sidx });
-                            ++g_framesDropped;   // never torn-read; counted
-                            if (prReady == 0)
-                                continue;
-                            throw ls::error("poll() on capture slot-ready failed");
-                        }
-                        ::close(captureFd);
-                        captureFd = -1;
-                    }
-                    if (state.shmSeq.at(sidx)) {
-                        for (int waits = 0; waits < 3; ++waits) {
-                            const uint32_t s = __atomic_load_n(
-                                state.shmSeq.at(sidx), __ATOMIC_ACQUIRE);
-                            if (s != state.shmSeen.at(sidx)) {
-                                state.shmSeen.at(sidx) = s;
-                                break;
-                            }
-                            if (waits < 2)
-                                ::poll(nullptr, 0, 1);
-                        }
-                    }
-                    std::memcpy(state.hostPtrs.at(sidx), state.shmMaps.at(sidx),
-                        state.shmBytes);
-                    LSFG_FRAME_DBG("input: posix-shm memcpy slot %u", sidx);
-
-                    // Session-40 click-response detector (LSFGVK_CODETECT=1):
-                    // downsampled grid RMS-diff of the newest captured game frame
-                    // vs the previous copy of THIS slot. A large content jump
-                    // right after uclick's keystroke injection = the in-game
-                    // visible response ⇒ candidate click→frame latency sample.
-                    // Reads hostPtrs (CPU-side copy: shm path only), 1/64 pixels.
-                    static const bool codetect =
-                        std::getenv("LSFGVK_CODETECT") != nullptr
-                        && std::getenv("LSFGVK_CODETECT")[0] == '1';
-                    if (codetect && state.shmBytes) {
-                        static std::vector<uint8_t> prevGrid{};
-                        static uint32_t prevHotSlot = 0xffffffffu;
-                        const auto* px = static_cast<const uint8_t*>(
-                            state.hostPtrs.at(sidx));
-                        const size_t tot = static_cast<size_t>(w) * h;
-                        const size_t step = px ? (16 * 4) : 16; /* 16-px grid */
-                        uint64_t sum = 0; size_t n = 0;
-                        std::vector<uint8_t> grid;
-                        grid.reserve((tot / 256) + 8);
-                        const uint64_t recvNs = static_cast<uint64_t>(
-                            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                recvTs.time_since_epoch()).count());
-                        for (size_t i = 0; i + 15 < tot; i += 256) {
-                            // luminance-ish (G dominant) single byte
-                            const uint8_t g = px[i * 4 + 1];
-                            grid.push_back(g);
-                            if (!prevGrid.empty() && n < prevGrid.size()) {
-                                const int d =
-                                    static_cast<int>(g) -
-                                    static_cast<int>(prevGrid[n]);
-                                sum += static_cast<uint64_t>(d * d);
-                                ++n;
-                            }
-                        }
-                        const double rms = n
-                            ? std::sqrt(static_cast<double>(sum) / n) : 0.0;
-                        if (rms > 24.0) {
-                            lsfgvk::gui::g_guiState.inputLatencyValid.store(true);
-                            FILE* f = std::fopen("/tmp/lsfg-codeetect.log", "a");
-                            if (f) {
-                                std::fprintf(f, "ACT %llu slot%u fidx%llu rms%.1f\n",
-                                    (unsigned long long)recvNs, sidx,
-                                    (unsigned long long)fidx, rms);
-                                std::fclose(f);
-                            }
-                        }
-                        prevGrid = std::move(grid);
-                        (void)prevHotSlot;
-                    }
-                    if (false && w >= 2560 && state.hostPtrs.at(sidx)
-                            && (fidx == 80 || fidx == 250 || (fidx > 0 && fidx % 400 == 0))) {
-                        char path[128];
-                        std::snprintf(path, sizeof(path),
-                            "/tmp/lsfg-re2-ingame/dump-fidx%llu.ppm",
-                            (unsigned long long)fidx);
-                        if (FILE* out = std::fopen(path, "wb")) {
-                            std::fprintf(out, "P6\n%u %u\n255\n", w, h);
-                            const auto* px = static_cast<const uint8_t*>(state.hostPtrs.at(sidx));
-                            const size_t npx = static_cast<size_t>(w) * h;
-                            std::vector<uint8_t> rgb(npx * 3);
-                            for (size_t i = 0; i < npx; ++i) {
-                                rgb[i * 3 + 0] = px[i * 4 + 0];
-                                rgb[i * 3 + 1] = px[i * 4 + 1];
-                                rgb[i * 3 + 2] = px[i * 4 + 2];
-                            }
-                            std::fwrite(rgb.data(), 1, rgb.size(), out);
-                            std::fclose(out);
-                            LSFG_FRAME_DBG("dumped %s", path);
-                        }
-                    }
-                } else if (captureFd >= 0) {
+                if (captureFd >= 0) {
                     pollfd pfd{};
                     pfd.fd = captureFd;
                     pfd.events = POLLIN;
@@ -3302,19 +2439,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     captureFd = -1;
                     waitWriteDone = true;
                 }
-                // Source for the present-time blit. Three cases:
-                //   aImports  - cross-device imported capture (p2p path)
-                //   hostImages- udmabuf bounce: our own import of the shared
-                //               system memory, which is the whole point of
-                //               that transport
-                //   sourceImages - POSIX-shm staging image
-                // On the bounce path sourceImages is deliberately empty, so
-                // falling back to it would throw "lazy: no value present".
-                // On the udmabuf path the bounce above ALREADY copied the
-                // shared buffer into genSources, so genSources is both the
-                // bounce destination and the present source. There is no
-                // separate host image to blit from, and re-blitting would
-                // overwrite the frame we just DMA'd.
                 // DecoupledDma: the FRAME fd is the layer's 9060 VRAM image.
                 // Import it once, then before every copy export that dma-buf's
                 // sync file and poll it. EXPLICIT_SYNC means the import itself
@@ -3579,47 +2703,29 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                         decoupledFilled = true;
                     }
                 }
-                // udmabuf ring: the slot image IS the source. It was imported
-                // on our own card, so the snapshot copy below is a plain
-                // image->image DMA with no CPU involvement and no cross-device
-                // import at all.
-                const bool ringSrc = ringTransport
-                    && sidx < state.ringSlotImages.size()
-                    && state.ringSlotImages.at(sidx).has_value();
-                const bool bounceSrc = state.udmaBufs.at(sidx).has_value()
-                    || decoupledFilled || ringSrc;
+                const bool bounceSrc = decoupledFilled;
                 // Pointer, not a ternary of value types: vk::Image has no
                 // default ctor and the other branch is a lazy<Image>.
-                const vk::Image* ringSrcImg = ringSrc
-                    ? &*state.ringSlotImages.at(sidx) : nullptr;
-                const vk::Image* srcImagePtr = ringSrcImg != nullptr
-                    ? ringSrcImg
-                    : (bounceSrc
-                        ? &*state.genSources.at(sidx)
-                        : (state.aImports.at(sidx).has_value()
-                            ? &*state.aImports.at(sidx)
-                            : &*state.sourceImages.at(sidx)));
+                const vk::Image* srcImagePtr = bounceSrc
+                    ? &*state.genSources.at(sidx)
+                    : (state.aImports.at(sidx).has_value()
+                        ? &*state.aImports.at(sidx)
+                        : &*state.sourceImages.at(sidx));
                 auto& snapLazy = state.genSources.at(sidx);
                 const bool fromA = state.aImports.at(sidx).has_value() && !bounceSrc;
                 const bool swizzleBlit = fromA
                     && state.captureFormat != state.sourceFormat
                     && state.sourceImages.at(sidx).has_value();
-                const bool hostDma = sidx < state.dmaMaps.size()
-                    && state.dmaMaps.at(sidx) != nullptr;
-                const VkImageLayout srcOld = hostDma
-                    ? VK_IMAGE_LAYOUT_GENERAL
-                    : (fromA
+                const VkImageLayout srcOld = fromA
                     ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                    : (state.shmBytes ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED));
-                const VkImageLayout srcNew = hostDma
-                    ? VK_IMAGE_LAYOUT_GENERAL
-                    : (fromA
+                    : VK_IMAGE_LAYOUT_UNDEFINED;
+                const VkImageLayout srcNew = fromA
                     ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-                    : (state.shmBytes ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL));
-                const uint32_t srcQ = (fromA && !hostDma) ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
-                const uint32_t dstQ = (fromA && !hostDma) ? vk.transferQueueFamilyIndex() : VK_QUEUE_FAMILY_IGNORED;
+                    : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                const uint32_t srcQ = fromA ? VK_QUEUE_FAMILY_EXTERNAL : VK_QUEUE_FAMILY_IGNORED;
+                const uint32_t dstQ = fromA ? vk.transferQueueFamilyIndex() : VK_QUEUE_FAMILY_IGNORED;
                 if (bounceSrc) {
-                    // genSources already holds this frame; the bounce fence
+                    // genSources already holds this frame; the copy fence
                     // orders it against the present. Nothing to snapshot.
                 } else if (swizzleBlit) {
                     static bool loggedBlit = false;
@@ -3790,25 +2896,12 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                     vk.transferQueueHandle() != VK_NULL_HANDLE,
                     vk.transferQueueHandle() == vk.queue() ? 1 : 0,
                     (unsigned long long)fidx);
-                if (dmaHop) {
-                    /* Release was already sent immediately after hopShareToOffload */
-                    pendingDmaRelease = -1;
-                }
                 /* Ring: hand the slot back to the producer.
                    This must sit AFTER the if/else that submits the copy. The
                    ring takes the `if` branch (it submits its own copy on the
                    doubler queue), so a release placed inside the else branch
                    never ran: the ring filled after K frames and the producer
                    skipped forever, which is what we measured. */
-                if (ringTransport) {
-                    state.ring->release(sidx);
-                    if (std::getenv("LSFGVK_RING_DBG")) {
-                        std::fprintf(stderr,
-                            "lsfg-vk-app: ring slot %u released after copy queued (no host wait)\n",
-                            sidx);
-                        std::fflush(stderr);
-                    }
-                }
                 if (fidx >= 20 && fidx - lastDumpFidx >= 40
                         && state.genSources.at(sidx).has_value()
                         && std::getenv("LSFGVK_DUMP_PPM")
@@ -3881,8 +2974,6 @@ void runPresent(ls::ipc::Connection& conn, ls::ipc::StreamState& state,
                 }
                 } else {
                     if (captureFd >= 0) { ::close(captureFd); captureFd = -1; }
-                    if (dmaHop)
-                        conn.send(ls::ipc::Release{ frame->stagingIdx });
                 }
 
                 static const bool emptyGen = std::getenv("LSFGVK_EMPTY_GEN")

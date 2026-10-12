@@ -813,11 +813,6 @@ namespace {
         if (swIt == instance_info->swapchains.end())
             return VK_ERROR_INITIALIZATION_FAILED;
 
-        /* Drive the udmabuf ring copy from here: the game's own thread, top
-           of a frame, outside any nested submit. Submitting this copy from the
-           present hook or from a worker thread both faulted the device. */
-        layer_info->root.flushRingCopy(swapchain, swIt->second.get());
-
         static const bool dbgAcq = LSGV_FRAME_DBG_ENABLED;
         const auto t0 = std::chrono::steady_clock::now();
         VkResult res = VK_SUCCESS;
@@ -960,13 +955,7 @@ namespace {
                     }
                     bool skipIpc = false;
                     try {
-                        /* The udmabuf ring owns the data path, so it must see
-                           EVERY present: skipping the first 16 at >=1440 would
-                           leave the ring unfed for its first 16 frames. Other
-                           transports keep the existing debug skip. */
-                        const bool ringPath = layer_info->root.activeTransport()
-                            == ls::Transport::UdmabufRing;
-                        if (isIsolated(swapchain) && !ringPath) {
+                        if (isIsolated(swapchain)) {
                             auto& iso = isolatedAt(swapchain);
                             if (iso.extent.height >= 1440 && iso.presentCount < 16) {
                                 skipIpc = true;
@@ -980,18 +969,6 @@ namespace {
                         if (skipIpc) {
                             result = VK_SUCCESS;
                         } else {
-                            /* Ring: give the context the recycle fence so its
-                               copy submit can signal it. */
-                            if (isIsolated(swapchain)
-                                    && layer_info->root.activeTransport()
-                                        == ls::Transport::UdmabufRing) {
-                                auto& isoF = isolatedAt(swapchain);
-                                const uint32_t fi = info->pImageIndices[i];
-                                if (fi < isoF.recycleFences.size())
-                                    layer_info->root.setRingRecycleFence(
-                                        swapchain,
-                                        isoF.recycleFences.at(fi).handle());
-                            }
                             result = layer_info->root.presentSwapchain(swapchain,
                                 it->second, queue,
                                 const_cast<void*>(info->pNext),
@@ -1023,37 +1000,10 @@ namespace {
                         PendingPresentWork work;
                         work.vk = &it->second.get();
                         work.height = iso.extent.height;
-                        /* ringPath is included deliberately: the ring path
-                           forces skipIpc false so that every present reaches
-                           presentSwapchain, but the deferred work that
-                           CONSUMES the game's present wait-semaphores is
-                           gated on skipIpc. Without it nothing consumes them,
-                           vkd3d's present never completes, and the game stops
-                           after one frame - which is what we measured
-                           (one ring claim per stream, then silence). */
-                        const bool isRing = layer_info->root.activeTransport()
-                            == ls::Transport::UdmabufRing;
-                        /* For the ring, signal the recycle fence INLINE and
-                           consume the present semaphores with a submit here.
-                           Deferring them deadlocks: the deferred work is
-                           flushed from vkQueueSubmit2, and the game is
-                           blocked in acquire waiting on that very fence, so
-                           it never reaches its next submit. The <1440 path
-                           already does it inline. */
-                        /* ONLY the deferred path, or ONLY the ring copy -
-                           never both. These are binary semaphores: the first
-                           waiter consumes the signal, so a second waiter parks
-                           forever. Having both wait is what left the ring slot
-                           stuck in Writing with the copy never executing.
-                           The ring's copy waits on them, so the deferred work
-                           must not. */
-                        const bool consumeWaits = skipIpc && !isRing;
-                        /* The ring goes through the DEFERRED path too: our copy
-                           submit now consumes the present semaphores, so the
-                           game is not deadlocked and will reach the next
-                           vkQueueSubmit2, where this work is flushed and the
-                           recycle fence is signalled. Signalling it inline
-                           instead was a second nested submit (19 faults). */
+                        /* Binary semaphores: the first waiter consumes the
+                           signal, so only one path may consume the present
+                           waits - a second waiter parks forever. */
+                        const bool consumeWaits = skipIpc;
                         if (iso.extent.height >= 1440) {
                             // Nested QueueSubmit during QueuePresent races
                             // vkd3d's QueueSubmit2. Defer dedicated work.

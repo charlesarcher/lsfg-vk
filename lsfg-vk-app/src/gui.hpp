@@ -32,7 +32,6 @@ namespace lsfgvk::gui {
         std::string sessionMode{"wayland"}; // wayland, x11, auto
 
         // Linux & Dual-GPU specific options (lsfg-vk)
-        int transportMode{0}; // 0 = decoupled (cross-GPU default), not udmabuf
         int presentationMode{1}; // 0 = Internal Game, 1 = One-Way External
         std::string socketPath{"~/.local/state/lsfg-vk/app.sock"};
         std::string outputConnector{""};

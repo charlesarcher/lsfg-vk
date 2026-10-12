@@ -36,14 +36,6 @@ namespace lsfgvk::layer {
                 && this->active_profile->presentation == ls::Presentation::External;
         }
 
-        /// transport of the active profile, or PosixShm when none is active.
-        /// The ring transport must see every present, so the present hook asks
-        /// this instead of guessing from the swapchain state.
-        [[nodiscard]] ls::Transport activeTransport() const {
-            return this->active_profile.has_value()
-                ? this->active_profile->transport : ls::Transport::PosixShm;
-        }
-
         /// ensure the layer is up-to-date
         /// @return true if the configuration was updated
         bool update();
@@ -107,13 +99,6 @@ namespace lsfgvk::layer {
         /// tell the app the swapchain behind an external stream is gone, so it
         /// retires exactly that stream. No-op for non-external swapchains.
         void notifySwapchainClose(VkSwapchainKHR swapchain);
-        /// Submit/publish the udmabuf ring copy for this swapchain. Called
-        /// from vkAcquireNextImageKHR so the submit happens on the game's own
-        /// thread, outside any nested QueueSubmit.
-        void flushRingCopy(VkSwapchainKHR swapchain, const vk::Vulkan& vk);
-        /// Hand the isolated recycle fence to the ring context so its copy
-        /// submit can signal it, instead of a separate nested submit.
-        void setRingRecycleFence(VkSwapchainKHR swapchain, VkFence fence);
     private:
         ls::WatchedConfig config;
         std::optional<ls::GameConf> active_profile;
